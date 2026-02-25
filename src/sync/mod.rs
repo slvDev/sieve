@@ -1,17 +1,44 @@
 //! Sync engine — adapted from SHiNode.
 //!
-//! Reference: shinode/node/src/sync/
-//!
-//! Modules:
-//! - scheduler: work queue management, peer assignment, AIMD batch sizing
-//! - fetch: batch fetching from peers
-//! - follow: head-following mode after catching up
-//! - reorg: rollback handling within configured window
-//!
-//! Key difference from SHiNode: instead of storing raw receipts,
-//! the processing pipeline passes receipts through filter → decode → handler.
+//! Core types used across the sync pipeline. Sub-modules implement
+//! scheduling, fetching, head-following, and reorg handling.
+
+use reth_ethereum_primitives::{BlockBody, Receipt};
+use reth_primitives_traits::Header;
 
 pub mod fetch;
 pub mod follow;
 pub mod reorg;
 pub mod scheduler;
+
+/// Full payload for a block: header, body, receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPayload {
+    pub header: Header,
+    pub body: BlockBody,
+    pub receipts: Vec<Receipt>,
+}
+
+/// High-level sync state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    LookingForPeers,
+    Fetching,
+    Finalizing,
+    UpToDate,
+    Following,
+}
+
+impl SyncStatus {
+    /// Machine-readable status string for logging and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LookingForPeers => "looking_for_peers",
+            Self::Fetching => "fetching",
+            Self::Finalizing => "finalizing",
+            Self::UpToDate => "up_to_date",
+            Self::Following => "following",
+        }
+    }
+}
