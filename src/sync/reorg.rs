@@ -1,6 +1,4 @@
-//! Reorg handling — adapted from SHiNode.
-//!
-//! Reference: shinode/node/src/sync/historical/reorg.rs
+//! Reorg handling.
 //!
 //! On chain reorg:
 //! 1. Detect reorg (new block at existing height with different hash)

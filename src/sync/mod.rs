@@ -1,4 +1,4 @@
-//! Sync engine — adapted from SHiNode.
+//! Sync engine.
 //!
 //! Core types used across the sync pipeline. Sub-modules implement
 //! scheduling, fetching, head-following, and reorg handling.
@@ -6,6 +6,7 @@
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives_traits::Header;
 
+pub mod engine;
 pub mod fetch;
 pub mod follow;
 pub mod reorg;
@@ -41,4 +42,20 @@ impl SyncStatus {
             Self::Following => "following",
         }
     }
+}
+
+/// Fetch scheduling mode for a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMode {
+    /// Normal batch selection from pending queue.
+    Normal,
+    /// Escalation batch selection (priority retry across peers).
+    Escalation,
+}
+
+/// A batch of blocks assigned to a peer.
+#[derive(Debug, Clone)]
+pub struct FetchBatch {
+    pub blocks: Vec<u64>,
+    pub mode: FetchMode,
 }

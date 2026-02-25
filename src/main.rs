@@ -11,8 +11,7 @@ mod handler;
 mod p2p;
 mod sync;
 
-use reth_network::PeersInfo;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::info;
 
 #[tokio::main]
@@ -30,18 +29,22 @@ async fn main() -> eyre::Result<()> {
 
     info!(peers = session.pool.len(), "connected to ethereum p2p network");
 
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    let start_block: u64 = 21_000_000;
+    let end_block: u64 = 21_000_100;
 
-        let stats = &session.p2p_stats;
-        info!(
-            pool_peers = session.pool.len(),
-            reth_connected = session.handle.num_connected_peers(),
-            discovered = stats.discovered_count.load(Ordering::Relaxed),
-            sessions_established = stats.sessions_established.load(Ordering::Relaxed),
-            sessions_closed = stats.sessions_closed.load(Ordering::Relaxed),
-            genesis_mismatches = stats.genesis_mismatch_count.load(Ordering::Relaxed),
-            "p2p status"
-        );
-    }
+    let outcome = sync::engine::run_sync(
+        Arc::clone(&session.pool),
+        start_block,
+        end_block,
+    )
+    .await?;
+
+    info!(
+        blocks = outcome.blocks_fetched,
+        receipts = outcome.total_receipts,
+        elapsed_ms = outcome.elapsed.as_millis() as u64,
+        "sync complete"
+    );
+
+    Ok(())
 }
