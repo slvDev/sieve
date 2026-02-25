@@ -25,6 +25,12 @@ async fn main() -> eyre::Result<()> {
 
     info!("sieve starting");
 
+    let index_config = Arc::new(config::usdc_transfer_config()?);
+    info!(
+        contracts = index_config.contracts.len(),
+        "loaded index config"
+    );
+
     let session = p2p::connect_mainnet_peers().await?;
 
     info!(peers = session.pool.len(), "connected to ethereum p2p network");
@@ -36,12 +42,15 @@ async fn main() -> eyre::Result<()> {
         Arc::clone(&session.pool),
         start_block,
         end_block,
+        index_config,
     )
     .await?;
 
     info!(
         blocks = outcome.blocks_fetched,
         receipts = outcome.total_receipts,
+        events_matched = outcome.events_matched,
+        events_decoded = outcome.events_decoded,
         elapsed_ms = outcome.elapsed.as_millis() as u64,
         "sync complete"
     );

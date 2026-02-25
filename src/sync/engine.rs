@@ -3,12 +3,14 @@
 //! Peer feeder, ready set deduplication, quality-based peer selection,
 //! and JoinSet task tracking.
 
+use crate::config::IndexConfig;
 use crate::p2p::{NetworkPeer, PeerPool};
 use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
 use crate::sync::scheduler::{
     PeerHealthConfig, PeerHealthTracker, PeerWorkScheduler, SchedulerConfig,
 };
 use crate::sync::BlockPayload;
+use crate::{decode, filter};
 use reth_network_api::PeerId;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,6 +27,8 @@ const PAYLOAD_CHANNEL_SIZE: usize = 256;
 pub struct SyncOutcome {
     pub blocks_fetched: u64,
     pub total_receipts: u64,
+    pub events_matched: u64,
+    pub events_decoded: u64,
     pub elapsed: Duration,
 }
 
@@ -37,6 +41,7 @@ pub async fn run_sync(
     pool: Arc<PeerPool>,
     start_block: u64,
     end_block: u64,
+    config: Arc<IndexConfig>,
 ) -> eyre::Result<SyncOutcome> {
     let started = Instant::now();
     let total_blocks = end_block.saturating_sub(start_block) + 1;
@@ -44,12 +49,12 @@ pub async fn run_sync(
     info!(start_block, end_block, total_blocks, "starting sync");
 
     // Setup scheduler
-    let config = SchedulerConfig::default();
-    let peer_health_config = PeerHealthConfig::from_scheduler_config(&config);
+    let sched_config = SchedulerConfig::default();
+    let peer_health_config = PeerHealthConfig::from_scheduler_config(&sched_config);
     let peer_health = Arc::new(PeerHealthTracker::new(peer_health_config));
     let blocks: Vec<u64> = (start_block..=end_block).collect();
     let scheduler = Arc::new(PeerWorkScheduler::new_with_health(
-        config,
+        sched_config,
         blocks,
         Arc::clone(&peer_health),
     ));
@@ -69,7 +74,7 @@ pub async fn run_sync(
     );
 
     // Spawn payload consumer
-    let consumer_handle = tokio::spawn(consume_payloads(payload_rx));
+    let consumer_handle = tokio::spawn(consume_payloads(payload_rx, config));
 
     // Main fetch loop
     let ctx = FetchLoopContext {
@@ -88,7 +93,7 @@ pub async fn run_sync(
     let _ = feeder_handle.await;
     drop(payload_tx);
 
-    let (blocks_fetched, total_receipts) = consumer_handle
+    let (blocks_fetched, total_receipts, events_matched, events_decoded) = consumer_handle
         .await
         .map_err(|e| eyre::eyre!("consumer task failed: {e}"))?;
 
@@ -96,6 +101,8 @@ pub async fn run_sync(
     Ok(SyncOutcome {
         blocks_fetched,
         total_receipts,
+        events_matched,
+        events_decoded,
         elapsed,
     })
 }
@@ -339,7 +346,7 @@ async fn check_peer_eligibility(
             "peer head below work range, cooling down for 120s"
         );
         ctx.peer_health
-            .set_cooldown(peer.peer_id, Duration::from_secs(120))
+            .set_stale_head_cooldown(peer.peer_id, Duration::from_secs(120))
             .await;
         return Some(PeerAction::RecycleImmediate);
     }
@@ -439,19 +446,30 @@ async fn check_progress(
     *last_check = Instant::now();
 }
 
-async fn consume_payloads(mut payload_rx: mpsc::Receiver<BlockPayload>) -> (u64, u64) {
+async fn consume_payloads(
+    mut payload_rx: mpsc::Receiver<BlockPayload>,
+    config: Arc<IndexConfig>,
+) -> (u64, u64, u64, u64) {
     let mut blocks_fetched = 0u64;
     let mut total_receipts = 0u64;
+    let mut events_matched = 0u64;
+    let mut events_decoded = 0u64;
     let mut last_log = Instant::now();
 
     while let Some(payload) = payload_rx.recv().await {
         blocks_fetched = blocks_fetched.saturating_add(1);
         total_receipts = total_receipts.saturating_add(payload.receipts.len() as u64);
 
+        let (matched, decoded) = process_block_events(&payload, &config);
+        events_matched = events_matched.saturating_add(matched);
+        events_decoded = events_decoded.saturating_add(decoded);
+
         if last_log.elapsed() >= Duration::from_secs(2) {
             info!(
                 blocks_fetched,
                 total_receipts,
+                events_matched,
+                events_decoded,
                 block_number = payload.header.number,
                 "sync progress"
             );
@@ -459,5 +477,35 @@ async fn consume_payloads(mut payload_rx: mpsc::Receiver<BlockPayload>) -> (u64,
         }
     }
 
-    (blocks_fetched, total_receipts)
+    (blocks_fetched, total_receipts, events_matched, events_decoded)
+}
+
+/// Filter and decode events from a single block payload.
+/// Returns (matched_count, decoded_count).
+fn process_block_events(payload: &BlockPayload, config: &IndexConfig) -> (u64, u64) {
+    let matched = filter::filter_block(payload, config);
+    let matched_count = matched.len() as u64;
+    let mut decoded_count = 0u64;
+
+    for filtered_log in &matched {
+        let Some(contract) = config.contract_for_address(&filtered_log.log.address) else {
+            continue;
+        };
+        match decode::decode_log(filtered_log, contract) {
+            Ok(decoded) => {
+                decoded_count = decoded_count.saturating_add(1);
+                debug!("{decoded}");
+            }
+            Err(e) => {
+                warn!(
+                    block = filtered_log.block_number,
+                    tx_index = filtered_log.tx_index,
+                    error = %e,
+                    "failed to decode log"
+                );
+            }
+        }
+    }
+
+    (matched_count, decoded_count)
 }

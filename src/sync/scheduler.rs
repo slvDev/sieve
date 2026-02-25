@@ -132,6 +132,10 @@ impl PeerHealthConfig {
 struct PeerHealth {
     backoff_until: Option<Instant>,
     backoff_duration: Duration,
+    /// Separate cooldown for stale-head peers. Not cleared by `record_success`,
+    /// unlike `backoff_until` which resets on any successful fetch. This prevents
+    /// a stale peer from being prematurely un-cooled by an unrelated success.
+    stale_head_until: Option<Instant>,
     successes: u64,
     failures: u64,
     partials: u64,
@@ -147,8 +151,9 @@ struct PeerHealth {
 
 impl PeerHealth {
     fn is_cooling_down(&self) -> bool {
-        self.backoff_until
-            .is_some_and(|until| Instant::now() < until)
+        let now = Instant::now();
+        self.backoff_until.is_some_and(|until| now < until)
+            || self.stale_head_until.is_some_and(|until| now < until)
     }
 }
 
@@ -241,12 +246,16 @@ impl PeerHealthTracker {
         );
     }
 
-    /// Set a manual cooldown on a peer (e.g. stale head detected).
-    pub(crate) async fn set_cooldown(&self, peer_id: PeerId, duration: Duration) {
+    /// Set a stale-head cooldown on a peer.
+    ///
+    /// Unlike failure backoff (`backoff_until`), this is NOT cleared by
+    /// `record_success`. The peer must wait for the full cooldown even if
+    /// it succeeds on other work.
+    pub(crate) async fn set_stale_head_cooldown(&self, peer_id: PeerId, duration: Duration) {
         let mut health = self.health.lock().await;
         let entry = health.entry(peer_id).or_default();
         self.ensure_batch_limit(entry);
-        entry.backoff_until = Some(Instant::now() + duration);
+        entry.stale_head_until = Some(Instant::now() + duration);
     }
 
     pub(crate) async fn is_peer_cooling_down(&self, peer_id: PeerId) -> bool {
@@ -751,8 +760,10 @@ mod tests {
 
     #[tokio::test]
     async fn next_batch_respects_head_and_consecutive() {
-        let mut config = SchedulerConfig::default();
-        config.blocks_per_assignment = 3;
+        let config = SchedulerConfig {
+            blocks_per_assignment: 3,
+            ..Default::default()
+        };
         let scheduler = scheduler_with_blocks(config, 0, 9);
         let peer_id = PeerId::random();
 
@@ -770,8 +781,10 @@ mod tests {
 
     #[tokio::test]
     async fn requeue_promotes_to_escalation_after_max_attempts() {
-        let mut config = SchedulerConfig::default();
-        config.max_attempts_per_block = 2;
+        let config = SchedulerConfig {
+            max_attempts_per_block: 2,
+            ..Default::default()
+        };
         let scheduler = scheduler_with_blocks(config, 1, 1);
         let block = 1;
 
@@ -788,8 +801,10 @@ mod tests {
 
     #[tokio::test]
     async fn escalation_retries_failed_blocks() {
-        let mut config = SchedulerConfig::default();
-        config.max_attempts_per_block = 1;
+        let config = SchedulerConfig {
+            max_attempts_per_block: 1,
+            ..Default::default()
+        };
         let scheduler = scheduler_with_blocks(config, 1, 1);
         let peer_id = PeerId::random();
 

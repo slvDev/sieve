@@ -22,6 +22,7 @@ reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a
 alloy-primitives = "1.5.2"
 alloy-rlp = "0.3.12"
 alloy-consensus = { version = "1.4.3", features = ["serde"] }
+alloy-dyn-abi = "1"
 alloy-json-abi = "1"
 alloy-sol-types = "1"
 
