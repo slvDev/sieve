@@ -12,6 +12,7 @@ use alloy_primitives::B256;
 use std::fmt;
 
 /// A single decoded parameter from an event log.
+#[derive(Debug)]
 pub struct DecodedParam {
     /// Parameter name from the ABI (e.g. "from", "to", "value").
     pub name: String,
@@ -22,6 +23,7 @@ pub struct DecodedParam {
 }
 
 /// A fully decoded event with named parameters and block context.
+#[derive(Debug)]
 pub struct DecodedEvent {
     /// Event name from the ABI (e.g. "Transfer").
     pub event_name: String,
@@ -35,6 +37,10 @@ pub struct DecodedEvent {
     pub block_number: u64,
     /// Transaction hash that produced the event.
     pub tx_hash: B256,
+    /// Transaction index within the block.
+    pub tx_index: usize,
+    /// Log index within the transaction's receipt.
+    pub log_index: usize,
 }
 
 impl fmt::Display for DecodedEvent {
@@ -48,7 +54,11 @@ impl fmt::Display for DecodedEvent {
             first = false;
             write!(f, "{}={:?}", param.name, param.value)?;
         }
-        write!(f, ") block={}", self.block_number)
+        write!(
+            f,
+            ") block={} tx={} log={}",
+            self.block_number, self.tx_index, self.log_index
+        )
     }
 }
 
@@ -104,6 +114,8 @@ pub fn decode_log(log: &FilteredLog, contract: &ContractConfig) -> eyre::Result<
         body,
         block_number: log.block_number,
         tx_hash: log.tx_hash,
+        tx_index: log.tx_index,
+        log_index: log.log_index,
     })
 }
 
@@ -113,6 +125,7 @@ mod tests {
     use super::*;
     use crate::config::usdc_transfer_config;
     use alloy_primitives::{address, Bytes, Log, LogData, U256};
+    use eyre::WrapErr;
 
     #[test]
     fn decode_transfer_log() -> eyre::Result<()> {
@@ -122,7 +135,7 @@ mod tests {
         let transfer_selector: B256 =
             "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
                 .parse()
-                .map_err(|e| eyre::eyre!("parse: {e}"))?;
+                .wrap_err("parse transfer selector")?;
 
         let from = address!("1111111111111111111111111111111111111111");
         let to = address!("2222222222222222222222222222222222222222");
@@ -157,6 +170,8 @@ mod tests {
         assert_eq!(decoded.event_name, "Transfer");
         assert_eq!(decoded.contract_name, "USDC");
         assert_eq!(decoded.block_number, 21_000_042);
+        assert_eq!(decoded.tx_index, 0);
+        assert_eq!(decoded.log_index, 0);
 
         // Check indexed params: from, to
         assert_eq!(decoded.indexed.len(), 2);
@@ -174,6 +189,8 @@ mod tests {
         let display = format!("{decoded}");
         assert!(display.contains("USDC.Transfer("));
         assert!(display.contains("block=21000042"));
+        assert!(display.contains("tx=0"));
+        assert!(display.contains("log=0"));
 
         Ok(())
     }

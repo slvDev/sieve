@@ -32,7 +32,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

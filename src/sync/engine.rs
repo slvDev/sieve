@@ -4,6 +4,8 @@
 //! and JoinSet task tracking.
 
 use crate::config::IndexConfig;
+use crate::db::{self, Database};
+use crate::handler::HandlerRegistry;
 use crate::p2p::{NetworkPeer, PeerPool};
 use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
 use crate::sync::scheduler::{
@@ -11,6 +13,8 @@ use crate::sync::scheduler::{
 };
 use crate::sync::BlockPayload;
 use crate::{decode, filter};
+
+use eyre::WrapErr;
 use reth_network_api::PeerId;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -24,12 +28,24 @@ const MAX_CONCURRENT_FETCHES: usize = 32;
 const PAYLOAD_CHANNEL_SIZE: usize = 256;
 
 /// Outcome of a sync run.
+#[derive(Debug)]
 pub struct SyncOutcome {
     pub blocks_fetched: u64,
     pub total_receipts: u64,
     pub events_matched: u64,
     pub events_decoded: u64,
+    pub events_stored: u64,
     pub elapsed: Duration,
+}
+
+/// Accumulated stats from the payload consumer.
+#[derive(Debug, Default)]
+struct ConsumerStats {
+    blocks_fetched: u64,
+    total_receipts: u64,
+    events_matched: u64,
+    events_decoded: u64,
+    events_stored: u64,
 }
 
 /// Run sync for a block range, fetching from the peer pool.
@@ -42,6 +58,8 @@ pub async fn run_sync(
     start_block: u64,
     end_block: u64,
     config: Arc<IndexConfig>,
+    db: Arc<Database>,
+    handlers: Arc<HandlerRegistry>,
 ) -> eyre::Result<SyncOutcome> {
     let started = Instant::now();
     let total_blocks = end_block.saturating_sub(start_block) + 1;
@@ -74,7 +92,7 @@ pub async fn run_sync(
     );
 
     // Spawn payload consumer
-    let consumer_handle = tokio::spawn(consume_payloads(payload_rx, config));
+    let consumer_handle = tokio::spawn(consume_payloads(payload_rx, config, db, handlers));
 
     // Main fetch loop
     let ctx = FetchLoopContext {
@@ -93,16 +111,17 @@ pub async fn run_sync(
     let _ = feeder_handle.await;
     drop(payload_tx);
 
-    let (blocks_fetched, total_receipts, events_matched, events_decoded) = consumer_handle
+    let stats = consumer_handle
         .await
-        .map_err(|e| eyre::eyre!("consumer task failed: {e}"))?;
+        .wrap_err("consumer task failed")?;
 
     let elapsed = started.elapsed();
     Ok(SyncOutcome {
-        blocks_fetched,
-        total_receipts,
-        events_matched,
-        events_decoded,
+        blocks_fetched: stats.blocks_fetched,
+        total_receipts: stats.total_receipts,
+        events_matched: stats.events_matched,
+        events_decoded: stats.events_decoded,
+        events_stored: stats.events_stored,
         elapsed,
     })
 }
@@ -449,27 +468,46 @@ async fn check_progress(
 async fn consume_payloads(
     mut payload_rx: mpsc::Receiver<BlockPayload>,
     config: Arc<IndexConfig>,
-) -> (u64, u64, u64, u64) {
-    let mut blocks_fetched = 0u64;
-    let mut total_receipts = 0u64;
-    let mut events_matched = 0u64;
-    let mut events_decoded = 0u64;
+    db: Arc<Database>,
+    handlers: Arc<HandlerRegistry>,
+) -> ConsumerStats {
+    let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
 
-    while let Some(payload) = payload_rx.recv().await {
-        blocks_fetched = blocks_fetched.saturating_add(1);
-        total_receipts = total_receipts.saturating_add(payload.receipts.len() as u64);
+    let ctx = ProcessContext {
+        config: &config,
+        db: &db,
+        handlers: &handlers,
+    };
 
-        let (matched, decoded) = process_block_events(&payload, &config);
-        events_matched = events_matched.saturating_add(matched);
-        events_decoded = events_decoded.saturating_add(decoded);
+    while let Some(payload) = payload_rx.recv().await {
+        stats.blocks_fetched = stats.blocks_fetched.saturating_add(1);
+        stats.total_receipts = stats
+            .total_receipts
+            .saturating_add(payload.receipts.len() as u64);
+
+        match process_block_events(&payload, &ctx).await {
+            Ok((matched, decoded, stored)) => {
+                stats.events_matched = stats.events_matched.saturating_add(matched);
+                stats.events_decoded = stats.events_decoded.saturating_add(decoded);
+                stats.events_stored = stats.events_stored.saturating_add(stored);
+            }
+            Err(e) => {
+                warn!(
+                    block = payload.header.number,
+                    error = %e,
+                    "failed to process block events"
+                );
+            }
+        }
 
         if last_log.elapsed() >= Duration::from_secs(2) {
             info!(
-                blocks_fetched,
-                total_receipts,
-                events_matched,
-                events_decoded,
+                blocks_fetched = stats.blocks_fetched,
+                total_receipts = stats.total_receipts,
+                events_matched = stats.events_matched,
+                events_decoded = stats.events_decoded,
+                events_stored = stats.events_stored,
                 block_number = payload.header.number,
                 "sync progress"
             );
@@ -477,24 +515,40 @@ async fn consume_payloads(
         }
     }
 
-    (blocks_fetched, total_receipts, events_matched, events_decoded)
+    stats
 }
 
-/// Filter and decode events from a single block payload.
-/// Returns (matched_count, decoded_count).
-fn process_block_events(payload: &BlockPayload, config: &IndexConfig) -> (u64, u64) {
-    let matched = filter::filter_block(payload, config);
-    let matched_count = matched.len() as u64;
-    let mut decoded_count = 0u64;
+/// Shared references for the payload consumer (reduces argument counts).
+struct ProcessContext<'a> {
+    config: &'a IndexConfig,
+    db: &'a Database,
+    handlers: &'a HandlerRegistry,
+}
 
+/// Filter, decode, and store events from a single block payload.
+/// Returns (matched_count, decoded_count, stored_count).
+async fn process_block_events(
+    payload: &BlockPayload,
+    ctx: &ProcessContext<'_>,
+) -> eyre::Result<(u64, u64, u64)> {
+    // Step 1: filter
+    let matched = filter::filter_block(payload, ctx.config);
+    let matched_count = matched.len() as u64;
+
+    if matched.is_empty() {
+        return Ok((0, 0, 0));
+    }
+
+    // Step 2: decode (CPU work, no DB)
+    let mut decoded_events = Vec::new();
     for filtered_log in &matched {
-        let Some(contract) = config.contract_for_address(&filtered_log.log.address) else {
+        let Some(contract) = ctx.config.contract_for_address(&filtered_log.log.address) else {
             continue;
         };
         match decode::decode_log(filtered_log, contract) {
             Ok(decoded) => {
-                decoded_count = decoded_count.saturating_add(1);
                 debug!("{decoded}");
+                decoded_events.push(decoded);
             }
             Err(e) => {
                 warn!(
@@ -507,5 +561,26 @@ fn process_block_events(payload: &BlockPayload, config: &IndexConfig) -> (u64, u
         }
     }
 
-    (matched_count, decoded_count)
+    let decoded_count = decoded_events.len() as u64;
+
+    if decoded_events.is_empty() {
+        return Ok((matched_count, 0, 0));
+    }
+
+    // Step 3: store in one transaction per block
+    let mut tx = ctx.db.begin().await?;
+    let mut stored_count = 0u64;
+
+    for event in &decoded_events {
+        let dispatched = ctx.handlers.dispatch(event, &mut tx).await?;
+        stored_count = stored_count.saturating_add(dispatched);
+    }
+
+    db::update_checkpoint(&mut tx, payload.header.number).await?;
+
+    tx.commit()
+        .await
+        .wrap_err_with(|| format!("failed to commit block {}", payload.header.number))?;
+
+    Ok((matched_count, decoded_count, stored_count))
 }
