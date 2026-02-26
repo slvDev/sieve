@@ -228,13 +228,17 @@ fn generate_insert_sql(table: &str, columns: &[ResolvedColumn]) -> String {
         col_names.push_str(&col.column_name);
     }
 
-    let param_count = 4 + columns.len();
-    let mut params = String::new();
-    for i in 1..=param_count {
-        if i > 1 {
-            params.push_str(", ");
+    // Standard columns ($1-$4) have native Rust type bindings.
+    // User columns may need explicit casts when bound as text (e.g. numeric).
+    let mut params = String::from("$1, $2, $3, $4");
+    for (i, col) in columns.iter().enumerate() {
+        params.push_str(", ");
+        let param_idx = i + 5;
+        if col.pg_type == "numeric" {
+            let _ = write!(params, "${param_idx}::numeric");
+        } else {
+            let _ = write!(params, "${param_idx}");
         }
-        let _ = write!(params, "${i}");
     }
 
     format!(
