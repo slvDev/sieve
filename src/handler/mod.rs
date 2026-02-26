@@ -37,6 +37,20 @@ pub trait EventHandler: Send + Sync {
         event: &DecodedEvent,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()>;
+
+    /// Roll back this handler's data above `block_number`.
+    ///
+    /// Called during reorg handling. Each handler is responsible for deleting
+    /// its own rows so `rollback_to` doesn't need to hardcode table names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DELETE query fails.
+    async fn rollback(
+        &self,
+        block_number: u64,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()>;
 }
 
 /// Registry of event handlers. Dispatches decoded events to matching handlers.
@@ -80,6 +94,22 @@ impl HandlerRegistry {
             }
         }
         Ok(count)
+    }
+
+    /// Roll back all handlers' data above `block_number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any handler's rollback fails.
+    pub async fn rollback_all(
+        &self,
+        block_number: u64,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        for handler in &self.handlers {
+            handler.rollback(block_number, tx).await?;
+        }
+        Ok(())
     }
 
     /// Number of registered handlers.
@@ -131,7 +161,8 @@ impl EventHandler for UsdcTransferHandler {
 
         sqlx::query(
             "INSERT INTO usdc_transfers (block_number, tx_hash, tx_index, log_index, from_address, to_address, value) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (block_number, tx_index, log_index) DO NOTHING",
         )
         .bind(event.block_number as i64)
         .bind(event.tx_hash.as_slice())
@@ -144,6 +175,19 @@ impl EventHandler for UsdcTransferHandler {
         .await
         .wrap_err("failed to insert USDC transfer")?;
 
+        Ok(())
+    }
+
+    async fn rollback(
+        &self,
+        block_number: u64,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        sqlx::query("DELETE FROM usdc_transfers WHERE block_number > $1")
+            .bind(block_number as i64)
+            .execute(&mut **tx)
+            .await
+            .wrap_err("failed to rollback usdc_transfers")?;
         Ok(())
     }
 }
@@ -297,6 +341,56 @@ mod tests {
         .wrap_err("query failed")?;
 
         assert_eq!(count.0, 1);
+
+        // Clean up
+        sqlx::query("DELETE FROM usdc_transfers WHERE block_number = $1")
+            .bind(21_000_042i64)
+            .execute(db.pool())
+            .await
+            .wrap_err("cleanup failed")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn usdc_handler_is_idempotent() -> eyre::Result<()> {
+        let url = std::env::var("DATABASE_URL")
+            .wrap_err("DATABASE_URL not set")?;
+        let db = crate::db::Database::connect(&url).await?;
+
+        // Clean up any leftover data from previous test runs
+        sqlx::query("DELETE FROM usdc_transfers WHERE block_number = $1")
+            .bind(21_000_042i64)
+            .execute(db.pool())
+            .await
+            .wrap_err("pre-cleanup failed")?;
+
+        let event = make_test_event();
+        let handler = UsdcTransferHandler;
+
+        // Insert first time
+        let mut tx = db.begin().await?;
+        handler.handle(&event, &mut tx).await?;
+        tx.commit().await.wrap_err("first commit failed")?;
+
+        // Insert same event again (should be a no-op due to ON CONFLICT DO NOTHING)
+        let mut tx = db.begin().await?;
+        handler.handle(&event, &mut tx).await?;
+        tx.commit().await.wrap_err("second commit failed")?;
+
+        // Verify only one row exists
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM usdc_transfers WHERE block_number = $1 AND tx_index = $2 AND log_index = $3",
+        )
+        .bind(21_000_042i64)
+        .bind(5i32)
+        .bind(3i32)
+        .fetch_one(db.pool())
+        .await
+        .wrap_err("count query failed")?;
+
+        assert_eq!(count.0, 1, "expected exactly 1 row after duplicate insert");
 
         // Clean up
         sqlx::query("DELETE FROM usdc_transfers WHERE block_number = $1")

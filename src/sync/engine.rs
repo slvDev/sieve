@@ -16,6 +16,7 @@ use crate::{decode, filter};
 
 use eyre::WrapErr;
 use reth_network_api::PeerId;
+use reth_primitives_traits::SealedHeader;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +51,10 @@ struct ConsumerStats {
 
 /// Run sync for a block range, fetching from the peer pool.
 ///
+/// The `stop_rx` watch channel allows external callers (follow loop, shutdown
+/// handler) to signal an early stop. When `*stop_rx.borrow() == true`, the
+/// fetch loop exits at the next iteration boundary.
+///
 /// # Errors
 ///
 /// Returns an error if the sync encounters an unrecoverable failure.
@@ -60,6 +65,7 @@ pub async fn run_sync(
     config: Arc<IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
+    stop_rx: watch::Receiver<bool>,
 ) -> eyre::Result<SyncOutcome> {
     let started = Instant::now();
     let total_blocks = end_block.saturating_sub(start_block) + 1;
@@ -81,14 +87,14 @@ pub async fn run_sync(
     let (payload_tx, payload_rx) = mpsc::channel::<BlockPayload>(PAYLOAD_CHANNEL_SIZE);
     let (ready_tx, ready_rx) = mpsc::unbounded_channel::<NetworkPeer>();
 
-    // Shutdown signal for peer feeder
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Local shutdown signal for the peer feeder (triggered when fetch loop exits)
+    let (feeder_shutdown_tx, feeder_shutdown_rx) = watch::channel(false);
 
     // Spawn peer feeder
     let feeder_handle = spawn_peer_feeder(
         Arc::clone(&pool),
         ready_tx.clone(),
-        shutdown_rx,
+        feeder_shutdown_rx,
     );
 
     // Spawn payload consumer
@@ -104,10 +110,10 @@ pub async fn run_sync(
         payload_tx: &payload_tx,
         ready_tx: &ready_tx,
     };
-    run_fetch_loop(&ctx, ready_rx).await;
+    run_fetch_loop(&ctx, ready_rx, &stop_rx).await;
 
-    // Shutdown
-    let _ = shutdown_tx.send(true);
+    // Shutdown peer feeder and consumer
+    let _ = feeder_shutdown_tx.send(true);
     let _ = feeder_handle.await;
     drop(payload_tx);
 
@@ -179,6 +185,7 @@ struct FetchLoopContext<'a> {
 async fn run_fetch_loop(
     ctx: &FetchLoopContext<'_>,
     mut ready_rx: mpsc::UnboundedReceiver<NetworkPeer>,
+    stop_rx: &watch::Receiver<bool>,
 ) {
     let fetch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
     let mut fetch_tasks: JoinSet<()> = JoinSet::new();
@@ -188,6 +195,12 @@ async fn run_fetch_loop(
     let mut last_progress_completed = 0u64;
 
     loop {
+        // Check for external shutdown signal
+        if *stop_rx.borrow() {
+            debug!("fetch loop: stop signal received");
+            break;
+        }
+
         // Drain ready peers, refreshing head from pool
         drain_ready_peers(&mut ready_rx, ctx.pool, &mut ready_peers, &mut ready_set);
 
@@ -525,24 +538,80 @@ struct ProcessContext<'a> {
     handlers: &'a HandlerRegistry,
 }
 
+/// Compute the sealed hash for a block header.
+fn compute_block_hash(header: &reth_primitives_traits::Header) -> alloy_primitives::B256 {
+    SealedHeader::seal_slow(header.clone()).hash()
+}
+
+/// Commit block hash and checkpoint for a block with no events to store.
+async fn commit_block_bookkeeping(
+    db_ref: &Database,
+    block_number: u64,
+    block_hash: &[u8],
+) -> eyre::Result<()> {
+    let mut tx = db_ref.begin().await?;
+    db::store_block_hash(&mut tx, block_number, block_hash).await?;
+    db::update_checkpoint(&mut tx, block_number).await?;
+    tx.commit()
+        .await
+        .wrap_err_with(|| format!("failed to commit block {block_number}"))?;
+    Ok(())
+}
+
 /// Filter, decode, and store events from a single block payload.
 /// Returns (matched_count, decoded_count, stored_count).
 async fn process_block_events(
     payload: &BlockPayload,
     ctx: &ProcessContext<'_>,
 ) -> eyre::Result<(u64, u64, u64)> {
+    let block_hash = compute_block_hash(&payload.header);
+
     // Step 1: filter
     let matched = filter::filter_block(payload, ctx.config);
     let matched_count = matched.len() as u64;
 
     if matched.is_empty() {
+        commit_block_bookkeeping(ctx.db, payload.header.number, block_hash.as_slice()).await?;
         return Ok((0, 0, 0));
     }
 
     // Step 2: decode (CPU work, no DB)
+    let decoded_events = decode_matched_logs(&matched, ctx.config);
+    let decoded_count = decoded_events.len() as u64;
+
+    if decoded_events.is_empty() {
+        commit_block_bookkeeping(ctx.db, payload.header.number, block_hash.as_slice()).await?;
+        return Ok((matched_count, 0, 0));
+    }
+
+    // Step 3: store in one transaction per block
+    let mut tx = ctx.db.begin().await?;
+    let mut stored_count = 0u64;
+
+    db::store_block_hash(&mut tx, payload.header.number, block_hash.as_slice()).await?;
+
+    for event in &decoded_events {
+        let dispatched = ctx.handlers.dispatch(event, &mut tx).await?;
+        stored_count = stored_count.saturating_add(dispatched);
+    }
+
+    db::update_checkpoint(&mut tx, payload.header.number).await?;
+
+    tx.commit()
+        .await
+        .wrap_err_with(|| format!("failed to commit block {}", payload.header.number))?;
+
+    Ok((matched_count, decoded_count, stored_count))
+}
+
+/// Decode matched logs into events, logging any decode failures.
+fn decode_matched_logs(
+    matched: &[filter::FilteredLog],
+    config: &crate::config::IndexConfig,
+) -> Vec<decode::DecodedEvent> {
     let mut decoded_events = Vec::new();
-    for filtered_log in &matched {
-        let Some(contract) = ctx.config.contract_for_address(&filtered_log.log.address) else {
+    for filtered_log in matched {
+        let Some(contract) = config.contract_for_address(&filtered_log.log.address) else {
             continue;
         };
         match decode::decode_log(filtered_log, contract) {
@@ -560,27 +629,5 @@ async fn process_block_events(
             }
         }
     }
-
-    let decoded_count = decoded_events.len() as u64;
-
-    if decoded_events.is_empty() {
-        return Ok((matched_count, 0, 0));
-    }
-
-    // Step 3: store in one transaction per block
-    let mut tx = ctx.db.begin().await?;
-    let mut stored_count = 0u64;
-
-    for event in &decoded_events {
-        let dispatched = ctx.handlers.dispatch(event, &mut tx).await?;
-        stored_count = stored_count.saturating_add(dispatched);
-    }
-
-    db::update_checkpoint(&mut tx, payload.header.number).await?;
-
-    tx.commit()
-        .await
-        .wrap_err_with(|| format!("failed to commit block {}", payload.header.number))?;
-
-    Ok((matched_count, decoded_count, stored_count))
+    decoded_events
 }

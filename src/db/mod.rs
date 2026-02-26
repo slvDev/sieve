@@ -8,6 +8,7 @@
 //! Transaction model: one Postgres transaction per block, so all handler
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
+use alloy_primitives::B256;
 use eyre::WrapErr;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -74,6 +75,32 @@ impl Database {
             .wrap_err("failed to begin transaction")
     }
 
+    /// Read the stored block hash for a given block number.
+    ///
+    /// Returns `None` if no hash is stored for that block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn get_block_hash(&self, block_number: u64) -> eyre::Result<Option<B256>> {
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT block_hash FROM _sieve_block_hashes WHERE block_number = $1",
+        )
+        .bind(block_number as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .wrap_err("failed to read block hash")?;
+
+        match row {
+            Some((bytes,)) => {
+                let hash = B256::try_from(bytes.as_slice())
+                    .map_err(|_| eyre::eyre!("invalid block hash length in DB"))?;
+                Ok(Some(hash))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Expose the pool for integration tests.
     #[cfg(test)]
     pub const fn pool(&self) -> &PgPool {
@@ -83,6 +110,8 @@ impl Database {
 
 /// Update the checkpoint block number within an existing transaction.
 ///
+/// Uses `GREATEST` so the checkpoint never moves backward during normal sync.
+///
 /// # Errors
 ///
 /// Returns an error if the UPDATE query fails.
@@ -91,7 +120,7 @@ pub async fn update_checkpoint(
     block_number: u64,
 ) -> eyre::Result<()> {
     sqlx::query(
-        "UPDATE _sieve_checkpoints SET block_number = $1, updated_at = NOW() WHERE id = 1",
+        "UPDATE _sieve_checkpoints SET block_number = GREATEST(block_number, $1), updated_at = NOW() WHERE id = 1",
     )
     .bind(block_number as i64)
     .execute(&mut **tx)
@@ -100,26 +129,58 @@ pub async fn update_checkpoint(
     Ok(())
 }
 
-/// Roll back indexed data to a given block number within an existing transaction.
+/// Store a block hash for reorg detection within an existing transaction.
 ///
-/// Deletes user table rows above `block_number` and resets the checkpoint.
-/// Used for reorg handling.
+/// Uses `ON CONFLICT DO UPDATE` so re-indexing after a reorg overwrites
+/// the old (now-stale) hash.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT/UPDATE query fails.
+pub async fn store_block_hash(
+    tx: &mut Transaction<'_, Postgres>,
+    block_number: u64,
+    block_hash: &[u8],
+) -> eyre::Result<()> {
+    sqlx::query(
+        "INSERT INTO _sieve_block_hashes (block_number, block_hash) VALUES ($1, $2) \
+         ON CONFLICT (block_number) DO UPDATE SET block_hash = EXCLUDED.block_hash",
+    )
+    .bind(block_number as i64)
+    .bind(block_hash)
+    .execute(&mut **tx)
+    .await
+    .wrap_err("failed to store block hash")?;
+    Ok(())
+}
+
+/// Roll back internal sieve tables (block hashes, checkpoint) to a given block number.
+///
+/// Handlers roll back their own tables via [`HandlerRegistry::rollback_all`].
+/// This function handles sieve-internal state only.
 ///
 /// # Errors
 ///
 /// Returns an error if any DELETE/UPDATE query fails.
-#[expect(dead_code, reason = "used in Phase 5 reorg handling")]
 pub async fn rollback_to(
     tx: &mut Transaction<'_, Postgres>,
     block_number: u64,
 ) -> eyre::Result<()> {
-    sqlx::query("DELETE FROM usdc_transfers WHERE block_number > $1")
+    sqlx::query("DELETE FROM _sieve_block_hashes WHERE block_number > $1")
         .bind(block_number as i64)
         .execute(&mut **tx)
         .await
-        .wrap_err("failed to rollback usdc_transfers")?;
+        .wrap_err("failed to rollback block hashes")?;
 
-    update_checkpoint(tx, block_number).await?;
+    // Unconditional SET — rollback explicitly lowers the checkpoint
+    sqlx::query(
+        "UPDATE _sieve_checkpoints SET block_number = $1, updated_at = NOW() WHERE id = 1",
+    )
+    .bind(block_number as i64)
+    .execute(&mut **tx)
+    .await
+    .wrap_err("failed to reset checkpoint after rollback")?;
+
     Ok(())
 }
 
@@ -159,6 +220,130 @@ mod tests {
         // Should now return the block number
         let checkpoint = db.last_checkpoint().await?;
         assert_eq!(checkpoint, Some(21_000_100));
+
+        // Clean up
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("cleanup failed")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn block_hash_roundtrip() -> eyre::Result<()> {
+        let db = test_db().await?;
+
+        let hash_a = alloy_primitives::B256::repeat_byte(0xAA);
+        let hash_b = alloy_primitives::B256::repeat_byte(0xBB);
+
+        // Store a hash and read it back
+        let mut tx = db.begin().await?;
+        store_block_hash(&mut tx, 99_999, hash_a.as_slice()).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        let stored = db.get_block_hash(99_999).await?;
+        assert_eq!(stored, Some(hash_a));
+
+        // Overwrite with a different hash (simulates reorg re-indexing)
+        let mut tx = db.begin().await?;
+        store_block_hash(&mut tx, 99_999, hash_b.as_slice()).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        let stored = db.get_block_hash(99_999).await?;
+        assert_eq!(stored, Some(hash_b));
+
+        // Clean up
+        sqlx::query("DELETE FROM _sieve_block_hashes WHERE block_number = $1")
+            .bind(99_999i64)
+            .execute(db.pool())
+            .await
+            .wrap_err("cleanup failed")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn rollback_deletes_hashes() -> eyre::Result<()> {
+        let db = test_db().await?;
+
+        // Store hashes for blocks 100-110
+        for block in 100..=110u64 {
+            let hash = alloy_primitives::B256::repeat_byte(block as u8);
+            let mut tx = db.begin().await?;
+            store_block_hash(&mut tx, block, hash.as_slice()).await?;
+            update_checkpoint(&mut tx, block).await?;
+            tx.commit().await.wrap_err("commit failed")?;
+        }
+
+        // Rollback to 105
+        let mut tx = db.begin().await?;
+        rollback_to(&mut tx, 105).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        // Blocks 100-105 should still have hashes
+        for block in 100..=105u64 {
+            let stored = db.get_block_hash(block).await?;
+            assert!(stored.is_some(), "block {block} hash should exist");
+        }
+
+        // Blocks 106-110 should be gone
+        for block in 106..=110u64 {
+            let stored = db.get_block_hash(block).await?;
+            assert!(stored.is_none(), "block {block} hash should be deleted");
+        }
+
+        // Checkpoint should be 105
+        let checkpoint = db.last_checkpoint().await?;
+        assert_eq!(checkpoint, Some(105));
+
+        // Clean up
+        sqlx::query("DELETE FROM _sieve_block_hashes WHERE block_number BETWEEN 100 AND 110")
+            .execute(db.pool())
+            .await
+            .wrap_err("cleanup failed")?;
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("cleanup failed")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn checkpoint_does_not_decrease() -> eyre::Result<()> {
+        let db = test_db().await?;
+
+        // Reset checkpoint to 0
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("reset failed")?;
+
+        // Set checkpoint to 100
+        let mut tx = db.begin().await?;
+        update_checkpoint(&mut tx, 100).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        // Try to set checkpoint to 50 (should be ignored by GREATEST)
+        let mut tx = db.begin().await?;
+        update_checkpoint(&mut tx, 50).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        // Checkpoint should still be 100
+        let checkpoint = db.last_checkpoint().await?;
+        assert_eq!(checkpoint, Some(100));
+
+        // Set checkpoint to 200 (should advance)
+        let mut tx = db.begin().await?;
+        update_checkpoint(&mut tx, 200).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        let checkpoint = db.last_checkpoint().await?;
+        assert_eq!(checkpoint, Some(200));
 
         // Clean up
         sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")

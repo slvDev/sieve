@@ -408,6 +408,65 @@ async fn wait_for_peer_pool(
     }
 }
 
+// ── Head discovery ──────────────────────────────────────────────────
+
+/// Global cursor for round-robin peer rotation across `discover_head_p2p` calls.
+static HEAD_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Discover the highest block number from the peer pool above `baseline`.
+///
+/// Probes up to `probe_peers` peers, requesting headers starting at
+/// `baseline + 1`. Returns the highest block number actually confirmed
+/// via header fetch, or `None` if no peer has data above `baseline`.
+///
+/// Uses a global cursor to rotate across peers between calls, spreading
+/// probe load evenly across the pool.
+///
+/// # Errors
+///
+/// Returns an error only on unexpected failures (not peer timeouts).
+pub async fn discover_head_p2p(
+    pool: &PeerPool,
+    baseline: u64,
+    probe_peers: usize,
+    probe_limit: usize,
+) -> Result<Option<u64>> {
+    let peers = pool.snapshot();
+    if peers.is_empty() {
+        return Ok(None);
+    }
+
+    let mut best_head: Option<u64> = None;
+    let mut probed = 0usize;
+
+    // Don't skip peers based on self-reported head_number — many peers
+    // report stale heads but can still serve headers above baseline.
+    for _ in 0..peers.len() {
+        if probed >= probe_peers {
+            break;
+        }
+        let idx = HEAD_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) % peers.len();
+        let peer = &peers[idx];
+
+        match request_headers_batch(peer, baseline + 1, probe_limit).await {
+            Ok(headers) => {
+                probed += 1;
+                for header in &headers {
+                    let num = header.number;
+                    if num > baseline {
+                        best_head = Some(best_head.map_or(num, |b: u64| b.max(num)));
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(peer_id = ?peer.peer_id, error = %e, "head probe failed");
+            }
+        }
+    }
+
+    Ok(best_head)
+}
+
 // ── Low-level request functions ──────────────────────────────────────
 
 async fn request_head_number(
