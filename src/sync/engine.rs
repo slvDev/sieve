@@ -5,7 +5,7 @@
 
 use crate::config::IndexConfig;
 use crate::db::{self, Database};
-use crate::handler::HandlerRegistry;
+use crate::handler::{EventContext, HandlerRegistry};
 use crate::p2p::{NetworkPeer, PeerPool};
 use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
 use crate::sync::scheduler::{
@@ -14,10 +14,13 @@ use crate::sync::scheduler::{
 use crate::sync::BlockPayload;
 use crate::{decode, filter};
 
+use alloy_consensus::transaction::SignerRecoverable;
+use alloy_consensus::Transaction;
+use alloy_primitives::{Address, B256, TxKind};
 use eyre::WrapErr;
 use reth_network_api::PeerId;
 use reth_primitives_traits::SealedHeader;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Semaphore};
@@ -590,8 +593,16 @@ async fn process_block_events(
 
     db::store_block_hash(&mut tx, payload.header.number, block_hash.as_slice()).await?;
 
+    // Cache sender recovery per tx_index (multiple events may share a tx)
+    let mut sender_cache: HashMap<usize, Address> = HashMap::new();
+
     for event in &decoded_events {
-        let dispatched = ctx.handlers.dispatch(event, &mut tx).await?;
+        let event_context =
+            build_event_context(payload, block_hash, event, &mut sender_cache)?;
+        let dispatched = ctx
+            .handlers
+            .dispatch(event, &event_context, &mut tx)
+            .await?;
         stored_count = stored_count.saturating_add(dispatched);
     }
 
@@ -602,6 +613,53 @@ async fn process_block_events(
         .wrap_err_with(|| format!("failed to commit block {}", payload.header.number))?;
 
     Ok((matched_count, decoded_count, stored_count))
+}
+
+/// Build an [`EventContext`] from a block payload for a given decoded event.
+///
+/// Caches sender recovery per `tx_index` to avoid redundant ECDSA work
+/// when multiple events originate from the same transaction.
+fn build_event_context(
+    payload: &BlockPayload,
+    block_hash: B256,
+    event: &decode::DecodedEvent,
+    sender_cache: &mut HashMap<usize, Address>,
+) -> eyre::Result<EventContext> {
+    let tx_signed = payload
+        .body
+        .transactions
+        .get(event.tx_index)
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "tx_index {} out of range for block {}",
+                event.tx_index,
+                payload.header.number
+            )
+        })?;
+
+    let tx_from = if let Some(&cached) = sender_cache.get(&event.tx_index) {
+        cached
+    } else {
+        let sender = tx_signed
+            .recover_signer_unchecked()
+            .wrap_err("failed to recover tx sender")?;
+        sender_cache.insert(event.tx_index, sender);
+        sender
+    };
+
+    let tx_to = match tx_signed.kind() {
+        TxKind::Call(addr) => Some(addr),
+        TxKind::Create => None,
+    };
+
+    Ok(EventContext {
+        block_timestamp: payload.header.timestamp,
+        block_hash,
+        tx_from,
+        tx_to,
+        tx_value: tx_signed.value(),
+        tx_gas_price: tx_signed.effective_gas_price(payload.header.base_fee_per_gas),
+    })
 }
 
 /// Decode matched logs into events, logging any decode failures.

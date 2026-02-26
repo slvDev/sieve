@@ -8,15 +8,35 @@
 //! SQL dynamically from resolved event definitions.
 
 use crate::decode::{DecodedEvent, DecodedParam};
-use crate::toml_config::ResolvedEvent;
+use crate::toml_config::{ContextField, ResolvedEvent};
 use alloy_dyn_abi::DynSolValue;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use async_trait::async_trait;
 use eyre::WrapErr;
 use sqlx::postgres::PgArguments;
 use sqlx::query::Query;
 use sqlx::{Postgres, Transaction};
 use tracing::debug;
+
+/// Block and transaction context for enriching events.
+///
+/// Built from `BlockPayload` data in the sync engine, passed to handlers
+/// alongside the decoded event.
+#[derive(Debug, Clone)]
+pub struct EventContext {
+    /// Block timestamp (seconds since epoch).
+    pub block_timestamp: u64,
+    /// Block hash.
+    pub block_hash: B256,
+    /// Transaction sender (recovered from signature).
+    pub tx_from: Address,
+    /// Transaction recipient (None for contract creation).
+    pub tx_to: Option<Address>,
+    /// Transaction value in wei.
+    pub tx_value: U256,
+    /// Effective gas price.
+    pub tx_gas_price: u128,
+}
 
 /// Trait for user-defined event handlers.
 ///
@@ -41,6 +61,7 @@ pub trait EventHandler: Send + Sync {
     async fn handle(
         &self,
         event: &DecodedEvent,
+        context: &EventContext,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()>;
 
@@ -90,12 +111,13 @@ impl HandlerRegistry {
     pub async fn dispatch(
         &self,
         event: &DecodedEvent,
+        context: &EventContext,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<u64> {
         let mut count = 0u64;
         for handler in &self.handlers {
             if handler.matches(&event.contract_name, &event.event_name) {
-                handler.handle(event, tx).await?;
+                handler.handle(event, context, tx).await?;
                 count = count.saturating_add(1);
             }
         }
@@ -170,6 +192,7 @@ impl EventHandler for ConfigDrivenHandler {
     async fn handle(
         &self,
         event: &DecodedEvent,
+        context: &EventContext,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()> {
         debug!(
@@ -188,6 +211,11 @@ impl EventHandler for ConfigDrivenHandler {
             .bind(event.tx_hash.as_slice())
             .bind(event.tx_index as i32)
             .bind(event.log_index as i32);
+
+        // Bind context columns (between standard and user columns)
+        for cf in &self.resolved.context_fields {
+            query = bind_context_field(query, *cf, context);
+        }
 
         // Bind user-defined columns
         for col in &self.resolved.columns {
@@ -293,6 +321,24 @@ fn bind_dyn_value<'q>(
     }
 }
 
+/// Bind a context field value to a sqlx query.
+fn bind_context_field<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    field: ContextField,
+    context: &EventContext,
+) -> Query<'q, Postgres, PgArguments> {
+    match field {
+        ContextField::BlockTimestamp => query.bind(context.block_timestamp as i64),
+        ContextField::BlockHash => query.bind(context.block_hash.as_slice().to_vec()),
+        ContextField::TxFrom => query.bind(Address::to_checksum(&context.tx_from, None)),
+        ContextField::TxTo => {
+            query.bind(context.tx_to.map(|a| Address::to_checksum(&a, None)))
+        }
+        ContextField::TxValue => query.bind(context.tx_value.to_string()),
+        ContextField::TxGasPrice => query.bind(context.tx_gas_price as i64),
+    }
+}
+
 // ── USDC Transfer handler (test-only) ─────────────────────────────────
 
 #[cfg(test)]
@@ -313,6 +359,7 @@ impl EventHandler for UsdcTransferHandler {
     async fn handle(
         &self,
         event: &DecodedEvent,
+        _context: &EventContext,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()> {
         let from = extract_address(&event.indexed, "from")?;
@@ -433,9 +480,21 @@ mod tests {
                 value: DynSolValue::Uint(U256::from(1_000_000u64), 256),
             }],
             block_number: 21_000_042,
+            block_timestamp: 1_700_000_000,
             tx_hash: B256::repeat_byte(0xBB),
             tx_index: 5,
             log_index: 3,
+        }
+    }
+
+    fn make_test_context() -> EventContext {
+        EventContext {
+            block_timestamp: 1_700_000_000,
+            block_hash: B256::repeat_byte(0xCC),
+            tx_from: address!("3333333333333333333333333333333333333333"),
+            tx_to: Some(address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")),
+            tx_value: U256::ZERO,
+            tx_gas_price: 30_000_000_000,
         }
     }
 
@@ -488,6 +547,7 @@ mod tests {
             event_name: "Transfer".to_string(),
             contract_name: "USDC".to_string(),
             table_name: "usdc_transfers".to_string(),
+            context_fields: vec![],
             columns: vec![],
             insert_sql: String::new(),
             create_table_sql: String::new(),
@@ -567,10 +627,11 @@ mod tests {
         let db = crate::db::Database::connect(&url).await?;
 
         let event = make_test_event();
+        let context = make_test_context();
         let handler = UsdcTransferHandler;
 
         let mut tx = db.begin().await?;
-        handler.handle(&event, &mut tx).await?;
+        handler.handle(&event, &context, &mut tx).await?;
         tx.commit()
             .await
             .wrap_err("commit failed")?;
@@ -613,16 +674,17 @@ mod tests {
             .wrap_err("pre-cleanup failed")?;
 
         let event = make_test_event();
+        let context = make_test_context();
         let handler = UsdcTransferHandler;
 
         // Insert first time
         let mut tx = db.begin().await?;
-        handler.handle(&event, &mut tx).await?;
+        handler.handle(&event, &context, &mut tx).await?;
         tx.commit().await.wrap_err("first commit failed")?;
 
         // Insert same event again (should be a no-op due to ON CONFLICT DO NOTHING)
         let mut tx = db.begin().await?;
-        handler.handle(&event, &mut tx).await?;
+        handler.handle(&event, &context, &mut tx).await?;
         tx.commit().await.wrap_err("second commit failed")?;
 
         // Verify only one row exists

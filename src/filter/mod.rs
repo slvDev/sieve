@@ -18,6 +18,8 @@ pub struct FilteredLog {
     pub log: Log<LogData>,
     /// Block number where this log was emitted.
     pub block_number: u64,
+    /// Block timestamp (seconds since epoch).
+    pub block_timestamp: u64,
     /// Transaction hash that produced this log.
     pub tx_hash: B256,
     /// Transaction index within the block.
@@ -36,6 +38,7 @@ pub struct FilteredLog {
 #[must_use]
 pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<FilteredLog> {
     let block_number = payload.header.number;
+    let block_timestamp = payload.header.timestamp;
 
     // Validate receipt/transaction count match
     if payload.receipts.len() != payload.body.transactions.len() {
@@ -82,6 +85,7 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
                 matched.push(FilteredLog {
                     log: log.clone(),
                     block_number,
+                    block_timestamp,
                     tx_hash: *tx_hash,
                     tx_index,
                     log_index,

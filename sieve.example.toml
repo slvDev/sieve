@@ -12,6 +12,7 @@ start_block = 21_000_000
 [[contracts.events]]
 name = "Transfer"
 table = "usdc_transfers"
+context = ["block_timestamp", "tx_from"]
 columns = [
   { param = "from",  name = "from_address", type = "text" },
   { param = "to",    name = "to_address",   type = "text" },

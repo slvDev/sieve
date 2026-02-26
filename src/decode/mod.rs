@@ -35,6 +35,8 @@ pub struct DecodedEvent {
     pub body: Vec<DecodedParam>,
     /// Block number where the event was emitted.
     pub block_number: u64,
+    /// Block timestamp (seconds since epoch).
+    pub block_timestamp: u64,
     /// Transaction hash that produced the event.
     pub tx_hash: B256,
     /// Transaction index within the block.
@@ -56,8 +58,8 @@ impl fmt::Display for DecodedEvent {
         }
         write!(
             f,
-            ") block={} tx={} log={}",
-            self.block_number, self.tx_index, self.log_index
+            ") block={} ts={} tx={} log={}",
+            self.block_number, self.block_timestamp, self.tx_index, self.log_index
         )
     }
 }
@@ -113,6 +115,7 @@ pub fn decode_log(log: &FilteredLog, contract: &ContractConfig) -> eyre::Result<
         indexed,
         body,
         block_number: log.block_number,
+        block_timestamp: log.block_timestamp,
         tx_hash: log.tx_hash,
         tx_index: log.tx_index,
         log_index: log.log_index,
@@ -160,6 +163,7 @@ mod tests {
         let filtered = FilteredLog {
             log,
             block_number: 21_000_042,
+            block_timestamp: 1_700_000_000,
             tx_hash: B256::repeat_byte(0xBB),
             tx_index: 0,
             log_index: 0,
@@ -189,6 +193,7 @@ mod tests {
         let display = format!("{decoded}");
         assert!(display.contains("USDC.Transfer("));
         assert!(display.contains("block=21000042"));
+        assert!(display.contains("ts=1700000000"));
         assert!(display.contains("tx=0"));
         assert!(display.contains("log=0"));
 

@@ -52,6 +52,8 @@ pub struct TomlEvent {
     pub name: String,
     /// Postgres table name for this event's data.
     pub table: String,
+    /// Optional context fields to enrich events with block/tx data.
+    pub context: Option<Vec<String>>,
     /// Optional explicit column mappings. If omitted, auto-generated from ABI.
     pub columns: Option<Vec<TomlColumn>>,
 }
@@ -66,6 +68,72 @@ pub struct TomlColumn {
     /// Postgres type (defaults to auto-mapping from Solidity type).
     #[serde(rename = "type")]
     pub pg_type: Option<String>,
+}
+
+// ── Context fields ────────────────────────────────────────────────────
+
+/// A context field that enriches events with block/transaction data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextField {
+    /// Block timestamp (seconds since epoch).
+    BlockTimestamp,
+    /// Block hash.
+    BlockHash,
+    /// Transaction sender (recovered from signature).
+    TxFrom,
+    /// Transaction recipient (None for contract creation).
+    TxTo,
+    /// Transaction value in wei.
+    TxValue,
+    /// Effective gas price.
+    TxGasPrice,
+}
+
+impl ContextField {
+    /// Parse a context field name from TOML config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is not a recognized context field.
+    fn from_name(name: &str) -> eyre::Result<Self> {
+        match name {
+            "block_timestamp" => Ok(Self::BlockTimestamp),
+            "block_hash" => Ok(Self::BlockHash),
+            "tx_from" => Ok(Self::TxFrom),
+            "tx_to" => Ok(Self::TxTo),
+            "tx_value" => Ok(Self::TxValue),
+            "tx_gas_price" => Ok(Self::TxGasPrice),
+            _ => Err(eyre::eyre!(
+                "unknown context field '{name}'. Valid fields: \
+                 block_timestamp, block_hash, tx_from, tx_to, tx_value, tx_gas_price"
+            )),
+        }
+    }
+
+    /// Postgres column name for this context field.
+    #[must_use]
+    pub const fn pg_column_name(self) -> &'static str {
+        match self {
+            Self::BlockTimestamp => "block_timestamp",
+            Self::BlockHash => "block_hash",
+            Self::TxFrom => "tx_from",
+            Self::TxTo => "tx_to",
+            Self::TxValue => "tx_value",
+            Self::TxGasPrice => "tx_gas_price",
+        }
+    }
+
+    /// Postgres type (with nullability suffix) for this context field.
+    #[must_use]
+    pub const fn pg_type(self) -> &'static str {
+        match self {
+            Self::BlockTimestamp | Self::TxGasPrice => "BIGINT NOT NULL",
+            Self::BlockHash => "BYTEA NOT NULL",
+            Self::TxFrom => "TEXT NOT NULL",
+            Self::TxTo => "TEXT",
+            Self::TxValue => "NUMERIC NOT NULL",
+        }
+    }
 }
 
 // ── Resolved types ────────────────────────────────────────────────────
@@ -99,6 +167,8 @@ pub struct ResolvedEvent {
     pub contract_name: String,
     /// Postgres table name.
     pub table_name: String,
+    /// Context fields to enrich events with block/tx data.
+    pub context_fields: Vec<ContextField>,
     /// User-defined columns (mapped from ABI params).
     pub columns: Vec<ResolvedColumn>,
     /// Pre-built INSERT SQL.
@@ -188,7 +258,11 @@ fn validate_identifier(name: &str, kind: &str) -> eyre::Result<()> {
 ///
 /// Callers must validate identifiers before calling this function.
 #[must_use]
-fn generate_create_table_sql(table: &str, columns: &[ResolvedColumn]) -> String {
+fn generate_create_table_sql(
+    table: &str,
+    context_fields: &[ContextField],
+    columns: &[ResolvedColumn],
+) -> String {
     use std::fmt::Write;
 
     let mut sql = format!(
@@ -199,6 +273,11 @@ fn generate_create_table_sql(table: &str, columns: &[ResolvedColumn]) -> String 
          tx_index INTEGER NOT NULL,\n  \
          log_index INTEGER NOT NULL"
     );
+
+    // Context columns (between standard and user columns)
+    for cf in context_fields {
+        let _ = write!(sql, ",\n  {} {}", cf.pg_column_name(), cf.pg_type());
+    }
 
     for col in columns {
         let _ = write!(sql, ",\n  {} {} NOT NULL", col.column_name, col.pg_type);
@@ -219,26 +298,48 @@ fn generate_indexes_sql(table: &str) -> Vec<String> {
 
 /// Generate the INSERT SQL with positional parameters.
 #[must_use]
-fn generate_insert_sql(table: &str, columns: &[ResolvedColumn]) -> String {
+fn generate_insert_sql(
+    table: &str,
+    context_fields: &[ContextField],
+    columns: &[ResolvedColumn],
+) -> String {
     use std::fmt::Write;
 
     let mut col_names = String::from("block_number, tx_hash, tx_index, log_index");
+
+    // Context columns
+    for cf in context_fields {
+        col_names.push_str(", ");
+        col_names.push_str(cf.pg_column_name());
+    }
+
     for col in columns {
         col_names.push_str(", ");
         col_names.push_str(&col.column_name);
     }
 
-    // Standard columns ($1-$4) have native Rust type bindings.
-    // User columns may need explicit casts when bound as text (e.g. numeric).
+    // Standard columns ($1-$4), then context ($5...), then user columns.
     let mut params = String::from("$1, $2, $3, $4");
-    for (i, col) in columns.iter().enumerate() {
+    let mut param_idx = 5usize;
+
+    for cf in context_fields {
         params.push_str(", ");
-        let param_idx = i + 5;
+        if matches!(cf, ContextField::TxValue) {
+            let _ = write!(params, "${param_idx}::numeric");
+        } else {
+            let _ = write!(params, "${param_idx}");
+        }
+        param_idx += 1;
+    }
+
+    for col in columns {
+        params.push_str(", ");
         if col.pg_type == "numeric" {
             let _ = write!(params, "${param_idx}::numeric");
         } else {
             let _ = write!(params, "${param_idx}");
         }
+        param_idx += 1;
     }
 
     format!(
@@ -340,6 +441,13 @@ pub fn resolve_config(
                 )
             })?;
 
+            // Resolve context fields
+            let context_fields = resolve_context_fields(
+                toml_event.context.as_deref(),
+                &contract.name,
+                &toml_event.name,
+            )?;
+
             // Resolve columns
             let columns = resolve_columns(
                 toml_event.columns.as_deref(),
@@ -349,15 +457,17 @@ pub fn resolve_config(
             )?;
 
             let create_table_sql =
-                generate_create_table_sql(&toml_event.table, &columns);
+                generate_create_table_sql(&toml_event.table, &context_fields, &columns);
             let create_indexes_sql = generate_indexes_sql(&toml_event.table);
-            let insert_sql = generate_insert_sql(&toml_event.table, &columns);
+            let insert_sql =
+                generate_insert_sql(&toml_event.table, &context_fields, &columns);
             let rollback_sql = generate_rollback_sql(&toml_event.table);
 
             resolved_events.push(ResolvedEvent {
                 event_name: toml_event.name.clone(),
                 contract_name: contract.name.clone(),
                 table_name: toml_event.table.clone(),
+                context_fields,
                 columns,
                 insert_sql,
                 create_table_sql,
@@ -451,6 +561,40 @@ fn resolve_columns(
             Ok(resolved)
         }
     }
+}
+
+/// Resolve context fields from optional TOML string list.
+///
+/// # Errors
+///
+/// Returns an error if any context field name is unrecognized or duplicated.
+fn resolve_context_fields(
+    names: Option<&[String]>,
+    contract_name: &str,
+    event_name: &str,
+) -> eyre::Result<Vec<ContextField>> {
+    let Some(names) = names else {
+        return Ok(Vec::new());
+    };
+
+    let mut fields = Vec::with_capacity(names.len());
+    let mut seen = HashSet::new();
+
+    for name in names {
+        let field = ContextField::from_name(name).wrap_err_with(|| {
+            format!("in event '{contract_name}.{event_name}'")
+        })?;
+
+        if !seen.insert(name.as_str()) {
+            return Err(eyre::eyre!(
+                "duplicate context field '{name}' in event '{contract_name}.{event_name}'"
+            ));
+        }
+
+        fields.push(field);
+    }
+
+    Ok(fields)
 }
 
 #[cfg(test)]
@@ -599,7 +743,7 @@ table = "usdc_approvals"
             },
         ];
 
-        let sql = generate_create_table_sql("usdc_transfers", &columns);
+        let sql = generate_create_table_sql("usdc_transfers", &[], &columns);
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS usdc_transfers"));
         assert!(sql.contains("id BIGSERIAL PRIMARY KEY"));
         assert!(sql.contains("block_number BIGINT NOT NULL"));
@@ -607,6 +751,31 @@ table = "usdc_approvals"
         assert!(sql.contains("from_address text NOT NULL"));
         assert!(sql.contains("value numeric NOT NULL"));
         assert!(sql.contains("UNIQUE (block_number, tx_index, log_index)"));
+    }
+
+    #[test]
+    fn generate_create_table_with_context() {
+        let ctx = vec![ContextField::BlockTimestamp, ContextField::TxFrom];
+        let columns = vec![ResolvedColumn {
+            column_name: "value".to_string(),
+            param_name: "value".to_string(),
+            pg_type: "numeric".to_string(),
+        }];
+
+        let sql = generate_create_table_sql("t", &ctx, &columns);
+        // Context columns appear between standard and user columns
+        assert!(sql.contains("block_timestamp BIGINT NOT NULL"));
+        assert!(sql.contains("tx_from TEXT NOT NULL"));
+        assert!(sql.contains("value numeric NOT NULL"));
+    }
+
+    #[test]
+    fn generate_create_table_with_nullable_tx_to() {
+        let ctx = vec![ContextField::TxTo];
+        let sql = generate_create_table_sql("t", &ctx, &[]);
+        // tx_to should be nullable (no NOT NULL)
+        assert!(sql.contains("tx_to TEXT"));
+        assert!(!sql.contains("tx_to TEXT NOT NULL"));
     }
 
     #[test]
@@ -624,11 +793,33 @@ table = "usdc_approvals"
             },
         ];
 
-        let sql = generate_insert_sql("usdc_transfers", &columns);
+        let sql = generate_insert_sql("usdc_transfers", &[], &columns);
         assert!(sql.contains("INSERT INTO usdc_transfers"));
         assert!(sql.contains("block_number, tx_hash, tx_index, log_index, from_address, to_address"));
         assert!(sql.contains("$1, $2, $3, $4, $5, $6"));
         assert!(sql.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn generate_insert_with_context() {
+        let ctx = vec![ContextField::BlockTimestamp, ContextField::TxFrom];
+        let columns = vec![ResolvedColumn {
+            column_name: "value".to_string(),
+            param_name: "value".to_string(),
+            pg_type: "numeric".to_string(),
+        }];
+
+        let sql = generate_insert_sql("t", &ctx, &columns);
+        // Context columns between standard ($1-$4) and user columns
+        assert!(sql.contains("block_timestamp, tx_from, value"));
+        assert!(sql.contains("$5, $6, $7::numeric"));
+    }
+
+    #[test]
+    fn generate_insert_tx_value_gets_numeric_cast() {
+        let ctx = vec![ContextField::TxValue];
+        let sql = generate_insert_sql("t", &ctx, &[]);
+        assert!(sql.contains("$5::numeric"));
     }
 
     #[test]
@@ -809,6 +1000,75 @@ table = "same_table"
         assert!(err.to_string().contains("duplicate table name"));
 
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_context_fields_from_toml() -> eyre::Result<()> {
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+context = ["block_timestamp", "tx_from"]
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        let ctx = config.contracts[0].events[0].context.as_ref();
+        assert!(ctx.is_some());
+        let ctx = ctx.ok_or_else(|| eyre::eyre!("missing context"))?;
+        assert_eq!(ctx.len(), 2);
+        assert_eq!(ctx[0], "block_timestamp");
+        assert_eq!(ctx[1], "tx_from");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_context_fields_valid() -> eyre::Result<()> {
+        let names = vec![
+            "block_timestamp".to_string(),
+            "block_hash".to_string(),
+            "tx_from".to_string(),
+            "tx_to".to_string(),
+            "tx_value".to_string(),
+            "tx_gas_price".to_string(),
+        ];
+        let fields = resolve_context_fields(Some(&names), "Test", "Foo")?;
+        assert_eq!(fields.len(), 6);
+        assert_eq!(fields[0], ContextField::BlockTimestamp);
+        assert_eq!(fields[5], ContextField::TxGasPrice);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_context_fields_unknown_errors() -> eyre::Result<()> {
+        let names = vec!["nonexistent".to_string()];
+        let Err(err) = resolve_context_fields(Some(&names), "Test", "Foo") else {
+            return Err(eyre::eyre!("expected error for unknown context field"));
+        };
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown context field"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_context_fields_duplicate_errors() -> eyre::Result<()> {
+        let names = vec!["block_timestamp".to_string(), "block_timestamp".to_string()];
+        let Err(err) = resolve_context_fields(Some(&names), "Test", "Foo") else {
+            return Err(eyre::eyre!("expected error for duplicate context field"));
+        };
+        assert!(err.to_string().contains("duplicate context field"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_context_fields_none_is_empty() -> eyre::Result<()> {
+        let fields = resolve_context_fields(None, "Test", "Foo")?;
+        assert!(fields.is_empty());
         Ok(())
     }
 
