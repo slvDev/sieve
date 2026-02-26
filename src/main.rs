@@ -10,8 +10,10 @@ mod filter;
 mod handler;
 mod p2p;
 mod sync;
+mod toml_config;
 
 use clap::Parser;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -26,19 +28,20 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     let cli = cli::Cli::parse();
+    let startup = load_toml_config(&cli)?;
 
     // Validate --end-block if provided
     if let Some(end_block) = cli.end_block {
-        if end_block < cli.start_block {
+        if end_block < startup.start_block {
             return Err(eyre::eyre!(
-                "--end-block ({end_block}) must be >= --start-block ({})",
-                cli.start_block
+                "--end-block ({end_block}) must be >= start_block ({})",
+                startup.start_block
             ));
         }
     }
 
     info!(
-        start_block = cli.start_block,
+        start_block = startup.start_block,
         end_block = cli.end_block,
         mode = if cli.end_block.is_some() { "historical" } else { "follow" },
         "sieve starting"
@@ -49,28 +52,101 @@ async fn main() -> eyre::Result<()> {
     tokio::spawn(shutdown_handler(stop_tx));
 
     // Database — connect early so checkpoint check is fast (before P2P)
-    let db = Arc::new(db::Database::connect(&cli.database_url).await?);
+    let db = Arc::new(db::Database::connect(&startup.database_url).await?);
+    db::create_user_tables(&db, &startup.resolved_events).await?;
 
-    // Index config
-    let index_config = Arc::new(config::usdc_transfer_config()?);
-    info!(
-        contracts = index_config.contracts.len(),
-        "loaded index config"
-    );
+    let index_config = Arc::new(startup.index_config);
+    info!(contracts = index_config.contracts.len(), "loaded index config");
 
-    // Handlers
-    let handlers = Arc::new(handler::HandlerRegistry::new(vec![Box::new(
-        handler::UsdcTransferHandler,
-    )]));
+    // Build handlers from resolved events
+    let handlers: Vec<Box<dyn handler::EventHandler>> = startup
+        .resolved_events
+        .into_iter()
+        .map(|re| -> Box<dyn handler::EventHandler> {
+            Box::new(handler::ConfigDrivenHandler::new(re))
+        })
+        .collect();
+    let handlers = Arc::new(handler::HandlerRegistry::new(handlers));
     info!(handlers = handlers.len(), "registered event handlers");
 
     // P2P
     let session = p2p::connect_mainnet_peers().await?;
     info!(peers = session.pool.len(), "connected to ethereum p2p network");
 
+    run_indexer(&cli, startup.start_block, &session, index_config, db, handlers, stop_rx).await
+}
+
+/// Resolved startup parameters from TOML config + CLI.
+#[derive(Debug)]
+struct StartupConfig {
+    database_url: String,
+    index_config: config::IndexConfig,
+    resolved_events: Vec<toml_config::ResolvedEvent>,
+    start_block: u64,
+}
+
+/// Load TOML config, resolve ABI files, and compute startup parameters.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read, parsed, or resolved.
+fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
+    let config_path = Path::new(&cli.config);
+    let sieve_config = toml_config::load_config(config_path)?;
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+
+    // Resolve database URL: CLI > env > TOML
+    let database_url = cli
+        .database_url
+        .clone()
+        .or_else(|| {
+            sieve_config
+                .database
+                .as_ref()
+                .and_then(|d| d.url.clone())
+        })
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "no database URL provided. Use --database-url, DATABASE_URL env var, or [database].url in config"
+            )
+        })?;
+
+    let resolved = toml_config::resolve_config(&sieve_config, config_dir)?;
+
+    // Compute effective start_block: CLI override or minimum across contracts
+    let start_block = cli.start_block.unwrap_or_else(|| {
+        sieve_config
+            .contracts
+            .iter()
+            .map(|c| c.start_block)
+            .min()
+            .unwrap_or(0)
+    });
+
+    Ok(StartupConfig {
+        database_url,
+        index_config: resolved.index_config,
+        resolved_events: resolved.resolved_events,
+        start_block,
+    })
+}
+
+/// Run the indexer in either historical or follow mode.
+///
+/// # Errors
+///
+/// Returns an error on sync or database failures.
+async fn run_indexer(
+    cli: &cli::Cli,
+    start_block: u64,
+    session: &p2p::NetworkSession,
+    index_config: Arc<config::IndexConfig>,
+    db: Arc<db::Database>,
+    handlers: Arc<handler::HandlerRegistry>,
+    stop_rx: watch::Receiver<bool>,
+) -> eyre::Result<()> {
     if let Some(end_block) = cli.end_block {
-        // Historical mode: sync a fixed range then exit
-        let effective_start = resolve_effective_start(&db, cli.start_block, end_block).await?;
+        let effective_start = resolve_effective_start(&db, start_block, end_block).await?;
 
         if effective_start > end_block {
             info!("nothing to index");
@@ -98,10 +174,9 @@ async fn main() -> eyre::Result<()> {
             "sync complete"
         );
     } else {
-        // Follow mode: sync to tip, then follow new blocks continuously
         sync::follow::run_follow_loop(
             Arc::clone(&session.pool),
-            cli.start_block,
+            start_block,
             index_config,
             db,
             handlers,

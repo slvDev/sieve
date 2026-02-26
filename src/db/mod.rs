@@ -8,6 +8,7 @@
 //! Transaction model: one Postgres transaction per block, so all handler
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
+use crate::toml_config::ResolvedEvent;
 use alloy_primitives::B256;
 use eyre::WrapErr;
 use sqlx::postgres::PgPoolOptions;
@@ -101,8 +102,7 @@ impl Database {
         }
     }
 
-    /// Expose the pool for integration tests.
-    #[cfg(test)]
+    /// Expose the connection pool.
     pub const fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -181,6 +181,35 @@ pub async fn rollback_to(
     .await
     .wrap_err("failed to reset checkpoint after rollback")?;
 
+    Ok(())
+}
+
+/// Create user-defined tables from resolved TOML config.
+///
+/// Runs `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`
+/// for each resolved event. Safe to run repeatedly (idempotent DDL).
+///
+/// # Errors
+///
+/// Returns an error if any DDL statement fails.
+pub async fn create_user_tables(db: &Database, events: &[ResolvedEvent]) -> eyre::Result<()> {
+    for event in events {
+        sqlx::raw_sql(&event.create_table_sql)
+            .execute(db.pool())
+            .await
+            .wrap_err_with(|| format!("failed to create table '{}'", event.table_name))?;
+
+        for index_sql in &event.create_indexes_sql {
+            sqlx::raw_sql(index_sql)
+                .execute(db.pool())
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to create index for table '{}'", event.table_name)
+                })?;
+        }
+
+        info!(table = %event.table_name, "created user table");
+    }
     Ok(())
 }
 

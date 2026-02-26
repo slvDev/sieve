@@ -5,21 +5,18 @@
 //! address→contract lookup for use during filtering.
 
 use alloy_json_abi::{Event, JsonAbi};
-use alloy_primitives::{address, Address, B256};
+use alloy_primitives::{Address, B256};
 use std::collections::HashMap;
 
 /// Configuration for a single contract to index.
+#[derive(Debug)]
 pub struct ContractConfig {
     /// Human-readable name (e.g. "USDC").
     pub name: String,
     /// On-chain contract address.
     pub address: Address,
-    /// Full parsed ABI.
-    pub abi: JsonAbi,
     /// Events to index, keyed by selector (topic0).
     pub events: HashMap<B256, Event>,
-    /// Block number to start indexing from.
-    pub start_block: u64,
 }
 
 impl ContractConfig {
@@ -35,9 +32,22 @@ impl ContractConfig {
         address: Address,
         abi_json: &str,
         event_names: &[&str],
-        start_block: u64,
     ) -> eyre::Result<Self> {
         let abi: JsonAbi = serde_json::from_str(abi_json)?;
+        Self::from_abi(name, address, &abi, event_names)
+    }
+
+    /// Create a new contract config from an already-parsed ABI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an event name is not found in the ABI.
+    pub fn from_abi(
+        name: impl Into<String>,
+        address: Address,
+        abi: &JsonAbi,
+        event_names: &[&str],
+    ) -> eyre::Result<Self> {
         let mut events = HashMap::with_capacity(event_names.len());
 
         for &event_name in event_names {
@@ -48,21 +58,19 @@ impl ContractConfig {
             let event = event_list
                 .first()
                 .ok_or_else(|| eyre::eyre!("no variants for event '{event_name}'"))?;
-            let selector = event.selector();
-            events.insert(selector, event.clone());
+            events.insert(event.selector(), event.clone());
         }
 
         Ok(Self {
             name: name.into(),
             address,
-            abi,
             events,
-            start_block,
         })
     }
 }
 
 /// Top-level index configuration holding all contracts to watch.
+#[derive(Debug)]
 pub struct IndexConfig {
     /// All contract configurations.
     pub contracts: Vec<ContractConfig>,
@@ -93,12 +101,15 @@ impl IndexConfig {
     }
 }
 
-/// Hardcoded USDC Transfer config for testing/demo.
+/// Hardcoded USDC Transfer config for tests.
 ///
 /// # Errors
 ///
-/// Returns an error if the ABI JSON fails to parse (should not happen).
+/// Returns an error if the ABI JSON fails to parse.
+#[cfg(test)]
 pub fn usdc_transfer_config() -> eyre::Result<IndexConfig> {
+    use alloy_primitives::address;
+
     let abi_json = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]"#;
 
     let contract = ContractConfig::new(
@@ -106,7 +117,6 @@ pub fn usdc_transfer_config() -> eyre::Result<IndexConfig> {
         address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         abi_json,
         &["Transfer"],
-        0,
     )?;
 
     Ok(IndexConfig::new(vec![contract]))
@@ -116,6 +126,7 @@ pub fn usdc_transfer_config() -> eyre::Result<IndexConfig> {
 #[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
 mod tests {
     use super::*;
+    use alloy_primitives::address;
 
     #[test]
     fn transfer_selector_matches_expected() -> eyre::Result<()> {

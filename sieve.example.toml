@@ -1,0 +1,24 @@
+# sieve.example.toml — example config for indexing USDC events
+
+[database]
+url = "postgres://postgres:sieve@localhost:5432/sieve"
+
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21_000_000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+columns = [
+  { param = "from",  name = "from_address", type = "text" },
+  { param = "to",    name = "to_address",   type = "text" },
+  { param = "value", name = "value",        type = "numeric" },
+]
+
+[[contracts.events]]
+name = "Approval"
+table = "usdc_approvals"
+# columns omitted → auto-generated from ABI params with default type mapping
