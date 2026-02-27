@@ -2,6 +2,7 @@
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod api;
 mod cli;
 mod config;
 mod db;
@@ -11,12 +12,16 @@ mod handler;
 mod p2p;
 mod sync;
 mod toml_config;
+mod types;
+#[cfg(test)]
+mod test_utils;
 
 use clap::Parser;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{info, warn};
+use types::BlockNumber;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -32,7 +37,7 @@ async fn main() -> eyre::Result<()> {
 
     // Validate --end-block if provided
     if let Some(end_block) = cli.end_block {
-        if end_block < startup.start_block {
+        if end_block < startup.start_block.as_u64() {
             return Err(eyre::eyre!(
                 "--end-block ({end_block}) must be >= start_block ({})",
                 startup.start_block
@@ -41,7 +46,7 @@ async fn main() -> eyre::Result<()> {
     }
 
     info!(
-        start_block = startup.start_block,
+        start_block = startup.start_block.as_u64(),
         end_block = cli.end_block,
         mode = if cli.end_block.is_some() { "historical" } else { "follow" },
         "sieve starting"
@@ -61,13 +66,25 @@ async fn main() -> eyre::Result<()> {
     // Build handlers from resolved events
     let handlers: Vec<Box<dyn handler::EventHandler>> = startup
         .resolved_events
-        .into_iter()
+        .iter()
         .map(|re| -> Box<dyn handler::EventHandler> {
-            Box::new(handler::ConfigDrivenHandler::new(re))
+            Box::new(handler::ConfigDrivenHandler::new(re.clone()))
         })
         .collect();
     let handlers = Arc::new(handler::HandlerRegistry::new(handlers));
     info!(handlers = handlers.len(), "registered event handlers");
+
+    // GraphQL API server (optional)
+    if let Some(api_port) = cli.api_port {
+        let schema =
+            api::build_schema(&startup.resolved_events, db.pool().clone())?;
+        let api_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api::run_api_server(api_port, schema, api_stop).await {
+                tracing::error!(error = %e, "API server error");
+            }
+        });
+    }
 
     // P2P
     let session = p2p::connect_mainnet_peers().await?;
@@ -82,7 +99,7 @@ struct StartupConfig {
     database_url: String,
     index_config: config::IndexConfig,
     resolved_events: Vec<toml_config::ResolvedEvent>,
-    start_block: u64,
+    start_block: BlockNumber,
 }
 
 /// Load TOML config, resolve ABI files, and compute startup parameters.
@@ -114,14 +131,14 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
     let resolved = toml_config::resolve_config(&sieve_config, config_dir)?;
 
     // Compute effective start_block: CLI override or minimum across contracts
-    let start_block = cli.start_block.unwrap_or_else(|| {
+    let start_block = BlockNumber::new(cli.start_block.unwrap_or_else(|| {
         sieve_config
             .contracts
             .iter()
             .map(|c| c.start_block)
             .min()
             .unwrap_or(0)
-    });
+    }));
 
     Ok(StartupConfig {
         database_url,
@@ -138,14 +155,15 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 /// Returns an error on sync or database failures.
 async fn run_indexer(
     cli: &cli::Cli,
-    start_block: u64,
+    start_block: BlockNumber,
     session: &p2p::NetworkSession,
     index_config: Arc<config::IndexConfig>,
     db: Arc<db::Database>,
     handlers: Arc<handler::HandlerRegistry>,
     stop_rx: watch::Receiver<bool>,
 ) -> eyre::Result<()> {
-    if let Some(end_block) = cli.end_block {
+    if let Some(end_block_raw) = cli.end_block {
+        let end_block = BlockNumber::new(end_block_raw);
         let effective_start = resolve_effective_start(&db, start_block, end_block).await?;
 
         if effective_start > end_block {
@@ -153,7 +171,7 @@ async fn run_indexer(
             return Ok(());
         }
 
-        let outcome = sync::engine::run_sync(
+        let outcome = sync::run_sync(
             Arc::clone(&session.pool),
             effective_start,
             end_block,
@@ -174,7 +192,7 @@ async fn run_indexer(
             "sync complete"
         );
     } else {
-        sync::follow::run_follow_loop(
+        sync::run_follow_loop(
             Arc::clone(&session.pool),
             start_block,
             index_config,
@@ -195,21 +213,21 @@ async fn run_indexer(
 /// Returns an error if the checkpoint read fails.
 async fn resolve_effective_start(
     db: &db::Database,
-    start_block: u64,
-    end_block: u64,
-) -> eyre::Result<u64> {
+    start_block: BlockNumber,
+    end_block: BlockNumber,
+) -> eyre::Result<BlockNumber> {
     if let Some(checkpoint) = db.last_checkpoint().await? {
         if checkpoint >= end_block {
             info!(
-                checkpoint,
-                end_block,
+                checkpoint = checkpoint.as_u64(),
+                end_block = end_block.as_u64(),
                 "range already indexed, nothing to do"
             );
-            return Ok(end_block + 1); // signals "nothing to index"
+            return Ok(BlockNumber::new(end_block.as_u64() + 1)); // signals "nothing to index"
         }
         if checkpoint >= start_block {
-            let resume_from = checkpoint + 1;
-            info!(checkpoint, resume_from, "resuming from checkpoint");
+            let resume_from = BlockNumber::new(checkpoint.as_u64() + 1);
+            info!(checkpoint = checkpoint.as_u64(), resume_from = resume_from.as_u64(), "resuming from checkpoint");
             return Ok(resume_from);
         }
     }

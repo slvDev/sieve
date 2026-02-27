@@ -9,6 +9,7 @@
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
 use crate::toml_config::ResolvedEvent;
+use crate::types::BlockNumber;
 use alloy_primitives::B256;
 use eyre::WrapErr;
 use sqlx::postgres::PgPoolOptions;
@@ -50,7 +51,7 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn last_checkpoint(&self) -> eyre::Result<Option<u64>> {
+    pub async fn last_checkpoint(&self) -> eyre::Result<Option<BlockNumber>> {
         let row: (i64,) =
             sqlx::query_as("SELECT block_number FROM _sieve_checkpoints WHERE id = 1")
                 .fetch_one(&self.pool)
@@ -60,7 +61,7 @@ impl Database {
         if row.0 == 0 {
             Ok(None)
         } else {
-            Ok(Some(row.0 as u64))
+            Ok(Some(BlockNumber::new(row.0 as u64)))
         }
     }
 
@@ -83,11 +84,11 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn get_block_hash(&self, block_number: u64) -> eyre::Result<Option<B256>> {
+    pub async fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<B256>> {
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
             "SELECT block_hash FROM _sieve_block_hashes WHERE block_number = $1",
         )
-        .bind(block_number as i64)
+        .bind(block_number.as_u64() as i64)
         .fetch_optional(&self.pool)
         .await
         .wrap_err("failed to read block hash")?;
@@ -117,12 +118,12 @@ impl Database {
 /// Returns an error if the UPDATE query fails.
 pub async fn update_checkpoint(
     tx: &mut Transaction<'_, Postgres>,
-    block_number: u64,
+    block_number: BlockNumber,
 ) -> eyre::Result<()> {
     sqlx::query(
         "UPDATE _sieve_checkpoints SET block_number = GREATEST(block_number, $1), updated_at = NOW() WHERE id = 1",
     )
-    .bind(block_number as i64)
+    .bind(block_number.as_u64() as i64)
     .execute(&mut **tx)
     .await
     .wrap_err("failed to update checkpoint")?;
@@ -139,14 +140,14 @@ pub async fn update_checkpoint(
 /// Returns an error if the INSERT/UPDATE query fails.
 pub async fn store_block_hash(
     tx: &mut Transaction<'_, Postgres>,
-    block_number: u64,
+    block_number: BlockNumber,
     block_hash: &[u8],
 ) -> eyre::Result<()> {
     sqlx::query(
         "INSERT INTO _sieve_block_hashes (block_number, block_hash) VALUES ($1, $2) \
          ON CONFLICT (block_number) DO UPDATE SET block_hash = EXCLUDED.block_hash",
     )
-    .bind(block_number as i64)
+    .bind(block_number.as_u64() as i64)
     .bind(block_hash)
     .execute(&mut **tx)
     .await
@@ -164,10 +165,10 @@ pub async fn store_block_hash(
 /// Returns an error if any DELETE/UPDATE query fails.
 pub async fn rollback_to(
     tx: &mut Transaction<'_, Postgres>,
-    block_number: u64,
+    block_number: BlockNumber,
 ) -> eyre::Result<()> {
     sqlx::query("DELETE FROM _sieve_block_hashes WHERE block_number > $1")
-        .bind(block_number as i64)
+        .bind(block_number.as_u64() as i64)
         .execute(&mut **tx)
         .await
         .wrap_err("failed to rollback block hashes")?;
@@ -176,7 +177,7 @@ pub async fn rollback_to(
     sqlx::query(
         "UPDATE _sieve_checkpoints SET block_number = $1, updated_at = NOW() WHERE id = 1",
     )
-    .bind(block_number as i64)
+    .bind(block_number.as_u64() as i64)
     .execute(&mut **tx)
     .await
     .wrap_err("failed to reset checkpoint after rollback")?;
@@ -241,14 +242,14 @@ mod tests {
 
         // Update checkpoint
         let mut tx = db.begin().await?;
-        update_checkpoint(&mut tx, 21_000_100).await?;
+        update_checkpoint(&mut tx, BlockNumber::new(21_000_100)).await?;
         tx.commit()
             .await
             .wrap_err("commit failed")?;
 
         // Should now return the block number
         let checkpoint = db.last_checkpoint().await?;
-        assert_eq!(checkpoint, Some(21_000_100));
+        assert_eq!(checkpoint, Some(BlockNumber::new(21_000_100)));
 
         // Clean up
         sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")
@@ -269,18 +270,18 @@ mod tests {
 
         // Store a hash and read it back
         let mut tx = db.begin().await?;
-        store_block_hash(&mut tx, 99_999, hash_a.as_slice()).await?;
+        store_block_hash(&mut tx, BlockNumber::new(99_999), hash_a.as_slice()).await?;
         tx.commit().await.wrap_err("commit failed")?;
 
-        let stored = db.get_block_hash(99_999).await?;
+        let stored = db.get_block_hash(BlockNumber::new(99_999)).await?;
         assert_eq!(stored, Some(hash_a));
 
         // Overwrite with a different hash (simulates reorg re-indexing)
         let mut tx = db.begin().await?;
-        store_block_hash(&mut tx, 99_999, hash_b.as_slice()).await?;
+        store_block_hash(&mut tx, BlockNumber::new(99_999), hash_b.as_slice()).await?;
         tx.commit().await.wrap_err("commit failed")?;
 
-        let stored = db.get_block_hash(99_999).await?;
+        let stored = db.get_block_hash(BlockNumber::new(99_999)).await?;
         assert_eq!(stored, Some(hash_b));
 
         // Clean up
@@ -302,31 +303,31 @@ mod tests {
         for block in 100..=110u64 {
             let hash = alloy_primitives::B256::repeat_byte(block as u8);
             let mut tx = db.begin().await?;
-            store_block_hash(&mut tx, block, hash.as_slice()).await?;
-            update_checkpoint(&mut tx, block).await?;
+            store_block_hash(&mut tx, BlockNumber::new(block), hash.as_slice()).await?;
+            update_checkpoint(&mut tx, BlockNumber::new(block)).await?;
             tx.commit().await.wrap_err("commit failed")?;
         }
 
         // Rollback to 105
         let mut tx = db.begin().await?;
-        rollback_to(&mut tx, 105).await?;
+        rollback_to(&mut tx, BlockNumber::new(105)).await?;
         tx.commit().await.wrap_err("commit failed")?;
 
         // Blocks 100-105 should still have hashes
         for block in 100..=105u64 {
-            let stored = db.get_block_hash(block).await?;
+            let stored = db.get_block_hash(BlockNumber::new(block)).await?;
             assert!(stored.is_some(), "block {block} hash should exist");
         }
 
         // Blocks 106-110 should be gone
         for block in 106..=110u64 {
-            let stored = db.get_block_hash(block).await?;
+            let stored = db.get_block_hash(BlockNumber::new(block)).await?;
             assert!(stored.is_none(), "block {block} hash should be deleted");
         }
 
         // Checkpoint should be 105
         let checkpoint = db.last_checkpoint().await?;
-        assert_eq!(checkpoint, Some(105));
+        assert_eq!(checkpoint, Some(BlockNumber::new(105)));
 
         // Clean up
         sqlx::query("DELETE FROM _sieve_block_hashes WHERE block_number BETWEEN 100 AND 110")
@@ -354,25 +355,25 @@ mod tests {
 
         // Set checkpoint to 100
         let mut tx = db.begin().await?;
-        update_checkpoint(&mut tx, 100).await?;
+        update_checkpoint(&mut tx, BlockNumber::new(100)).await?;
         tx.commit().await.wrap_err("commit failed")?;
 
         // Try to set checkpoint to 50 (should be ignored by GREATEST)
         let mut tx = db.begin().await?;
-        update_checkpoint(&mut tx, 50).await?;
+        update_checkpoint(&mut tx, BlockNumber::new(50)).await?;
         tx.commit().await.wrap_err("commit failed")?;
 
         // Checkpoint should still be 100
         let checkpoint = db.last_checkpoint().await?;
-        assert_eq!(checkpoint, Some(100));
+        assert_eq!(checkpoint, Some(BlockNumber::new(100)));
 
         // Set checkpoint to 200 (should advance)
         let mut tx = db.begin().await?;
-        update_checkpoint(&mut tx, 200).await?;
+        update_checkpoint(&mut tx, BlockNumber::new(200)).await?;
         tx.commit().await.wrap_err("commit failed")?;
 
         let checkpoint = db.last_checkpoint().await?;
-        assert_eq!(checkpoint, Some(200));
+        assert_eq!(checkpoint, Some(BlockNumber::new(200)));
 
         // Clean up
         sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")

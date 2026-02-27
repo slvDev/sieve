@@ -7,6 +7,7 @@
 
 use crate::config::ContractConfig;
 use crate::filter::FilteredLog;
+use crate::types::BlockNumber;
 use alloy_dyn_abi::{DynSolValue, EventExt};
 use alloy_primitives::B256;
 use std::fmt;
@@ -34,7 +35,7 @@ pub struct DecodedEvent {
     /// Decoded non-indexed (body) parameters (in ABI order).
     pub body: Vec<DecodedParam>,
     /// Block number where the event was emitted.
-    pub block_number: u64,
+    pub block_number: BlockNumber,
     /// Block timestamp (seconds since epoch).
     pub block_timestamp: u64,
     /// Transaction hash that produced the event.
@@ -44,6 +45,10 @@ pub struct DecodedEvent {
     /// Log index within the transaction's receipt.
     pub log_index: usize,
 }
+
+// Compile-time size assertion for hot type (reth pattern).
+#[cfg(target_pointer_width = "64")]
+const _: [(); 160] = [(); core::mem::size_of::<DecodedEvent>()];
 
 impl fmt::Display for DecodedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,7 +64,7 @@ impl fmt::Display for DecodedEvent {
         write!(
             f,
             ") block={} ts={} tx={} log={}",
-            self.block_number, self.block_timestamp, self.tx_index, self.log_index
+            self.block_number.as_u64(), self.block_timestamp, self.tx_index, self.log_index
         )
     }
 }
@@ -127,6 +132,7 @@ pub fn decode_log(log: &FilteredLog, contract: &ContractConfig) -> eyre::Result<
 mod tests {
     use super::*;
     use crate::config::usdc_transfer_config;
+    use crate::types::BlockNumber;
     use alloy_primitives::{address, Bytes, Log, LogData, U256};
     use eyre::WrapErr;
 
@@ -162,7 +168,7 @@ mod tests {
 
         let filtered = FilteredLog {
             log,
-            block_number: 21_000_042,
+            block_number: BlockNumber::new(21_000_042),
             block_timestamp: 1_700_000_000,
             tx_hash: B256::repeat_byte(0xBB),
             tx_index: 0,
@@ -173,7 +179,7 @@ mod tests {
 
         assert_eq!(decoded.event_name, "Transfer");
         assert_eq!(decoded.contract_name, "USDC");
-        assert_eq!(decoded.block_number, 21_000_042);
+        assert_eq!(decoded.block_number, BlockNumber::new(21_000_042));
         assert_eq!(decoded.tx_index, 0);
         assert_eq!(decoded.log_index, 0);
 

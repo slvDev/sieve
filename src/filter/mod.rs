@@ -9,6 +9,7 @@
 
 use crate::config::IndexConfig;
 use crate::sync::BlockPayload;
+use crate::types::BlockNumber;
 use alloy_primitives::{Log, LogData, B256};
 use tracing::warn;
 
@@ -17,7 +18,7 @@ pub struct FilteredLog {
     /// The raw log (address + topics + data).
     pub log: Log<LogData>,
     /// Block number where this log was emitted.
-    pub block_number: u64,
+    pub block_number: BlockNumber,
     /// Block timestamp (seconds since epoch).
     pub block_timestamp: u64,
     /// Transaction hash that produced this log.
@@ -28,6 +29,10 @@ pub struct FilteredLog {
     pub log_index: usize,
 }
 
+// Compile-time size assertion for hot type (reth pattern).
+#[cfg(target_pointer_width = "64")]
+const _: [(); 144] = [(); core::mem::size_of::<FilteredLog>()];
+
 /// Filter a block's receipts against the index config.
 ///
 /// Returns only logs whose address matches a configured contract AND whose
@@ -37,15 +42,15 @@ pub struct FilteredLog {
 /// then zips for iteration.
 #[must_use]
 pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<FilteredLog> {
-    let block_number = payload.header.number;
-    let block_timestamp = payload.header.timestamp;
+    let block_number = BlockNumber::new(payload.header().number);
+    let block_timestamp = payload.header().timestamp;
 
     // Validate receipt/transaction count match
-    if payload.receipts.len() != payload.body.transactions.len() {
+    if payload.receipts().len() != payload.body().transactions.len() {
         warn!(
-            block_number,
-            receipts = payload.receipts.len(),
-            transactions = payload.body.transactions.len(),
+            block_number = block_number.as_u64(),
+            receipts = payload.receipts().len(),
+            transactions = payload.body().transactions.len(),
             "receipt/transaction count mismatch, skipping block"
         );
         return Vec::new();
@@ -53,7 +58,7 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
 
     // Pre-compute tx hashes upfront
     let tx_hashes: Vec<B256> = payload
-        .body
+        .body()
         .transactions
         .iter()
         .map(|tx| *tx.tx_hash())
@@ -62,7 +67,7 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
     let mut matched = Vec::new();
 
     for (tx_index, (receipt, tx_hash)) in payload
-        .receipts
+        .receipts()
         .iter()
         .zip(tx_hashes.iter())
         .enumerate()
@@ -102,27 +107,11 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
 mod tests {
     use super::*;
     use crate::config::usdc_transfer_config;
-    use alloy_primitives::{address, bytes, Address, Bytes, B256};
-    use reth_ethereum_primitives::{BlockBody, Receipt};
+    use crate::test_utils::{build_test_transaction, make_log, make_receipt};
+    use crate::types::BlockNumber;
+    use alloy_primitives::{address, bytes, Bytes, B256};
+    use reth_ethereum_primitives::BlockBody;
     use reth_primitives_traits::Header;
-
-    /// Build a log with given address and topics.
-    fn make_log(addr: Address, topics: Vec<B256>, data: Bytes) -> Log<LogData> {
-        Log {
-            address: addr,
-            data: LogData::new_unchecked(topics, data),
-        }
-    }
-
-    /// Build a minimal receipt with given logs.
-    fn make_receipt(logs: Vec<Log<LogData>>) -> Receipt {
-        Receipt {
-            tx_type: alloy_consensus::TxType::Legacy,
-            success: true,
-            cumulative_gas_used: 0,
-            logs,
-        }
-    }
 
     #[test]
     fn filter_matches_correct_logs() -> eyre::Result<()> {
@@ -157,8 +146,6 @@ mod tests {
 
         let receipt = make_receipt(vec![matching_log, wrong_addr_log, wrong_topic_log]);
 
-        // We need a transaction in the body for the tx_hash lookup.
-        // Build a minimal legacy transaction.
         let tx = build_test_transaction();
         let body = BlockBody {
             transactions: vec![tx],
@@ -171,16 +158,12 @@ mod tests {
             ..Default::default()
         };
 
-        let payload = BlockPayload {
-            header,
-            body,
-            receipts: vec![receipt],
-        };
+        let payload = BlockPayload::new(header, body, vec![receipt]);
 
         let matched = filter_block(&payload, &config);
 
         assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].block_number, 21_000_042);
+        assert_eq!(matched[0].block_number, BlockNumber::new(21_000_042));
         assert_eq!(matched[0].log.address, usdc_addr);
         assert_eq!(matched[0].tx_index, 0);
         assert_eq!(matched[0].log_index, 0);
@@ -196,7 +179,6 @@ mod tests {
                 .parse()
                 .map_err(|e| eyre::eyre!("parse: {e}"))?;
 
-        // One receipt with a matching log, but zero transactions in body
         let log = make_log(usdc_addr, vec![transfer_selector], Bytes::new());
         let receipt = make_receipt(vec![log]);
         let body = BlockBody {
@@ -204,11 +186,7 @@ mod tests {
             ommers: vec![],
             withdrawals: None,
         };
-        let payload = BlockPayload {
-            header: Header::default(),
-            body,
-            receipts: vec![receipt],
-        };
+        let payload = BlockPayload::new(Header::default(), body, vec![receipt]);
 
         let matched = filter_block(&payload, &config);
         assert!(matched.is_empty(), "should skip block on count mismatch");
@@ -224,34 +202,10 @@ mod tests {
             ommers: vec![],
             withdrawals: None,
         };
-        let payload = BlockPayload {
-            header,
-            body,
-            receipts: vec![],
-        };
+        let payload = BlockPayload::new(header, body, vec![]);
 
         let matched = filter_block(&payload, &config);
         assert!(matched.is_empty());
         Ok(())
-    }
-
-    /// Build a minimal legacy transaction for testing.
-    fn build_test_transaction() -> reth_ethereum_primitives::TransactionSigned {
-        use alloy_consensus::{Signed, TxLegacy};
-        use alloy_primitives::{Signature, TxKind, U256};
-
-        let tx = TxLegacy {
-            chain_id: Some(1),
-            nonce: 0,
-            gas_price: 0,
-            gas_limit: 21000,
-            to: TxKind::Call(Address::ZERO),
-            value: U256::ZERO,
-            input: Bytes::new(),
-        };
-
-        let sig = Signature::new(U256::from(1u64), U256::from(1u64), false);
-        let signed = Signed::new_unchecked(tx, sig, B256::repeat_byte(0xAA));
-        reth_ethereum_primitives::TransactionSigned::Legacy(signed)
     }
 }

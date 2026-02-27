@@ -9,6 +9,7 @@
 
 use crate::decode::{DecodedEvent, DecodedParam};
 use crate::toml_config::{ContextField, ResolvedEvent};
+use crate::types::BlockNumber;
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, U256};
 use async_trait::async_trait;
@@ -75,7 +76,7 @@ pub trait EventHandler: Send + Sync {
     /// Returns an error if the DELETE query fails.
     async fn rollback(
         &self,
-        block_number: u64,
+        block_number: BlockNumber,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()>;
 }
@@ -131,7 +132,7 @@ impl HandlerRegistry {
     /// Returns an error if any handler's rollback fails.
     pub async fn rollback_all(
         &self,
-        block_number: u64,
+        block_number: BlockNumber,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()> {
         for handler in &self.handlers {
@@ -197,7 +198,7 @@ impl EventHandler for ConfigDrivenHandler {
     ) -> eyre::Result<()> {
         debug!(
             handler = %self.handler_name,
-            block = event.block_number,
+            block = event.block_number.as_u64(),
             table = %self.resolved.table_name,
             "inserting event"
         );
@@ -207,7 +208,7 @@ impl EventHandler for ConfigDrivenHandler {
 
         // Bind standard columns: block_number, tx_hash, tx_index, log_index
         query = query
-            .bind(event.block_number as i64)
+            .bind(event.block_number.as_u64() as i64)
             .bind(event.tx_hash.as_slice())
             .bind(event.tx_index as i32)
             .bind(event.log_index as i32);
@@ -247,11 +248,11 @@ impl EventHandler for ConfigDrivenHandler {
 
     async fn rollback(
         &self,
-        block_number: u64,
+        block_number: BlockNumber,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()> {
         sqlx::query(&self.resolved.rollback_sql)
-            .bind(block_number as i64)
+            .bind(block_number.as_u64() as i64)
             .execute(&mut **tx)
             .await
             .wrap_err_with(|| format!("failed to rollback '{}'", self.resolved.table_name))?;
@@ -367,7 +368,7 @@ impl EventHandler for UsdcTransferHandler {
         let value = extract_uint(&event.body, "value")?;
 
         debug!(
-            block = event.block_number,
+            block = event.block_number.as_u64(),
             from = %from,
             to = %to,
             value = %value,
@@ -379,7 +380,7 @@ impl EventHandler for UsdcTransferHandler {
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (block_number, tx_index, log_index) DO NOTHING",
         )
-        .bind(event.block_number as i64)
+        .bind(event.block_number.as_u64() as i64)
         .bind(event.tx_hash.as_slice())
         .bind(event.tx_index as i32)
         .bind(event.log_index as i32)
@@ -395,11 +396,11 @@ impl EventHandler for UsdcTransferHandler {
 
     async fn rollback(
         &self,
-        block_number: u64,
+        block_number: BlockNumber,
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()> {
         sqlx::query("DELETE FROM usdc_transfers WHERE block_number > $1")
-            .bind(block_number as i64)
+            .bind(block_number.as_u64() as i64)
             .execute(&mut **tx)
             .await
             .wrap_err("failed to rollback usdc_transfers")?;
@@ -454,6 +455,7 @@ mod tests {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{address, B256, I256, U256};
     use crate::decode::{DecodedEvent, DecodedParam};
+    use crate::types::BlockNumber;
 
     fn make_test_event() -> DecodedEvent {
         let from = address!("1111111111111111111111111111111111111111");
@@ -479,7 +481,7 @@ mod tests {
                 solidity_type: "uint256".to_string(),
                 value: DynSolValue::Uint(U256::from(1_000_000u64), 256),
             }],
-            block_number: 21_000_042,
+            block_number: BlockNumber::new(21_000_042),
             block_timestamp: 1_700_000_000,
             tx_hash: B256::repeat_byte(0xBB),
             tx_index: 5,

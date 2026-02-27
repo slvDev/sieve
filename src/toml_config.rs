@@ -74,6 +74,7 @@ pub struct TomlColumn {
 
 /// A context field that enriches events with block/transaction data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContextField {
     /// Block timestamp (seconds since epoch).
     BlockTimestamp,
