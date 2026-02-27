@@ -21,6 +21,10 @@ pub struct Cli {
     /// PostgreSQL connection URL. Falls back to DATABASE_URL env var, then config file.
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: Option<String>,
+
+    /// Port for the GraphQL API server. Omit to disable.
+    #[arg(long)]
+    pub api_port: Option<u16>,
 }
 
 #[cfg(test)]
@@ -75,6 +79,20 @@ mod tests {
     fn end_block_is_optional() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["sieve"])?;
         assert_eq!(cli.end_block, None);
+        Ok(())
+    }
+
+    #[test]
+    fn api_port_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "--api-port", "8080"])?;
+        assert_eq!(cli.api_port, Some(8080));
+        Ok(())
+    }
+
+    #[test]
+    fn api_port_is_optional() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve"])?;
+        assert!(cli.api_port.is_none());
         Ok(())
     }
 }
