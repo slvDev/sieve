@@ -37,6 +37,14 @@ pub fn build_columns_meta(event: &ResolvedEvent) -> Vec<ColumnMeta> {
         ColumnMeta { name: "log_index".to_string(), pg_type: "integer".to_string(), nullable: false },
     ];
 
+    if event.is_factory_child {
+        cols.push(ColumnMeta {
+            name: "contract_address".to_string(),
+            pg_type: "text".to_string(),
+            nullable: false,
+        });
+    }
+
     for cf in &event.context_fields {
         cols.push(ColumnMeta {
             name: cf.pg_column_name().to_string(),
@@ -191,6 +199,8 @@ pub fn operators_for_type(pg_type: &str) -> Vec<(&'static str, TypeRef)> {
             ("_ne", TypeRef::named(TypeRef::STRING)),
             ("_contains", TypeRef::named(TypeRef::STRING)),
             ("_starts_with", TypeRef::named(TypeRef::STRING)),
+            ("_in", TypeRef::named_list(TypeRef::STRING)),
+            ("_not_in", TypeRef::named_list(TypeRef::STRING)),
         ],
         "bigint" | "numeric" | "integer" | "bigserial" => vec![
             ("", TypeRef::named(TypeRef::STRING)),
@@ -199,17 +209,25 @@ pub fn operators_for_type(pg_type: &str) -> Vec<(&'static str, TypeRef)> {
             ("_gte", TypeRef::named(TypeRef::STRING)),
             ("_lt", TypeRef::named(TypeRef::STRING)),
             ("_lte", TypeRef::named(TypeRef::STRING)),
+            ("_in", TypeRef::named_list(TypeRef::STRING)),
+            ("_not_in", TypeRef::named_list(TypeRef::STRING)),
         ],
         "boolean" => vec![
             ("", TypeRef::named(TypeRef::BOOLEAN)),
             ("_ne", TypeRef::named(TypeRef::BOOLEAN)),
+            ("_in", TypeRef::named_list(TypeRef::BOOLEAN)),
+            ("_not_in", TypeRef::named_list(TypeRef::BOOLEAN)),
         ],
         "bytea" => vec![
             ("", TypeRef::named(TypeRef::STRING)),
             ("_ne", TypeRef::named(TypeRef::STRING)),
+            ("_in", TypeRef::named_list(TypeRef::STRING)),
+            ("_not_in", TypeRef::named_list(TypeRef::STRING)),
         ],
         _ => vec![
             ("", TypeRef::named(TypeRef::STRING)),
+            ("_in", TypeRef::named_list(TypeRef::STRING)),
+            ("_not_in", TypeRef::named_list(TypeRef::STRING)),
         ],
     }
 }
@@ -259,6 +277,7 @@ mod tests {
             create_table_sql: String::new(),
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
+            is_factory_child: false,
         }
     }
 
@@ -318,19 +337,47 @@ mod tests {
     fn operators_for_text_type() {
         let ops = operators_for_type("text");
         let suffixes: Vec<&str> = ops.iter().map(|(s, _)| *s).collect();
-        assert_eq!(suffixes, vec!["", "_ne", "_contains", "_starts_with"]);
+        assert_eq!(
+            suffixes,
+            vec!["", "_ne", "_contains", "_starts_with", "_in", "_not_in"]
+        );
     }
 
     #[test]
     fn operators_for_numeric_type() {
         let ops = operators_for_type("bigint");
         let suffixes: Vec<&str> = ops.iter().map(|(s, _)| *s).collect();
-        assert_eq!(suffixes, vec!["", "_ne", "_gt", "_gte", "_lt", "_lte"]);
+        assert_eq!(
+            suffixes,
+            vec!["", "_ne", "_gt", "_gte", "_lt", "_lte", "_in", "_not_in"]
+        );
     }
 
     #[test]
     fn operators_for_boolean_type() {
         let ops = operators_for_type("boolean");
-        assert_eq!(ops.len(), 2);
+        assert_eq!(ops.len(), 4);
+    }
+
+    #[test]
+    fn factory_child_columns_meta() {
+        let mut event = test_event();
+        event.is_factory_child = true;
+
+        let meta = build_columns_meta(&event);
+        let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
+
+        // contract_address appears after standard columns, before context columns
+        assert_eq!(
+            names,
+            vec!["id", "block_number", "tx_hash", "tx_index", "log_index",
+                 "contract_address", "block_timestamp", "tx_from", "from_address", "value"]
+        );
+
+        // contract_address is text, not nullable
+        let ca = meta.iter().find(|c| c.name == "contract_address");
+        assert!(ca.is_some());
+        assert_eq!(ca.map(|c| c.pg_type.as_str()), Some("text"));
+        assert!(!ca.is_none_or(|c| c.nullable));
     }
 }

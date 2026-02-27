@@ -24,6 +24,8 @@ pub enum FilterOp {
     Lte,
     Contains,
     StartsWith,
+    In,
+    NotIn,
 }
 
 /// A typed SQL parameter value.
@@ -34,6 +36,8 @@ pub enum SqlParam {
     Int64(i64),
     Int32(i32),
     Bool(bool),
+    /// Intermediate container for IN/NOT IN lists; flattened before binding.
+    List(Vec<Self>),
 }
 
 /// A parsed filter condition ready for SQL generation.
@@ -51,11 +55,13 @@ pub struct FilterCondition {
 const SUFFIXES: &[(&str, FilterOp)] = &[
     ("_starts_with", FilterOp::StartsWith),
     ("_contains", FilterOp::Contains),
+    ("_not_in", FilterOp::NotIn),
     ("_gte", FilterOp::Gte),
     ("_lte", FilterOp::Lte),
     ("_gt", FilterOp::Gt),
     ("_lt", FilterOp::Lt),
     ("_ne", FilterOp::Ne),
+    ("_in", FilterOp::In),
 ];
 
 /// Parse a filter key like `"block_number_gte"` into `("block_number", Gte)`.
@@ -111,7 +117,7 @@ pub const DEFAULT_LIMIT: i64 = 100;
 pub fn build_select(
     table: &str,
     select_clause: &str,
-    filters: &[FilterCondition],
+    where_clause: Option<&WhereClause>,
     order_by: &str,
     order_dir: &str,
     limit: i64,
@@ -121,15 +127,12 @@ pub fn build_select(
     let mut params: Vec<SqlParam> = Vec::new();
     let mut param_idx = 1usize;
 
-    if !filters.is_empty() {
-        let mut conditions = Vec::with_capacity(filters.len());
-        for f in filters {
-            let condition = build_condition(&f.column, &f.pg_type, f.op, &mut param_idx);
-            conditions.push(condition);
-            params.push(f.value.clone());
+    if let Some(wc) = where_clause {
+        let where_sql = build_where_sql(wc, &mut params, &mut param_idx);
+        if !where_sql.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_sql);
         }
-        sql.push_str(" WHERE ");
-        sql.push_str(&conditions.join(" AND "));
     }
 
     let _ = write!(sql, " ORDER BY {order_by} {order_dir}");
@@ -201,6 +204,8 @@ fn build_condition(column: &str, pg_type: &str, op: FilterOp, param_idx: &mut us
             }
         }
         FilterOp::Contains | FilterOp::StartsWith => format!("{column} LIKE ${idx}"),
+        // In/NotIn are handled by build_single_filter_sql, not build_condition
+        FilterOp::In | FilterOp::NotIn => format!("{column} = ${idx}"),
     }
 }
 
@@ -258,36 +263,219 @@ fn value_as_string(value: &async_graphql::Value) -> eyre::Result<String> {
     }
 }
 
-/// Parse all filter fields from a GraphQL input object into `FilterCondition`s.
+// ── WhereClause tree ─────────────────────────────────────────────────
+
+/// Composable WHERE clause supporting AND/OR composition.
+#[derive(Debug, Clone)]
+pub enum WhereClause {
+    /// A single filter condition.
+    Condition(FilterCondition),
+    /// All children must match (implicit AND).
+    And(Vec<Self>),
+    /// At least one child must match (OR).
+    Or(Vec<Self>),
+}
+
+/// Build a SQL WHERE fragment from a [`WhereClause`] tree.
+///
+/// Recursively descends into `And`/`Or` groups, wrapping each group in
+/// parentheses. Flattens single-element groups to avoid redundant parens.
+/// Returns the SQL fragment and appends parameter values to `params`.
+pub fn build_where_sql(
+    clause: &WhereClause,
+    params: &mut Vec<SqlParam>,
+    param_idx: &mut usize,
+) -> String {
+    match clause {
+        WhereClause::Condition(f) => build_single_filter_sql(f, params, param_idx),
+        WhereClause::And(children) | WhereClause::Or(children) => {
+            if children.is_empty() {
+                return String::new();
+            }
+            let joiner = if matches!(clause, WhereClause::And(_)) {
+                " AND "
+            } else {
+                " OR "
+            };
+            let parts: Vec<String> = children
+                .iter()
+                .map(|c| build_where_sql(c, params, param_idx))
+                .collect();
+            if parts.len() == 1 {
+                parts.into_iter().next().unwrap_or_default()
+            } else {
+                format!("({})", parts.join(joiner))
+            }
+        }
+    }
+}
+
+/// Build SQL for a single `FilterCondition`, handling IN/NOT IN and scalar ops.
+fn build_single_filter_sql(
+    f: &FilterCondition,
+    params: &mut Vec<SqlParam>,
+    param_idx: &mut usize,
+) -> String {
+    match f.op {
+        FilterOp::In | FilterOp::NotIn => {
+            let SqlParam::List(ref items) = f.value else {
+                // Fallback: treat as empty IN (matches nothing)
+                let negated = f.op == FilterOp::NotIn;
+                return if negated {
+                    "TRUE".to_string()
+                } else {
+                    "FALSE".to_string()
+                };
+            };
+            let negated = f.op == FilterOp::NotIn;
+            let count = items.len();
+            // Empty list: IN () is invalid SQL; short-circuit
+            if count == 0 {
+                return if negated {
+                    "TRUE".to_string()
+                } else {
+                    "FALSE".to_string()
+                };
+            }
+            let sql = build_condition_in(&f.column, &f.pg_type, negated, count, *param_idx);
+            // Flatten list items into params
+            for item in items {
+                params.push(item.clone());
+            }
+            *param_idx += count;
+            sql
+        }
+        _ => {
+            let condition = build_condition(&f.column, &f.pg_type, f.op, param_idx);
+            params.push(f.value.clone());
+            condition
+        }
+    }
+}
+
+/// Build an `IN` or `NOT IN` condition with `count` placeholders.
+///
+/// For bytea columns: `col IN (decode($1, 'hex'), decode($2, 'hex'))`
+/// For numeric columns: `col IN ($1::bigint, $2::bigint)`
+/// For text/other: `col IN ($1, $2)`
+#[must_use]
+pub fn build_condition_in(
+    column: &str,
+    pg_type: &str,
+    negated: bool,
+    count: usize,
+    start_idx: usize,
+) -> String {
+    let op = if negated { "NOT IN" } else { "IN" };
+    let is_bytea = pg_type == "bytea";
+    let is_numeric = matches!(pg_type, "bigint" | "numeric" | "bigserial");
+
+    let placeholders: Vec<String> = (0..count)
+        .map(|i| {
+            let idx = start_idx + i;
+            if is_bytea {
+                format!("decode(${idx}, 'hex')")
+            } else if is_numeric {
+                format!("${idx}::{pg_type}")
+            } else {
+                format!("${idx}")
+            }
+        })
+        .collect();
+
+    format!("{column} {op} ({})", placeholders.join(", "))
+}
+
+/// Parse a GraphQL filter value list into a `SqlParam::List`.
+///
+/// Each element is parsed via [`parse_filter_value`] with `FilterOp::Eq`.
+///
+/// # Errors
+///
+/// Returns an error if the value is not a list or any element fails to parse.
+pub fn parse_filter_value_list(
+    value: &async_graphql::Value,
+    pg_type: &str,
+) -> eyre::Result<SqlParam> {
+    let async_graphql::Value::List(items) = value else {
+        return Err(eyre::eyre!("expected list value for _in/_not_in operator"));
+    };
+
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in items {
+        parsed.push(parse_filter_value(item, pg_type, FilterOp::Eq)?);
+    }
+    Ok(SqlParam::List(parsed))
+}
+
+/// Parse all filter fields from a GraphQL input object into a [`WhereClause`].
+///
+/// Recognizes `"OR"` key for OR composition (expects a list of filter objects).
+/// All other keys are parsed as column filters and combined with AND.
 ///
 /// # Errors
 ///
 /// Returns an error if any filter key is unknown or value is invalid.
-pub fn parse_filters(
+pub fn parse_where_clause(
     filter_obj: &async_graphql::Value,
     columns: &[ColumnMeta],
-) -> eyre::Result<Vec<FilterCondition>> {
+) -> eyre::Result<WhereClause> {
     let async_graphql::Value::Object(obj) = filter_obj else {
         return Err(eyre::eyre!("filter must be an object"));
     };
 
-    let mut conditions = Vec::new();
+    let mut conditions: Vec<WhereClause> = Vec::new();
+
     for (key, value) in obj {
         if matches!(value, async_graphql::Value::Null) {
             continue;
         }
+
         let key_str = key.as_str();
+
+        if key_str == "OR" {
+            conditions.push(parse_or_group(value, columns)?);
+            continue;
+        }
+
         let (col_name, op) = parse_filter_key(key_str, columns)?;
         let pg_type = column_pg_type(col_name, columns);
-        let param = parse_filter_value(value, pg_type, op)?;
-        conditions.push(FilterCondition {
+
+        let param = if matches!(op, FilterOp::In | FilterOp::NotIn) {
+            parse_filter_value_list(value, pg_type)?
+        } else {
+            parse_filter_value(value, pg_type, op)?
+        };
+
+        conditions.push(WhereClause::Condition(FilterCondition {
             column: col_name.to_string(),
             pg_type: pg_type.to_string(),
             op,
             value: param,
-        });
+        }));
     }
-    Ok(conditions)
+
+    if conditions.len() == 1 {
+        Ok(conditions.into_iter().next().unwrap_or_else(|| WhereClause::And(Vec::new())))
+    } else {
+        Ok(WhereClause::And(conditions))
+    }
+}
+
+/// Parse an `OR` group from a GraphQL list of filter objects.
+fn parse_or_group(
+    value: &async_graphql::Value,
+    columns: &[ColumnMeta],
+) -> eyre::Result<WhereClause> {
+    let async_graphql::Value::List(items) = value else {
+        return Err(eyre::eyre!("OR must be a list of filter objects"));
+    };
+
+    let mut branches = Vec::with_capacity(items.len());
+    for item in items {
+        branches.push(parse_where_clause(item, columns)?);
+    }
+    Ok(WhereClause::Or(branches))
 }
 
 /// Validate that an `orderBy` value is a known column name.
@@ -398,7 +586,7 @@ pub fn build_cursor_condition(
 pub struct SelectParams<'a> {
     pub table: &'a str,
     pub select_clause: &'a str,
-    pub filters: &'a [FilterCondition],
+    pub where_clause: Option<&'a WhereClause>,
     pub order_by: &'a str,
     pub order_pg_type: &'a str,
     pub order_dir: &'a str,
@@ -417,13 +605,14 @@ pub fn build_select_with_cursor(p: &SelectParams<'_>) -> (String, Vec<SqlParam>)
     let mut params: Vec<SqlParam> = Vec::new();
     let mut param_idx = 1usize;
 
-    // Collect all WHERE conditions
+    // Collect all top-level WHERE conditions
     let mut conditions = Vec::new();
 
-    for f in p.filters {
-        let condition = build_condition(&f.column, &f.pg_type, f.op, &mut param_idx);
-        conditions.push(condition);
-        params.push(f.value.clone());
+    if let Some(wc) = p.where_clause {
+        let where_sql = build_where_sql(wc, &mut params, &mut param_idx);
+        if !where_sql.is_empty() {
+            conditions.push(where_sql);
+        }
     }
 
     if let Some(c) = p.cursor {
@@ -460,9 +649,14 @@ pub fn build_select_with_cursor(p: &SelectParams<'_>) -> (String, Vec<SqlParam>)
 #[cfg(target_pointer_width = "64")]
 const _: [(); 32] = [(); core::mem::size_of::<Cursor>()];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 120] = [(); core::mem::size_of::<SelectParams<'_>>()];
+const _: [(); 112] = [(); core::mem::size_of::<SelectParams<'_>>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 88] = [(); core::mem::size_of::<WhereClause>()];
 
 /// Bind `SqlParam` values to a sqlx query.
+///
+/// `List` variants should already be flattened by `build_where_sql`;
+/// if encountered here, each element is bound in order.
 pub fn bind_params<'q>(
     mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     params: &'q [SqlParam],
@@ -473,6 +667,20 @@ pub fn bind_params<'q>(
             SqlParam::Int64(n) => query.bind(*n),
             SqlParam::Int32(n) => query.bind(*n),
             SqlParam::Bool(b) => query.bind(*b),
+            SqlParam::List(items) => {
+                // List items are flattened by build_where_sql, but handle
+                // defensively in case of direct use.
+                for item in items {
+                    query = match item {
+                        SqlParam::Text(s) => query.bind(s.as_str()),
+                        SqlParam::Int64(n) => query.bind(*n),
+                        SqlParam::Int32(n) => query.bind(*n),
+                        SqlParam::Bool(b) => query.bind(*b),
+                        SqlParam::List(_) => query, // nested lists not supported
+                    };
+                }
+                query
+            }
         };
     }
     query
@@ -523,7 +731,7 @@ mod tests {
         let (sql, params) = build_select(
             "usdc_transfers",
             "id, block_number",
-            &[],
+            None,
             "id",
             "DESC",
             100,
@@ -538,16 +746,16 @@ mod tests {
 
     #[test]
     fn build_select_with_filter() {
-        let filters = vec![FilterCondition {
+        let wc = WhereClause::Condition(FilterCondition {
             column: "block_number".into(),
             pg_type: "bigint".into(),
             op: FilterOp::Gte,
             value: SqlParam::Text("21000000".into()),
-        }];
+        });
         let (sql, params) = build_select(
             "usdc_transfers",
             "*",
-            &filters,
+            Some(&wc),
             "id",
             "DESC",
             100,
@@ -562,19 +770,19 @@ mod tests {
 
     #[test]
     fn build_select_bytea_filter() {
-        let filters = vec![FilterCondition {
+        let wc = WhereClause::Condition(FilterCondition {
             column: "tx_hash".into(),
             pg_type: "bytea".into(),
             op: FilterOp::Eq,
             value: SqlParam::Text("abcd1234".into()),
-        }];
-        let (sql, _) = build_select("t", "*", &filters, "id", "DESC", 10, 0);
+        });
+        let (sql, _) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
         assert!(sql.contains("tx_hash = decode($1, 'hex')"));
     }
 
     #[test]
     fn build_select_clamps_limit() {
-        let (sql, params) = build_select("t", "*", &[], "id", "DESC", 9999, 0);
+        let (sql, params) = build_select("t", "*", None, "id", "DESC", 9999, 0);
         // Should clamp to MAX_LIMIT (1000)
         assert!(sql.contains("LIMIT $1"));
         if let SqlParam::Int64(limit) = &params[0] {
@@ -584,24 +792,24 @@ mod tests {
 
     #[test]
     fn build_select_multiple_filters() {
-        let filters = vec![
-            FilterCondition {
+        let wc = WhereClause::And(vec![
+            WhereClause::Condition(FilterCondition {
                 column: "block_number".into(),
                 pg_type: "bigint".into(),
                 op: FilterOp::Gte,
                 value: SqlParam::Text("100".into()),
-            },
-            FilterCondition {
+            }),
+            WhereClause::Condition(FilterCondition {
                 column: "from_address".into(),
                 pg_type: "text".into(),
                 op: FilterOp::Eq,
                 value: SqlParam::Text("0xABC".into()),
-            },
-        ];
-        let (sql, params) = build_select("t", "*", &filters, "id", "ASC", 50, 10);
+            }),
+        ]);
+        let (sql, params) = build_select("t", "*", Some(&wc), "id", "ASC", 50, 10);
         assert_eq!(
             sql,
-            "SELECT * FROM t WHERE block_number >= $1::bigint AND from_address = $2 ORDER BY id ASC LIMIT $3 OFFSET $4"
+            "SELECT * FROM t WHERE (block_number >= $1::bigint AND from_address = $2) ORDER BY id ASC LIMIT $3 OFFSET $4"
         );
         assert_eq!(params.len(), 4);
     }
@@ -682,7 +890,7 @@ mod tests {
         let (sql, params) = build_select_with_cursor(&SelectParams {
             table: "t",
             select_clause: "*",
-            filters: &[],
+            where_clause: None,
             order_by: "block_number",
             order_pg_type: "bigint",
             order_dir: "DESC",
@@ -703,7 +911,7 @@ mod tests {
         let (sql, params) = build_select_with_cursor(&SelectParams {
             table: "t",
             select_clause: "*",
-            filters: &[],
+            where_clause: None,
             order_by: "id",
             order_pg_type: "bigserial",
             order_dir: "DESC",
@@ -713,5 +921,224 @@ mod tests {
         });
         assert!(sql.contains("OFFSET $2"));
         assert_eq!(params.len(), 2);
+    }
+
+    // ── In/NotIn tests ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_key_in_suffix() -> eyre::Result<()> {
+        let cols = test_columns();
+        let (col, op) = parse_filter_key("block_number_in", &cols)?;
+        assert_eq!(col, "block_number");
+        assert_eq!(op, FilterOp::In);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_key_not_in_suffix() -> eyre::Result<()> {
+        let cols = test_columns();
+        let (col, op) = parse_filter_key("block_number_not_in", &cols)?;
+        assert_eq!(col, "block_number");
+        assert_eq!(op, FilterOp::NotIn);
+        Ok(())
+    }
+
+    #[test]
+    fn build_condition_in_numeric() {
+        let sql = build_condition_in("block_number", "bigint", false, 3, 1);
+        assert_eq!(sql, "block_number IN ($1::bigint, $2::bigint, $3::bigint)");
+    }
+
+    #[test]
+    fn build_condition_not_in_bytea() {
+        let sql = build_condition_in("tx_hash", "bytea", true, 2, 1);
+        assert_eq!(
+            sql,
+            "tx_hash NOT IN (decode($1, 'hex'), decode($2, 'hex'))"
+        );
+    }
+
+    #[test]
+    fn parse_filter_value_list_text() -> eyre::Result<()> {
+        let val = async_graphql::Value::List(vec![
+            async_graphql::Value::String("a".into()),
+            async_graphql::Value::String("b".into()),
+        ]);
+        let param = parse_filter_value_list(&val, "text")?;
+        let SqlParam::List(items) = param else {
+            return Err(eyre::eyre!("expected List"));
+        };
+        assert_eq!(items.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_filter_value_list_non_list_errors() {
+        let val = async_graphql::Value::String("not a list".into());
+        assert!(parse_filter_value_list(&val, "text").is_err());
+    }
+
+    #[test]
+    fn build_select_with_in_filter() {
+        let wc = WhereClause::Condition(FilterCondition {
+            column: "block_number".into(),
+            pg_type: "bigint".into(),
+            op: FilterOp::In,
+            value: SqlParam::List(vec![
+                SqlParam::Text("100".into()),
+                SqlParam::Text("200".into()),
+                SqlParam::Text("300".into()),
+            ]),
+        });
+        let (sql, params) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
+        assert!(sql.contains("block_number IN ($1::bigint, $2::bigint, $3::bigint)"));
+        assert_eq!(params.len(), 5); // 3 IN params + limit + offset
+    }
+
+    // ── WhereClause / OR tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_where_clause_simple_and() -> eyre::Result<()> {
+        let cols = test_columns();
+        let obj = async_graphql::Value::Object({
+            let mut m = async_graphql::indexmap::IndexMap::new();
+            m.insert(
+                async_graphql::Name::new("block_number_gte"),
+                async_graphql::Value::String("100".into()),
+            );
+            m.insert(
+                async_graphql::Name::new("from_address"),
+                async_graphql::Value::String("0xABC".into()),
+            );
+            m
+        });
+        let wc = parse_where_clause(&obj, &cols)?;
+        assert!(matches!(wc, WhereClause::And(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_where_clause_or_group() -> eyre::Result<()> {
+        let cols = test_columns();
+        let obj = async_graphql::Value::Object({
+            let mut m = async_graphql::indexmap::IndexMap::new();
+            m.insert(
+                async_graphql::Name::new("OR"),
+                async_graphql::Value::List(vec![
+                    async_graphql::Value::Object({
+                        let mut inner = async_graphql::indexmap::IndexMap::new();
+                        inner.insert(
+                            async_graphql::Name::new("block_number_gte"),
+                            async_graphql::Value::String("100".into()),
+                        );
+                        inner
+                    }),
+                    async_graphql::Value::Object({
+                        let mut inner = async_graphql::indexmap::IndexMap::new();
+                        inner.insert(
+                            async_graphql::Name::new("from_address"),
+                            async_graphql::Value::String("0xABC".into()),
+                        );
+                        inner
+                    }),
+                ]),
+            );
+            m
+        });
+        let wc = parse_where_clause(&obj, &cols)?;
+        // Single entry in top-level → unwraps to the OR clause directly
+        assert!(matches!(wc, WhereClause::Or(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn build_where_sql_or() {
+        let wc = WhereClause::Or(vec![
+            WhereClause::Condition(FilterCondition {
+                column: "block_number".into(),
+                pg_type: "bigint".into(),
+                op: FilterOp::Gte,
+                value: SqlParam::Text("100".into()),
+            }),
+            WhereClause::Condition(FilterCondition {
+                column: "block_number".into(),
+                pg_type: "bigint".into(),
+                op: FilterOp::Lte,
+                value: SqlParam::Text("50".into()),
+            }),
+        ]);
+        let mut params = Vec::new();
+        let mut idx = 1;
+        let sql = build_where_sql(&wc, &mut params, &mut idx);
+        assert_eq!(
+            sql,
+            "(block_number >= $1::bigint OR block_number <= $2::bigint)"
+        );
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn build_where_sql_and_or_mixed() {
+        let wc = WhereClause::And(vec![
+            WhereClause::Condition(FilterCondition {
+                column: "from_address".into(),
+                pg_type: "text".into(),
+                op: FilterOp::Eq,
+                value: SqlParam::Text("0xABC".into()),
+            }),
+            WhereClause::Or(vec![
+                WhereClause::Condition(FilterCondition {
+                    column: "block_number".into(),
+                    pg_type: "bigint".into(),
+                    op: FilterOp::Gte,
+                    value: SqlParam::Text("100".into()),
+                }),
+                WhereClause::Condition(FilterCondition {
+                    column: "block_number".into(),
+                    pg_type: "bigint".into(),
+                    op: FilterOp::Lte,
+                    value: SqlParam::Text("50".into()),
+                }),
+            ]),
+        ]);
+        let mut params = Vec::new();
+        let mut idx = 1;
+        let sql = build_where_sql(&wc, &mut params, &mut idx);
+        assert_eq!(
+            sql,
+            "(from_address = $1 AND (block_number >= $2::bigint OR block_number <= $3::bigint))"
+        );
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn build_where_sql_empty_and_returns_empty() {
+        let wc = WhereClause::And(vec![]);
+        let mut params = Vec::new();
+        let mut idx = 1;
+        let sql = build_where_sql(&wc, &mut params, &mut idx);
+        assert!(sql.is_empty());
+    }
+
+    #[test]
+    fn build_select_with_empty_where_clause() {
+        let wc = WhereClause::And(vec![]);
+        let (sql, params) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
+        // Empty where clause should not produce WHERE
+        assert_eq!(sql, "SELECT * FROM t ORDER BY id DESC LIMIT $1 OFFSET $2");
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn build_select_with_empty_in_list() {
+        let wc = WhereClause::Condition(FilterCondition {
+            column: "block_number".into(),
+            pg_type: "bigint".into(),
+            op: FilterOp::In,
+            value: SqlParam::List(vec![]),
+        });
+        let (sql, _) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
+        // Empty IN list should produce FALSE
+        assert!(sql.contains("WHERE FALSE"));
     }
 }

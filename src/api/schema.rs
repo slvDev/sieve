@@ -7,8 +7,8 @@
 //! `sieve.toml`.
 
 use crate::api::query_builder::{
-    bind_params, build_select_with_cursor, decode_cursor, encode_cursor, parse_filters,
-    validate_order_column, Cursor, SelectParams, DEFAULT_LIMIT, MAX_LIMIT,
+    bind_params, build_select_with_cursor, decode_cursor, encode_cursor, parse_where_clause,
+    validate_order_column, Cursor, SelectParams, WhereClause, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use crate::api::types::{
     build_columns_meta, build_select_clause, operators_for_type, pg_to_graphql_type, row_to_json,
@@ -164,6 +164,9 @@ fn build_filter_input(type_name: &str, columns: &[ColumnMeta]) -> InputObject {
         }
     }
 
+    // Self-referential OR field for composable filters
+    input = input.field(InputValue::new("OR", TypeRef::named_list(type_name)));
+
     input
 }
 
@@ -261,7 +264,7 @@ const _: [(); 32] = [(); core::mem::size_of::<PageInfoData>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 56] = [(); core::mem::size_of::<ConnectionData>()];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 112] = [(); core::mem::size_of::<QueryArgs>()];
+const _: [(); 176] = [(); core::mem::size_of::<QueryArgs>()];
 
 // ── Root query field ─────────────────────────────────────────────────
 
@@ -322,7 +325,7 @@ async fn resolve_connection(
     let (sql, params) = build_select_with_cursor(&SelectParams {
         table: &meta.table_name,
         select_clause: &meta.select_clause,
-        filters: &args.filters,
+        where_clause: args.where_clause.as_ref(),
         order_by: &args.order_by,
         order_pg_type,
         order_dir: args.direction,
@@ -369,7 +372,7 @@ async fn resolve_connection(
 
 /// Parsed query arguments extracted from GraphQL resolver context.
 struct QueryArgs {
-    filters: Vec<crate::api::query_builder::FilterCondition>,
+    where_clause: Option<WhereClause>,
     order_by: String,
     direction: &'static str,
     limit: i64,
@@ -383,13 +386,15 @@ fn parse_query_args(
     meta: &TableMeta,
 ) -> async_graphql::Result<QueryArgs> {
     // Parse filter
-    let filters = match ctx.args.try_get("where") {
+    let where_clause = match ctx.args.try_get("where") {
         Ok(where_val) => {
             let val = where_val.deserialize::<async_graphql::Value>()?;
-            parse_filters(&val, &meta.columns)
-                .map_err(|e| async_graphql::Error::new(format!("{e:#}")))?
+            Some(
+                parse_where_clause(&val, &meta.columns)
+                    .map_err(|e| async_graphql::Error::new(format!("{e:#}")))?,
+            )
         }
-        Err(_) => Vec::new(),
+        Err(_) => None,
     };
 
     // Parse ordering
@@ -447,7 +452,7 @@ fn parse_query_args(
     };
 
     Ok(QueryArgs {
-        filters,
+        where_clause,
         order_by: order_by.to_string(),
         direction,
         limit,
@@ -540,6 +545,7 @@ mod tests {
             create_table_sql: String::new(),
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
+            is_factory_child: false,
         }
     }
 
