@@ -3,8 +3,15 @@
 //! Core types used across the sync pipeline. Sub-modules implement
 //! scheduling, fetching, head-following, and reorg handling.
 
+use crate::config::IndexConfig;
+use crate::db::Database;
+use crate::handler::HandlerRegistry;
+use crate::metrics::SieveMetrics;
+use crate::p2p::PeerPool;
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives_traits::Header;
+use std::sync::Arc;
+use tokio::sync::watch;
 
 pub mod engine;
 pub mod fetch;
@@ -15,6 +22,23 @@ pub mod scheduler;
 pub use engine::run_sync;
 pub use follow::run_follow_loop;
 pub use reorg::ReorgCheck;
+
+/// Shared context for sync operations, bundling parameters that would
+/// otherwise require 7+ function arguments.
+pub struct SyncContext {
+    /// Peer pool for P2P block fetching.
+    pub pool: Arc<PeerPool>,
+    /// Event filter and ABI decode configuration.
+    pub config: Arc<IndexConfig>,
+    /// PostgreSQL database handle.
+    pub db: Arc<Database>,
+    /// Event handler registry for storing decoded events.
+    pub handlers: Arc<HandlerRegistry>,
+    /// Prometheus metrics for observability.
+    pub metrics: Arc<SieveMetrics>,
+    /// Shutdown signal receiver.
+    pub stop_rx: watch::Receiver<bool>,
+}
 
 /// Full payload for a block: header, body, receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,3 +95,5 @@ pub struct FetchBatch {
 const _: [(); 816] = [(); core::mem::size_of::<BlockPayload>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 32] = [(); core::mem::size_of::<FetchBatch>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 56] = [(); core::mem::size_of::<SyncContext>()];

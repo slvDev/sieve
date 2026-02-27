@@ -4,14 +4,15 @@
 //! Each "epoch" discovers the current chain head via P2P, runs reorg
 //! preflight, then syncs the gap. Sleeps near the tip to avoid busy-looping.
 
-use crate::config::IndexConfig;
 use crate::db::{self, Database};
 use crate::handler::HandlerRegistry;
+use crate::metrics::SieveMetrics;
 use crate::p2p::{discover_head_p2p, PeerPool};
 use crate::sync::reorg;
-use crate::sync::{run_sync, ReorgCheck};
+use crate::sync::{run_sync, ReorgCheck, SyncContext};
 use crate::types::BlockNumber;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -21,9 +22,10 @@ use tracing::{debug, info, instrument, warn};
 struct FollowContext {
     pool: Arc<PeerPool>,
     start_block: BlockNumber,
-    config: Arc<IndexConfig>,
+    config: Arc<crate::config::IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
+    metrics: Arc<SieveMetrics>,
     stop_rx: watch::Receiver<bool>,
 }
 
@@ -36,26 +38,23 @@ struct FollowContext {
 /// Returns an error on unrecoverable failures (DB errors, deep reorgs).
 #[instrument(skip_all, fields(start_block = start_block.as_u64()))]
 pub async fn run_follow_loop(
-    pool: Arc<PeerPool>,
     start_block: BlockNumber,
-    config: Arc<IndexConfig>,
-    db: Arc<Database>,
-    handlers: Arc<HandlerRegistry>,
-    stop_rx: watch::Receiver<bool>,
+    ctx: SyncContext,
 ) -> eyre::Result<()> {
     info!(start_block = start_block.as_u64(), "entering follow mode");
 
-    let ctx = FollowContext {
-        pool,
+    let fctx = FollowContext {
+        pool: ctx.pool,
         start_block,
-        config,
-        db,
-        handlers,
-        stop_rx,
+        config: ctx.config,
+        db: ctx.db,
+        handlers: ctx.handlers,
+        metrics: ctx.metrics,
+        stop_rx: ctx.stop_rx,
     };
 
-    while !is_stopped(&ctx.stop_rx) {
-        if run_follow_epoch(&ctx).await? {
+    while !is_stopped(&fctx.stop_rx) {
+        if run_follow_epoch(&fctx).await? {
             break;
         }
     }
@@ -73,6 +72,9 @@ async fn run_follow_epoch(ctx: &FollowContext) -> eyre::Result<bool> {
         EpochAction::Reorg => Ok(false),
         EpochAction::Sync { next_block, head } => {
             let gap = sync_epoch(ctx, next_block, head).await?;
+            if gap <= 2 {
+                ctx.metrics.is_ready.store(true, Ordering::Relaxed);
+            }
             let should_exit =
                 gap <= 2 && wait_or_stop(&ctx.stop_rx, Duration::from_millis(500)).await;
             Ok(should_exit)
@@ -112,6 +114,8 @@ async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
         return Ok(EpochAction::Wait);
     };
 
+    ctx.metrics.chain_head.set(observed_head as i64);
+
     let next_block = baseline + 1;
     if next_block > observed_head {
         debug!(next_block, observed_head, "at tip, waiting");
@@ -142,14 +146,19 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
     let gap = head.saturating_sub(next_block) + 1;
     info!(next_block, head, gap, "follow epoch: syncing gap");
 
+    let sync_ctx = SyncContext {
+        pool: Arc::clone(&ctx.pool),
+        config: Arc::clone(&ctx.config),
+        db: Arc::clone(&ctx.db),
+        handlers: Arc::clone(&ctx.handlers),
+        metrics: Arc::clone(&ctx.metrics),
+        stop_rx: ctx.stop_rx.clone(),
+    };
+
     let outcome = run_sync(
-        Arc::clone(&ctx.pool),
         BlockNumber::new(next_block),
         BlockNumber::new(head),
-        Arc::clone(&ctx.config),
-        Arc::clone(&ctx.db),
-        Arc::clone(&ctx.handlers),
-        ctx.stop_rx.clone(),
+        sync_ctx,
     )
     .await?;
 

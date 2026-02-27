@@ -52,6 +52,10 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Metrics
+prometheus-client = "0.22"
+base64 = "0.22"
+
 # Misc
 eyre = "0.6"
 parking_lot = "0.12"

@@ -6,6 +6,8 @@
 //! `ResolvedEvent` metadata and are safe to interpolate.
 
 use crate::api::types::ColumnMeta;
+
+use base64::Engine;
 use std::fmt::Write as _;
 
 // ── Filter types ─────────────────────────────────────────────────────
@@ -304,6 +306,162 @@ pub fn validate_order_column<'a>(
     }
 }
 
+// ── Cursor pagination ────────────────────────────────────────────────
+
+/// A decoded cursor for keyset pagination.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Cursor {
+    /// Value of the sort column at the cursor position.
+    pub sort_value: String,
+    /// Primary key (`id`) at the cursor position.
+    pub id: i64,
+}
+
+/// Encode a cursor as a base64 JSON string.
+#[must_use]
+pub fn encode_cursor(sort_value: &str, id: i64) -> String {
+    let json = serde_json::json!({"v": sort_value, "id": id});
+    base64::engine::general_purpose::STANDARD.encode(json.to_string().as_bytes())
+}
+
+/// Decode a base64 JSON cursor string.
+///
+/// # Errors
+///
+/// Returns an error if the cursor is invalid base64 or JSON.
+pub fn decode_cursor(cursor: &str) -> eyre::Result<Cursor> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cursor)
+        .map_err(|e| eyre::eyre!("invalid cursor encoding: {e}"))?;
+    let s = String::from_utf8(bytes)
+        .map_err(|e| eyre::eyre!("cursor is not valid UTF-8: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&s).map_err(|e| eyre::eyre!("invalid cursor JSON: {e}"))?;
+
+    let sort_value = parsed
+        .get("v")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre::eyre!("cursor missing 'v' field"))?
+        .to_string();
+    let id = parsed
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| eyre::eyre!("cursor missing 'id' field"))?;
+
+    Ok(Cursor { sort_value, id })
+}
+
+/// Build a cursor-based WHERE condition for keyset pagination.
+///
+/// For DESC order: `(order_col, id) < ($sort_val, $cursor_id)`
+/// For ASC order:  `(order_col, id) > ($sort_val, $cursor_id)`
+///
+/// Returns the SQL fragment and parameter values to append.
+#[must_use]
+pub fn build_cursor_condition(
+    order_col: &str,
+    order_pg_type: &str,
+    direction: &str,
+    cursor: &Cursor,
+    param_idx: &mut usize,
+) -> (String, Vec<SqlParam>) {
+    let cmp = if direction == "ASC" { ">" } else { "<" };
+    let val_idx = *param_idx;
+    *param_idx += 1;
+    let id_idx = *param_idx;
+    *param_idx += 1;
+
+    let is_numeric = matches!(order_pg_type, "bigint" | "numeric" | "bigserial");
+    let cast = if is_numeric {
+        // bigserial is a DDL pseudo-type; runtime cast type is bigint
+        let cast_type = if order_pg_type == "bigserial" { "bigint" } else { order_pg_type };
+        format!("::{cast_type}")
+    } else {
+        String::new()
+    };
+
+    let sql = format!(
+        "({order_col}, id) {cmp} (${val_idx}{cast}, ${id_idx})"
+    );
+
+    let params = vec![
+        SqlParam::Text(cursor.sort_value.clone()),
+        SqlParam::Int64(cursor.id),
+    ];
+
+    (sql, params)
+}
+
+/// Parameters for building a SELECT query with cursor support.
+#[non_exhaustive]
+pub struct SelectParams<'a> {
+    pub table: &'a str,
+    pub select_clause: &'a str,
+    pub filters: &'a [FilterCondition],
+    pub order_by: &'a str,
+    pub order_pg_type: &'a str,
+    pub order_dir: &'a str,
+    pub limit: i64,
+    pub offset: i64,
+    pub cursor: Option<&'a Cursor>,
+}
+
+/// Build a SELECT query with optional cursor-based pagination.
+///
+/// When `cursor` is `Some`, uses keyset pagination (ignoring `offset`).
+/// When `None`, falls back to LIMIT/OFFSET.
+#[must_use]
+pub fn build_select_with_cursor(p: &SelectParams<'_>) -> (String, Vec<SqlParam>) {
+    let mut sql = format!("SELECT {} FROM {}", p.select_clause, p.table);
+    let mut params: Vec<SqlParam> = Vec::new();
+    let mut param_idx = 1usize;
+
+    // Collect all WHERE conditions
+    let mut conditions = Vec::new();
+
+    for f in p.filters {
+        let condition = build_condition(&f.column, &f.pg_type, f.op, &mut param_idx);
+        conditions.push(condition);
+        params.push(f.value.clone());
+    }
+
+    if let Some(c) = p.cursor {
+        let (cursor_cond, cursor_params) =
+            build_cursor_condition(p.order_by, p.order_pg_type, p.order_dir, c, &mut param_idx);
+        conditions.push(cursor_cond);
+        params.extend(cursor_params);
+    }
+
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+
+    let _ = write!(sql, " ORDER BY {} {}, id {}", p.order_by, p.order_dir, p.order_dir);
+
+    let clamped_limit = p.limit.clamp(1, MAX_LIMIT);
+
+    let _ = write!(sql, " LIMIT ${param_idx}");
+    params.push(SqlParam::Int64(clamped_limit));
+    param_idx += 1;
+
+    // Only add OFFSET when not using cursor pagination
+    if p.cursor.is_none() {
+        let clamped_offset = p.offset.max(0);
+        let _ = write!(sql, " OFFSET ${param_idx}");
+        params.push(SqlParam::Int64(clamped_offset));
+    }
+
+    (sql, params)
+}
+
+// Compile-time size assertions (reth pattern).
+#[cfg(target_pointer_width = "64")]
+const _: [(); 32] = [(); core::mem::size_of::<Cursor>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 120] = [(); core::mem::size_of::<SelectParams<'_>>()];
+
 /// Bind `SqlParam` values to a sqlx query.
 pub fn bind_params<'q>(
     mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
@@ -468,5 +626,92 @@ mod tests {
         };
         assert_eq!(s, "abcd");
         Ok(())
+    }
+
+    // ── Cursor tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn encode_decode_roundtrip() -> eyre::Result<()> {
+        let encoded = encode_cursor("21000042", 99);
+        let decoded = decode_cursor(&encoded)?;
+        assert_eq!(decoded.sort_value, "21000042");
+        assert_eq!(decoded.id, 99);
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_sql_desc() {
+        let cursor = Cursor {
+            sort_value: "21000000".into(),
+            id: 50,
+        };
+        let mut idx = 1;
+        let (sql, params) =
+            build_cursor_condition("block_number", "bigint", "DESC", &cursor, &mut idx);
+        assert_eq!(sql, "(block_number, id) < ($1::bigint, $2)");
+        assert_eq!(params.len(), 2);
+        assert_eq!(idx, 3);
+    }
+
+    #[test]
+    fn cursor_sql_asc() {
+        let cursor = Cursor {
+            sort_value: "100".into(),
+            id: 10,
+        };
+        let mut idx = 1;
+        let (sql, _) = build_cursor_condition("id", "bigserial", "ASC", &cursor, &mut idx);
+        // bigserial maps to bigint at runtime (bigserial is a DDL pseudo-type)
+        assert_eq!(sql, "(id, id) > ($1::bigint, $2)");
+    }
+
+    #[test]
+    fn decode_invalid_errors() {
+        assert!(decode_cursor("not-base64!!!").is_err());
+        // Valid base64 but invalid JSON
+        let bad = base64::engine::general_purpose::STANDARD.encode(b"not json");
+        assert!(decode_cursor(&bad).is_err());
+    }
+
+    #[test]
+    fn build_select_with_cursor_desc() {
+        let cursor = Cursor {
+            sort_value: "21000000".into(),
+            id: 50,
+        };
+        let (sql, params) = build_select_with_cursor(&SelectParams {
+            table: "t",
+            select_clause: "*",
+            filters: &[],
+            order_by: "block_number",
+            order_pg_type: "bigint",
+            order_dir: "DESC",
+            limit: 10,
+            offset: 0,
+            cursor: Some(&cursor),
+        });
+        assert!(sql.contains("(block_number, id) < ($1::bigint, $2)"));
+        assert!(sql.contains("ORDER BY block_number DESC, id DESC"));
+        assert!(sql.contains("LIMIT $3"));
+        // No OFFSET when cursor is present
+        assert!(!sql.contains("OFFSET"));
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn build_select_with_cursor_none_has_offset() {
+        let (sql, params) = build_select_with_cursor(&SelectParams {
+            table: "t",
+            select_clause: "*",
+            filters: &[],
+            order_by: "id",
+            order_pg_type: "bigserial",
+            order_dir: "DESC",
+            limit: 10,
+            offset: 5,
+            cursor: None,
+        });
+        assert!(sql.contains("OFFSET $2"));
+        assert_eq!(params.len(), 2);
     }
 }

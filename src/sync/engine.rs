@@ -6,12 +6,13 @@
 use crate::config::IndexConfig;
 use crate::db::{self, Database};
 use crate::handler::{EventContext, HandlerRegistry};
+use crate::metrics::SieveMetrics;
 use crate::p2p::{NetworkPeer, PeerPool};
 use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
 use crate::sync::scheduler::{
     PeerHealthConfig, PeerHealthTracker, PeerWorkScheduler, SchedulerConfig,
 };
-use crate::sync::BlockPayload;
+use crate::sync::{BlockPayload, SyncContext};
 use crate::types::BlockNumber;
 use crate::{decode, filter};
 
@@ -19,6 +20,7 @@ use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256, TxKind};
 use eyre::WrapErr;
+use prometheus_client::metrics::gauge::Gauge;
 use reth_network_api::PeerId;
 use reth_primitives_traits::SealedHeader;
 use std::collections::{HashMap, HashSet};
@@ -33,19 +35,28 @@ use tracing::{debug, info, instrument, warn};
 const MAX_CONCURRENT_FETCHES: usize = 32;
 const PAYLOAD_CHANNEL_SIZE: usize = 256;
 
-/// RAII guard that increments an atomic counter on creation and decrements on drop.
-struct ActiveTaskGuard(Arc<AtomicUsize>);
+/// RAII guard that increments an atomic counter and a Prometheus gauge
+/// on creation, and decrements both on drop.
+struct ActiveTaskGuard {
+    counter: Arc<AtomicUsize>,
+    gauge: Gauge,
+}
 
 impl ActiveTaskGuard {
-    fn new(counter: &Arc<AtomicUsize>) -> Self {
+    fn new(counter: &Arc<AtomicUsize>, gauge: Gauge) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
-        Self(Arc::clone(counter))
+        gauge.inc();
+        Self {
+            counter: Arc::clone(counter),
+            gauge,
+        }
     }
 }
 
 impl Drop for ActiveTaskGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.gauge.dec();
     }
 }
 
@@ -86,22 +97,17 @@ const _: [(); 24] = [(); core::mem::size_of::<ProcessOutcome>()];
 
 /// Run sync for a block range, fetching from the peer pool.
 ///
-/// The `stop_rx` watch channel allows external callers (follow loop, shutdown
-/// handler) to signal an early stop. When `*stop_rx.borrow() == true`, the
-/// fetch loop exits at the next iteration boundary.
+/// The `stop_rx` watch channel (inside `ctx`) allows external callers
+/// (follow loop, shutdown handler) to signal an early stop.
 ///
 /// # Errors
 ///
 /// Returns an error if the sync encounters an unrecoverable failure.
 #[instrument(skip_all, fields(start_block = start_block.as_u64(), end_block = end_block.as_u64()))]
 pub async fn run_sync(
-    pool: Arc<PeerPool>,
     start_block: BlockNumber,
     end_block: BlockNumber,
-    config: Arc<IndexConfig>,
-    db: Arc<Database>,
-    handlers: Arc<HandlerRegistry>,
-    stop_rx: watch::Receiver<bool>,
+    ctx: SyncContext,
 ) -> eyre::Result<SyncOutcome> {
     let started = Instant::now();
     let total_blocks = end_block.as_u64().saturating_sub(start_block.as_u64()) + 1;
@@ -128,27 +134,34 @@ pub async fn run_sync(
 
     // Spawn peer feeder
     let feeder_handle = spawn_peer_feeder(
-        Arc::clone(&pool),
+        Arc::clone(&ctx.pool),
         ready_tx.clone(),
         feeder_shutdown_rx,
     );
 
     // Spawn payload consumer
-    let consumer_handle = tokio::spawn(consume_payloads(payload_rx, config, db, handlers));
+    let consumer_handle = tokio::spawn(consume_payloads(
+        payload_rx,
+        Arc::clone(&ctx.config),
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.handlers),
+        Arc::clone(&ctx.metrics),
+    ));
 
     // Main fetch loop
     let active_tasks = Arc::new(AtomicUsize::new(0));
-    let ctx = FetchLoopContext {
+    let fetch_ctx = FetchLoopContext {
         scheduler: &scheduler,
         peer_health: &peer_health,
-        pool: &pool,
+        pool: &ctx.pool,
         active_tasks: &active_tasks,
+        metrics: &ctx.metrics,
         start_block,
         end_block,
         payload_tx: &payload_tx,
         ready_tx: &ready_tx,
     };
-    run_fetch_loop(&ctx, ready_rx, &stop_rx).await;
+    run_fetch_loop(&fetch_ctx, ready_rx, &ctx.stop_rx).await;
 
     // Shutdown peer feeder and consumer
     let _ = feeder_shutdown_tx.send(true);
@@ -215,6 +228,7 @@ struct FetchLoopContext<'a> {
     peer_health: &'a Arc<PeerHealthTracker>,
     pool: &'a Arc<PeerPool>,
     active_tasks: &'a Arc<AtomicUsize>,
+    metrics: &'a Arc<SieveMetrics>,
     start_block: BlockNumber,
     end_block: BlockNumber,
     payload_tx: &'a mpsc::Sender<BlockPayload>,
@@ -292,6 +306,8 @@ async fn try_dispatch_iteration(
     check_progress(
         ctx.scheduler,
         ctx.active_tasks,
+        ctx.pool,
+        ctx.metrics,
         &mut state.last_progress_check,
         &mut state.last_progress_completed,
         state.ready_peers.len(),
@@ -417,8 +433,9 @@ async fn dispatch_best_peer(
     };
 
     let counter = Arc::clone(ctx.active_tasks);
+    let gauge = ctx.metrics.active_fetches.clone();
     fetch_tasks.spawn(async move {
-        let _guard = ActiveTaskGuard::new(&counter);
+        let _guard = ActiveTaskGuard::new(&counter, gauge);
         run_fetch_task(task_ctx, params).await;
     });
 }
@@ -531,6 +548,8 @@ fn recycle_peer(
 async fn check_progress(
     scheduler: &PeerWorkScheduler,
     active_tasks: &AtomicUsize,
+    pool: &PeerPool,
+    metrics: &SieveMetrics,
     last_check: &mut Instant,
     last_completed: &mut u64,
     ready_count: usize,
@@ -543,6 +562,10 @@ async fn check_progress(
     let inflight = scheduler.inflight_count().await;
     let escalation = scheduler.escalation_len().await;
     let active = active_tasks.load(Ordering::Relaxed);
+
+    // Update Prometheus gauges
+    metrics.pending_blocks.set(pending as i64);
+    metrics.connected_peers.set(pool.len() as i64);
 
     if current_completed == *last_completed && (pending > 0 || escalation > 0) {
         warn!(
@@ -576,9 +599,11 @@ async fn consume_payloads(
     config: Arc<IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
+    metrics: Arc<SieveMetrics>,
 ) -> ConsumerStats {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
+    let mut max_indexed_block: u64 = 0;
 
     let ctx = ProcessContext {
         config: &config,
@@ -597,6 +622,18 @@ async fn consume_payloads(
                 stats.events_matched = stats.events_matched.saturating_add(outcome.matched);
                 stats.events_decoded = stats.events_decoded.saturating_add(outcome.decoded);
                 stats.events_stored = stats.events_stored.saturating_add(outcome.stored);
+
+                // Update Prometheus counters
+                metrics.blocks_indexed.inc();
+                metrics.events_matched.inc_by(outcome.matched);
+                metrics.events_stored.inc_by(outcome.stored);
+
+                // Only advance the gauge forward (payloads arrive out of order)
+                let block_num = payload.header().number;
+                if block_num > max_indexed_block {
+                    max_indexed_block = block_num;
+                    metrics.indexed_block.set(block_num as i64);
+                }
             }
             Err(e) => {
                 warn!(

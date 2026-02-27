@@ -1,18 +1,21 @@
 //! Dynamic GraphQL schema generation from resolved TOML event config.
 //!
 //! Builds a complete GraphQL schema at startup from `Vec<ResolvedEvent>`.
-//! Each event table becomes a query field with filtering, sorting, and
-//! pagination. Uses `async-graphql`'s dynamic schema API since the schema
-//! shape is determined at runtime by `sieve.toml`.
+//! Each event table becomes a query field returning a Connection type with
+//! cursor-based pagination, filtering, and sorting. Uses `async-graphql`'s
+//! dynamic schema API since the schema shape is determined at runtime by
+//! `sieve.toml`.
 
 use crate::api::query_builder::{
-    bind_params, build_select, parse_filters, validate_order_column, DEFAULT_LIMIT,
+    bind_params, build_select_with_cursor, decode_cursor, encode_cursor, parse_filters,
+    validate_order_column, Cursor, SelectParams, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use crate::api::types::{
     build_columns_meta, build_select_clause, operators_for_type, pg_to_graphql_type, row_to_json,
     to_pascal_case, ColumnMeta,
 };
 use crate::toml_config::ResolvedEvent;
+
 use async_graphql::dynamic::{
     Enum, EnumItem, Field, FieldFuture, FieldValue, InputObject, InputValue, Object, Schema,
     SchemaBuilder, TypeRef,
@@ -43,6 +46,9 @@ pub fn build_schema(events: &[ResolvedEvent], pool: PgPool) -> eyre::Result<Sche
     // Register _Meta type
     builder = builder.register(build_meta_type());
 
+    // Register shared PageInfo type
+    builder = builder.register(build_page_info_type());
+
     // Build Query root
     let mut query = Object::new("Query")
         .description("Auto-generated query API for indexed Ethereum events");
@@ -55,6 +61,7 @@ pub fn build_schema(events: &[ResolvedEvent], pool: PgPool) -> eyre::Result<Sche
         let type_name = to_pascal_case(&event.table_name);
         let filter_type_name = format!("{type_name}Filter");
         let order_by_type_name = format!("{type_name}OrderBy");
+        let connection_type_name = format!("{type_name}Connection");
 
         let columns_meta = build_columns_meta(event);
         let select_clause = build_select_clause(&columns_meta);
@@ -74,10 +81,13 @@ pub fn build_schema(events: &[ResolvedEvent], pool: PgPool) -> eyre::Result<Sche
         // Register order-by enum
         builder = builder.register(build_order_by_enum(&order_by_type_name, &columns_meta));
 
+        // Register Connection type
+        builder = builder.register(build_connection_type(&connection_type_name, &type_name));
+
         // Add query field
         query = query.field(build_query_field(
             &event.table_name,
-            &type_name,
+            &connection_type_name,
             &filter_type_name,
             &order_by_type_name,
             pool.clone(),
@@ -173,24 +183,105 @@ fn build_order_direction_enum() -> Enum {
         .item(EnumItem::new("DESC"))
 }
 
+// ── PageInfo and Connection types ────────────────────────────────────
+
+fn build_page_info_type() -> Object {
+    Object::new("PageInfo")
+        .field(Field::new(
+            "hasNextPage",
+            TypeRef::named_nn(TypeRef::BOOLEAN),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let info = ctx.parent_value.try_downcast_ref::<PageInfoData>()?;
+                    Ok(Some(FieldValue::value(info.has_next_page)))
+                })
+            },
+        ))
+        .field(Field::new(
+            "endCursor",
+            TypeRef::named(TypeRef::STRING),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let info = ctx.parent_value.try_downcast_ref::<PageInfoData>()?;
+                    Ok(info.end_cursor.as_ref().map(|c| FieldValue::value(c.clone())))
+                })
+            },
+        ))
+}
+
+fn build_connection_type(connection_type_name: &str, node_type_name: &str) -> Object {
+    let node_type = node_type_name.to_string();
+
+    Object::new(connection_type_name)
+        .field(Field::new(
+            "nodes",
+            TypeRef::named_nn_list_nn(&node_type),
+            move |ctx| {
+                FieldFuture::new(async move {
+                    let conn = ctx.parent_value.try_downcast_ref::<ConnectionData>()?;
+                    let values: Vec<FieldValue<'static>> = conn
+                        .nodes
+                        .iter()
+                        .map(|m| FieldValue::owned_any(m.clone()))
+                        .collect();
+                    Ok(Some(FieldValue::list(values)))
+                })
+            },
+        ))
+        .field(Field::new(
+            "pageInfo",
+            TypeRef::named_nn("PageInfo"),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let conn = ctx.parent_value.try_downcast_ref::<ConnectionData>()?;
+                    Ok(Some(FieldValue::owned_any(conn.page_info.clone())))
+                })
+            },
+        ))
+}
+
+// ── Internal data structs for FieldValue::owned_any ──────────────────
+
+/// Resolved connection data passed to GraphQL Connection type resolvers.
+struct ConnectionData {
+    nodes: Vec<HashMap<String, serde_json::Value>>,
+    page_info: PageInfoData,
+}
+
+/// Resolved page info for cursor-based pagination.
+#[derive(Clone)]
+struct PageInfoData {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+// Compile-time size assertions (reth pattern).
+#[cfg(target_pointer_width = "64")]
+const _: [(); 32] = [(); core::mem::size_of::<PageInfoData>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 56] = [(); core::mem::size_of::<ConnectionData>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 112] = [(); core::mem::size_of::<QueryArgs>()];
+
 // ── Root query field ─────────────────────────────────────────────────
 
 fn build_query_field(
     query_field_name: &str,
-    type_name: &str,
+    connection_type_name: &str,
     filter_type_name: &str,
     order_by_type_name: &str,
     pool: PgPool,
     meta: Arc<TableMeta>,
 ) -> Field {
+    let conn_type = connection_type_name.to_string();
     Field::new(
         query_field_name,
-        TypeRef::named_nn_list_nn(type_name),
+        TypeRef::named_nn(&conn_type),
         move |ctx| {
             let pool = pool.clone();
             let meta = Arc::clone(&meta);
             FieldFuture::new(async move {
-                resolve_query(ctx, &pool, &meta).await
+                resolve_connection(ctx, &pool, &meta).await
             })
         },
     )
@@ -208,13 +299,89 @@ fn build_query_field(
             .default_value(DEFAULT_LIMIT as i32),
     )
     .argument(InputValue::new("skip", TypeRef::named(TypeRef::INT)).default_value(0i32))
+    .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
 }
 
-async fn resolve_query(
+/// Resolve a connection query with cursor-based pagination.
+async fn resolve_connection(
     ctx: async_graphql::dynamic::ResolverContext<'_>,
     pool: &PgPool,
     meta: &TableMeta,
 ) -> async_graphql::Result<Option<FieldValue<'static>>> {
+    let args = parse_query_args(&ctx, meta)?;
+
+    let order_pg_type = meta
+        .columns
+        .iter()
+        .find(|c| c.name == args.order_by)
+        .map_or("text", |c| c.pg_type.as_str());
+
+    // Fetch limit+1 rows to determine hasNextPage
+    let fetch_limit = (args.limit + 1).min(MAX_LIMIT + 1);
+
+    let (sql, params) = build_select_with_cursor(&SelectParams {
+        table: &meta.table_name,
+        select_clause: &meta.select_clause,
+        filters: &args.filters,
+        order_by: &args.order_by,
+        order_pg_type,
+        order_dir: args.direction,
+        limit: fetch_limit,
+        offset: args.offset,
+        cursor: args.cursor.as_ref(),
+    });
+
+    let query = sqlx::query(&sql);
+    let query = bind_params(query, &params);
+
+    let rows = query
+        .fetch_all(pool)
+        .await
+        .map_err(|e| async_graphql::Error::new(format!("query failed: {e}")))?;
+
+    let has_next_page = rows.len() as i64 > args.limit;
+    let result_rows = if has_next_page {
+        &rows[..args.limit as usize]
+    } else {
+        &rows[..]
+    };
+
+    let mut nodes: Vec<HashMap<String, serde_json::Value>> =
+        Vec::with_capacity(result_rows.len());
+    for row in result_rows {
+        let map = row_to_json(row, &meta.columns)
+            .map_err(|e| async_graphql::Error::new(format!("row extraction failed: {e:#}")))?;
+        nodes.push(map);
+    }
+
+    let end_cursor = compute_end_cursor(result_rows, meta, &args.order_by);
+
+    let conn = ConnectionData {
+        nodes,
+        page_info: PageInfoData {
+            has_next_page,
+            end_cursor,
+        },
+    };
+
+    Ok(Some(FieldValue::owned_any(conn)))
+}
+
+/// Parsed query arguments extracted from GraphQL resolver context.
+struct QueryArgs {
+    filters: Vec<crate::api::query_builder::FilterCondition>,
+    order_by: String,
+    direction: &'static str,
+    limit: i64,
+    offset: i64,
+    cursor: Option<Cursor>,
+}
+
+/// Parse query arguments from the GraphQL resolver context.
+fn parse_query_args(
+    ctx: &async_graphql::dynamic::ResolverContext<'_>,
+    meta: &TableMeta,
+) -> async_graphql::Result<QueryArgs> {
     // Parse filter
     let filters = match ctx.args.try_get("where") {
         Ok(where_val) => {
@@ -239,7 +406,7 @@ async fn resolve_query(
     let order_by = validate_order_column(&order_by_str, &meta.columns)
         .map_err(|e| async_graphql::Error::new(format!("{e:#}")))?;
 
-    let direction: &str = ctx
+    let direction: &'static str = ctx
         .args
         .try_get("orderDirection")
         .ok()
@@ -249,13 +416,14 @@ async fn resolve_query(
         })
         .unwrap_or("DESC");
 
-    // Parse pagination
+    // Parse pagination (clamp to 1..MAX_LIMIT to prevent zero/negative panics)
     let limit = ctx
         .args
         .try_get("first")
         .ok()
         .and_then(|v| v.i64().ok())
-        .unwrap_or(DEFAULT_LIMIT);
+        .unwrap_or(DEFAULT_LIMIT)
+        .clamp(1, MAX_LIMIT);
 
     let offset = ctx
         .args
@@ -264,26 +432,54 @@ async fn resolve_query(
         .and_then(|v| v.i64().ok())
         .unwrap_or(0);
 
-    // Build and execute SQL
-    let (sql, params) =
-        build_select(&meta.table_name, &meta.select_clause, &filters, order_by, direction, limit, offset);
+    // Parse cursor
+    let cursor = match ctx.args.try_get("after") {
+        Ok(after_val) => {
+            let cursor_str = after_val
+                .string()
+                .map_err(|_| async_graphql::Error::new("'after' must be a string"))?;
+            Some(
+                decode_cursor(cursor_str)
+                    .map_err(|e| async_graphql::Error::new(format!("invalid cursor: {e:#}")))?,
+            )
+        }
+        Err(_) => None,
+    };
 
-    let query = sqlx::query(&sql);
-    let query = bind_params(query, &params);
+    Ok(QueryArgs {
+        filters,
+        order_by: order_by.to_string(),
+        direction,
+        limit,
+        offset,
+        cursor,
+    })
+}
 
-    let rows = query
-        .fetch_all(pool)
-        .await
-        .map_err(|e| async_graphql::Error::new(format!("query failed: {e}")))?;
+/// Compute the end cursor from the last row in the result set.
+fn compute_end_cursor(
+    rows: &[sqlx::postgres::PgRow],
+    meta: &TableMeta,
+    order_by: &str,
+) -> Option<String> {
+    let last_row = rows.last()?;
+    let last_map = row_to_json(last_row, &meta.columns).ok()?;
 
-    let mut results: Vec<FieldValue<'static>> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let map = row_to_json(row, &meta.columns)
-            .map_err(|e| async_graphql::Error::new(format!("row extraction failed: {e:#}")))?;
-        results.push(FieldValue::owned_any(map));
-    }
+    let sort_value = last_map
+        .get(order_by)
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })?;
 
-    Ok(Some(FieldValue::list(results)))
+    let id = last_map.get("id").and_then(|v| match v {
+        serde_json::Value::String(s) => s.parse::<i64>().ok(),
+        serde_json::Value::Number(n) => n.as_i64(),
+        _ => None,
+    })?;
+
+    Some(encode_cursor(&sort_value, id))
 }
 
 // ── _Meta field ──────────────────────────────────────────────────────
@@ -353,7 +549,6 @@ mod tests {
         let meta = build_columns_meta(&event);
         let _input = build_filter_input("TestFilter", &meta);
         // If it builds without panic, the InputObject is valid.
-        // Detailed field checking requires schema introspection (integration test).
     }
 
     #[test]
@@ -361,7 +556,6 @@ mod tests {
         let event = test_event();
         let meta = build_columns_meta(&event);
         let _e = build_order_by_enum("TestOrderBy", &meta);
-        // Same — builds without error.
     }
 
     #[test]
@@ -369,5 +563,17 @@ mod tests {
         let event = test_event();
         let meta = build_columns_meta(&event);
         let _obj = build_output_object("UsdcTransfers", &meta);
+    }
+
+    #[test]
+    fn connection_type_has_nodes_and_pageinfo() {
+        let _conn = build_connection_type("TestConnection", "TestNode");
+        // Builds without error — dynamic schema validates at build time.
+    }
+
+    #[test]
+    fn pageinfo_type_has_fields() {
+        let _pi = build_page_info_type();
+        // Builds without error.
     }
 }

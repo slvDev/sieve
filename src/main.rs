@@ -9,6 +9,7 @@ mod db;
 mod decode;
 mod filter;
 mod handler;
+mod metrics;
 mod p2p;
 mod sync;
 mod toml_config;
@@ -16,12 +17,13 @@ mod types;
 #[cfg(test)]
 mod test_utils;
 
+use types::BlockNumber;
+
 use clap::Parser;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{info, warn};
-use types::BlockNumber;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -74,13 +76,17 @@ async fn main() -> eyre::Result<()> {
     let handlers = Arc::new(handler::HandlerRegistry::new(handlers));
     info!(handlers = handlers.len(), "registered event handlers");
 
+    // Metrics
+    let metrics = Arc::new(metrics::SieveMetrics::new());
+
     // GraphQL API server (optional)
     if let Some(api_port) = cli.api_port {
         let schema =
             api::build_schema(&startup.resolved_events, db.pool().clone())?;
         let api_stop = stop_rx.clone();
+        let api_metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
-            if let Err(e) = api::run_api_server(api_port, schema, api_stop).await {
+            if let Err(e) = api::run_api_server(api_port, schema, api_metrics, api_stop).await {
                 tracing::error!(error = %e, "API server error");
             }
         });
@@ -90,7 +96,16 @@ async fn main() -> eyre::Result<()> {
     let session = p2p::connect_mainnet_peers().await?;
     info!(peers = session.pool.len(), "connected to ethereum p2p network");
 
-    run_indexer(&cli, startup.start_block, &session, index_config, db, handlers, stop_rx).await
+    let ctx = sync::SyncContext {
+        pool: Arc::clone(&session.pool),
+        config: index_config,
+        db,
+        handlers,
+        metrics,
+        stop_rx,
+    };
+
+    run_indexer(&cli, startup.start_block, ctx).await
 }
 
 /// Resolved startup parameters from TOML config + CLI.
@@ -156,31 +171,23 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 async fn run_indexer(
     cli: &cli::Cli,
     start_block: BlockNumber,
-    session: &p2p::NetworkSession,
-    index_config: Arc<config::IndexConfig>,
-    db: Arc<db::Database>,
-    handlers: Arc<handler::HandlerRegistry>,
-    stop_rx: watch::Receiver<bool>,
+    ctx: sync::SyncContext,
 ) -> eyre::Result<()> {
     if let Some(end_block_raw) = cli.end_block {
         let end_block = BlockNumber::new(end_block_raw);
-        let effective_start = resolve_effective_start(&db, start_block, end_block).await?;
+        let effective_start = resolve_effective_start(&ctx.db, start_block, end_block).await?;
 
         if effective_start > end_block {
             info!("nothing to index");
+            ctx.metrics.is_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
 
-        let outcome = sync::run_sync(
-            Arc::clone(&session.pool),
-            effective_start,
-            end_block,
-            index_config,
-            db,
-            handlers,
-            stop_rx,
-        )
-        .await?;
+        let metrics = Arc::clone(&ctx.metrics);
+        let outcome = sync::run_sync(effective_start, end_block, ctx).await?;
+
+        // Historical sync complete — mark as ready
+        metrics.is_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
         info!(
             blocks = outcome.blocks_fetched,
@@ -192,15 +199,7 @@ async fn run_indexer(
             "sync complete"
         );
     } else {
-        sync::run_follow_loop(
-            Arc::clone(&session.pool),
-            start_block,
-            index_config,
-            db,
-            handlers,
-            stop_rx,
-        )
-        .await?;
+        sync::run_follow_loop(start_block, ctx).await?;
     }
 
     Ok(())
