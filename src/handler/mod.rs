@@ -166,6 +166,8 @@ pub struct ConfigDrivenHandler {
     resolved: ResolvedEvent,
     /// Pre-computed handler name for logging.
     handler_name: String,
+    /// Whether this handler is for a factory-child contract.
+    is_factory_child: bool,
 }
 
 impl ConfigDrivenHandler {
@@ -173,9 +175,11 @@ impl ConfigDrivenHandler {
     #[must_use]
     pub fn new(resolved: ResolvedEvent) -> Self {
         let handler_name = format!("{}:{}", resolved.contract_name, resolved.event_name);
+        let is_factory_child = resolved.is_factory_child;
         Self {
             resolved,
             handler_name,
+            is_factory_child,
         }
     }
 }
@@ -212,6 +216,11 @@ impl EventHandler for ConfigDrivenHandler {
             .bind(event.tx_hash.as_slice())
             .bind(event.tx_index as i32)
             .bind(event.log_index as i32);
+
+        // Bind contract_address for factory children ($5)
+        if self.is_factory_child {
+            query = query.bind(Address::to_checksum(&event.contract_address, None));
+        }
 
         // Bind context columns (between standard and user columns)
         for cf in &self.resolved.context_fields {
@@ -486,6 +495,7 @@ mod tests {
             tx_hash: B256::repeat_byte(0xBB),
             tx_index: 5,
             log_index: 3,
+            contract_address: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         }
     }
 
@@ -555,6 +565,7 @@ mod tests {
             create_table_sql: String::new(),
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
+            is_factory_child: false,
         };
 
         let handler = ConfigDrivenHandler::new(resolved);

@@ -35,14 +35,31 @@ pub struct DatabaseConfig {
 pub struct TomlContract {
     /// Human-readable name (e.g. "USDC").
     pub name: String,
-    /// Hex address with 0x prefix.
-    pub address: String,
+    /// Hex address with 0x prefix. Absent for factory-child contracts.
+    pub address: Option<String>,
     /// Path to ABI JSON file (relative to config dir).
     pub abi: String,
-    /// Block number to start indexing from.
-    pub start_block: u64,
+    /// Block number to start indexing from. Factory provides it for children.
+    pub start_block: Option<u64>,
     /// Events to index from this contract.
     pub events: Vec<TomlEvent>,
+    /// Optional factory config for dynamically-created contracts.
+    pub factory: Option<TomlFactory>,
+}
+
+/// Factory section for a contract definition.
+#[derive(Debug, Deserialize)]
+pub struct TomlFactory {
+    /// Factory contract address (hex with 0x prefix).
+    pub address: String,
+    /// Optional separate ABI for the factory (defaults to parent ABI).
+    pub abi: Option<String>,
+    /// Name of the creation event (e.g. "PoolCreated").
+    pub event: String,
+    /// ABI parameter name holding the child contract address (e.g. "pool").
+    pub param: String,
+    /// Block number to start scanning for factory events.
+    pub start_block: u64,
 }
 
 /// An event definition from TOML.
@@ -157,6 +174,25 @@ pub struct ResolvedConfig {
     pub index_config: IndexConfig,
     /// Per-event SQL and column mappings.
     pub resolved_events: Vec<ResolvedEvent>,
+    /// Factory definitions for dynamic contract discovery.
+    pub factories: Vec<ResolvedFactory>,
+}
+
+/// A resolved factory contract definition.
+#[derive(Debug, Clone)]
+pub struct ResolvedFactory {
+    /// On-chain factory contract address.
+    pub factory_address: Address,
+    /// ABI event for contract creation.
+    pub creation_event: alloy_json_abi::Event,
+    /// Topic0 selector for the creation event.
+    pub creation_selector: alloy_primitives::B256,
+    /// Name of the ABI parameter holding the child address.
+    pub child_address_param: String,
+    /// Name of the child contract (for handler/table lookup).
+    pub child_contract_name: String,
+    /// Block number to start scanning for factory events.
+    pub start_block: u64,
 }
 
 /// A fully resolved event with pre-built SQL statements.
@@ -180,6 +216,8 @@ pub struct ResolvedEvent {
     pub create_indexes_sql: Vec<String>,
     /// Pre-built DELETE (rollback) SQL.
     pub rollback_sql: String,
+    /// Whether this event belongs to a factory-child contract.
+    pub is_factory_child: bool,
 }
 
 // ── Type mapping ──────────────────────────────────────────────────────
@@ -258,11 +296,14 @@ fn validate_identifier(name: &str, kind: &str) -> eyre::Result<()> {
 /// Generate `CREATE TABLE IF NOT EXISTS` SQL for an event.
 ///
 /// Callers must validate identifiers before calling this function.
+/// For factory-child tables, adds a `contract_address` column and includes
+/// it in the unique constraint.
 #[must_use]
 fn generate_create_table_sql(
     table: &str,
     context_fields: &[ContextField],
     columns: &[ResolvedColumn],
+    is_factory_child: bool,
 ) -> String {
     use std::fmt::Write;
 
@@ -275,6 +316,10 @@ fn generate_create_table_sql(
          log_index INTEGER NOT NULL"
     );
 
+    if is_factory_child {
+        sql.push_str(",\n  contract_address TEXT NOT NULL");
+    }
+
     // Context columns (between standard and user columns)
     for cf in context_fields {
         let _ = write!(sql, ",\n  {} {}", cf.pg_column_name(), cf.pg_type());
@@ -284,7 +329,11 @@ fn generate_create_table_sql(
         let _ = write!(sql, ",\n  {} {} NOT NULL", col.column_name, col.pg_type);
     }
 
-    sql.push_str(",\n  UNIQUE (block_number, tx_index, log_index)\n)");
+    if is_factory_child {
+        sql.push_str(",\n  UNIQUE (contract_address, block_number, tx_index, log_index)\n)");
+    } else {
+        sql.push_str(",\n  UNIQUE (block_number, tx_index, log_index)\n)");
+    }
 
     sql
 }
@@ -298,15 +347,27 @@ fn generate_indexes_sql(table: &str) -> Vec<String> {
 }
 
 /// Generate the INSERT SQL with positional parameters.
+///
+/// For factory-child tables, `contract_address` is inserted as `$5`
+/// (shifting context and user column indices by 1).
 #[must_use]
 fn generate_insert_sql(
     table: &str,
     context_fields: &[ContextField],
     columns: &[ResolvedColumn],
+    is_factory_child: bool,
 ) -> String {
     use std::fmt::Write;
 
     let mut col_names = String::from("block_number, tx_hash, tx_index, log_index");
+
+    // Standard columns are $1-$4; factory children add contract_address as $5
+    let mut param_idx = if is_factory_child {
+        col_names.push_str(", contract_address");
+        6
+    } else {
+        5
+    };
 
     // Context columns
     for cf in context_fields {
@@ -319,9 +380,11 @@ fn generate_insert_sql(
         col_names.push_str(&col.column_name);
     }
 
-    // Standard columns ($1-$4), then context ($5...), then user columns.
     let mut params = String::from("$1, $2, $3, $4");
-    let mut param_idx = 5usize;
+
+    if is_factory_child {
+        params.push_str(", $5");
+    }
 
     for cf in context_fields {
         params.push_str(", ");
@@ -343,10 +406,13 @@ fn generate_insert_sql(
         param_idx += 1;
     }
 
-    format!(
-        "INSERT INTO {table} ({col_names}) VALUES ({params}) \
-         ON CONFLICT (block_number, tx_index, log_index) DO NOTHING"
-    )
+    let conflict = if is_factory_child {
+        "ON CONFLICT (contract_address, block_number, tx_index, log_index) DO NOTHING"
+    } else {
+        "ON CONFLICT (block_number, tx_index, log_index) DO NOTHING"
+    };
+
+    format!("INSERT INTO {table} ({col_names}) VALUES ({params}) {conflict}")
 }
 
 /// Generate the rollback (DELETE) SQL.
@@ -387,14 +453,34 @@ pub fn resolve_config(
 ) -> eyre::Result<ResolvedConfig> {
     let mut contract_configs = Vec::with_capacity(config.contracts.len());
     let mut resolved_events = Vec::new();
+    let mut resolved_factories = Vec::new();
     let mut table_names = HashSet::new();
 
     for contract in &config.contracts {
-        // Validate address
-        let address: Address = contract
-            .address
-            .parse()
-            .wrap_err_with(|| format!("invalid address for contract '{}'", contract.name))?;
+        let is_factory_child = contract.factory.is_some();
+
+        // Validate: must have either address or factory, not both, not neither
+        if contract.address.is_some() && is_factory_child {
+            return Err(eyre::eyre!(
+                "contract '{}' has both 'address' and 'factory'; use one or the other",
+                contract.name
+            ));
+        }
+        if contract.address.is_none() && !is_factory_child {
+            return Err(eyre::eyre!(
+                "contract '{}' must have either 'address' or 'factory'",
+                contract.name
+            ));
+        }
+
+        // Resolve address: static contract has an address, factory child uses Address::ZERO placeholder
+        let address: Address = if let Some(ref addr_str) = contract.address {
+            addr_str
+                .parse()
+                .wrap_err_with(|| format!("invalid address for contract '{}'", contract.name))?
+        } else {
+            Address::ZERO
+        };
 
         // Read and parse ABI
         let abi_path = config_dir.join(&contract.abi);
@@ -413,68 +499,28 @@ pub fn resolve_config(
             )
         })?;
 
+        // Resolve factory if present
+        if let Some(ref factory) = contract.factory {
+            resolved_factories.push(resolve_factory(
+                factory,
+                &contract.name,
+                &abi,
+                config_dir,
+            )?);
+        }
+
         let event_names: Vec<&str> = contract.events.iter().map(|e| e.name.as_str()).collect();
 
         // Resolve each event
         for toml_event in &contract.events {
-            // Validate and check for duplicate table names
-            validate_identifier(&toml_event.table, "table")?;
-            if !table_names.insert(toml_event.table.clone()) {
-                return Err(eyre::eyre!(
-                    "duplicate table name '{}' across events",
-                    toml_event.table
-                ));
-            }
-
-            // Find event in ABI
-            let abi_events = abi.events.get(&toml_event.name).ok_or_else(|| {
-                eyre::eyre!(
-                    "event '{}' not found in ABI for contract '{}'",
-                    toml_event.name,
-                    contract.name
-                )
-            })?;
-            let abi_event = abi_events.first().ok_or_else(|| {
-                eyre::eyre!(
-                    "no variants for event '{}' in contract '{}'",
-                    toml_event.name,
-                    contract.name
-                )
-            })?;
-
-            // Resolve context fields
-            let context_fields = resolve_context_fields(
-                toml_event.context.as_deref(),
+            resolve_event(
+                toml_event,
                 &contract.name,
-                &toml_event.name,
+                &abi,
+                is_factory_child,
+                &mut table_names,
+                &mut resolved_events,
             )?;
-
-            // Resolve columns
-            let columns = resolve_columns(
-                toml_event.columns.as_deref(),
-                abi_event,
-                &contract.name,
-                &toml_event.name,
-            )?;
-
-            let create_table_sql =
-                generate_create_table_sql(&toml_event.table, &context_fields, &columns);
-            let create_indexes_sql = generate_indexes_sql(&toml_event.table);
-            let insert_sql =
-                generate_insert_sql(&toml_event.table, &context_fields, &columns);
-            let rollback_sql = generate_rollback_sql(&toml_event.table);
-
-            resolved_events.push(ResolvedEvent {
-                event_name: toml_event.name.clone(),
-                contract_name: contract.name.clone(),
-                table_name: toml_event.table.clone(),
-                context_fields,
-                columns,
-                insert_sql,
-                create_table_sql,
-                create_indexes_sql,
-                rollback_sql,
-            });
         }
 
         // Build ContractConfig for the filter/decode pipeline
@@ -492,12 +538,152 @@ pub fn resolve_config(
     info!(
         contracts = config.contracts.len(),
         events = resolved_events.len(),
+        factories = resolved_factories.len(),
         "resolved TOML config"
     );
 
     Ok(ResolvedConfig {
         index_config,
         resolved_events,
+        factories: resolved_factories,
+    })
+}
+
+/// Resolve a single TOML event definition into a `ResolvedEvent`.
+///
+/// # Errors
+///
+/// Returns an error if the table name is invalid/duplicate, the event is not
+/// found in the ABI, or column resolution fails.
+fn resolve_event(
+    toml_event: &TomlEvent,
+    contract_name: &str,
+    abi: &JsonAbi,
+    is_factory_child: bool,
+    table_names: &mut HashSet<String>,
+    resolved_events: &mut Vec<ResolvedEvent>,
+) -> eyre::Result<()> {
+    validate_identifier(&toml_event.table, "table")?;
+    if !table_names.insert(toml_event.table.clone()) {
+        return Err(eyre::eyre!(
+            "duplicate table name '{}' across events",
+            toml_event.table
+        ));
+    }
+
+    let abi_events = abi.events.get(&toml_event.name).ok_or_else(|| {
+        eyre::eyre!(
+            "event '{}' not found in ABI for contract '{contract_name}'",
+            toml_event.name,
+        )
+    })?;
+    let abi_event = abi_events.first().ok_or_else(|| {
+        eyre::eyre!(
+            "no variants for event '{}' in contract '{contract_name}'",
+            toml_event.name,
+        )
+    })?;
+
+    let context_fields = resolve_context_fields(
+        toml_event.context.as_deref(),
+        contract_name,
+        &toml_event.name,
+    )?;
+    let columns = resolve_columns(
+        toml_event.columns.as_deref(),
+        abi_event,
+        contract_name,
+        &toml_event.name,
+    )?;
+
+    let create_table_sql =
+        generate_create_table_sql(&toml_event.table, &context_fields, &columns, is_factory_child);
+    let create_indexes_sql = generate_indexes_sql(&toml_event.table);
+    let insert_sql =
+        generate_insert_sql(&toml_event.table, &context_fields, &columns, is_factory_child);
+    let rollback_sql = generate_rollback_sql(&toml_event.table);
+
+    resolved_events.push(ResolvedEvent {
+        event_name: toml_event.name.clone(),
+        contract_name: contract_name.to_owned(),
+        table_name: toml_event.table.clone(),
+        context_fields,
+        columns,
+        insert_sql,
+        create_table_sql,
+        create_indexes_sql,
+        rollback_sql,
+        is_factory_child,
+    });
+
+    Ok(())
+}
+
+/// Resolve a factory definition: load ABI, validate event and param, build
+/// `ResolvedFactory`.
+///
+/// # Errors
+///
+/// Returns an error if the factory ABI cannot be read/parsed, the event is
+/// not found, or the child-address param does not exist.
+fn resolve_factory(
+    factory: &TomlFactory,
+    contract_name: &str,
+    parent_abi: &JsonAbi,
+    config_dir: &Path,
+) -> eyre::Result<ResolvedFactory> {
+    let factory_abi: JsonAbi = if let Some(ref factory_abi_path) = factory.abi {
+        let fabi_path = config_dir.join(factory_abi_path);
+        let fabi_json = std::fs::read_to_string(&fabi_path).wrap_err_with(|| {
+            format!(
+                "failed to read factory ABI '{}' for contract '{contract_name}'",
+                fabi_path.display(),
+            )
+        })?;
+        serde_json::from_str(&fabi_json).wrap_err_with(|| {
+            format!(
+                "failed to parse factory ABI JSON '{}' for contract '{contract_name}'",
+                fabi_path.display(),
+            )
+        })?
+    } else {
+        parent_abi.clone()
+    };
+
+    let factory_address: Address = factory
+        .address
+        .parse()
+        .wrap_err_with(|| format!("invalid factory address for contract '{contract_name}'"))?;
+
+    let creation_events = factory_abi.events.get(&factory.event).ok_or_else(|| {
+        eyre::eyre!(
+            "factory event '{}' not found in ABI for contract '{contract_name}'",
+            factory.event,
+        )
+    })?;
+    let creation_event = creation_events.first().ok_or_else(|| {
+        eyre::eyre!(
+            "no variants for factory event '{}' in contract '{contract_name}'",
+            factory.event,
+        )
+    })?;
+
+    let param_exists = creation_event.inputs.iter().any(|p| p.name == factory.param);
+    if !param_exists {
+        return Err(eyre::eyre!(
+            "factory param '{}' not found in event '{}' for contract '{contract_name}'",
+            factory.param,
+            factory.event,
+        ));
+    }
+
+    Ok(ResolvedFactory {
+        factory_address,
+        creation_selector: creation_event.selector(),
+        creation_event: creation_event.clone(),
+        child_address_param: factory.param.clone(),
+        child_contract_name: contract_name.to_owned(),
+        start_block: factory.start_block,
     })
 }
 
@@ -744,7 +930,7 @@ table = "usdc_approvals"
             },
         ];
 
-        let sql = generate_create_table_sql("usdc_transfers", &[], &columns);
+        let sql = generate_create_table_sql("usdc_transfers", &[], &columns, false);
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS usdc_transfers"));
         assert!(sql.contains("id BIGSERIAL PRIMARY KEY"));
         assert!(sql.contains("block_number BIGINT NOT NULL"));
@@ -763,7 +949,7 @@ table = "usdc_approvals"
             pg_type: "numeric".to_string(),
         }];
 
-        let sql = generate_create_table_sql("t", &ctx, &columns);
+        let sql = generate_create_table_sql("t", &ctx, &columns, false);
         // Context columns appear between standard and user columns
         assert!(sql.contains("block_timestamp BIGINT NOT NULL"));
         assert!(sql.contains("tx_from TEXT NOT NULL"));
@@ -773,7 +959,7 @@ table = "usdc_approvals"
     #[test]
     fn generate_create_table_with_nullable_tx_to() {
         let ctx = vec![ContextField::TxTo];
-        let sql = generate_create_table_sql("t", &ctx, &[]);
+        let sql = generate_create_table_sql("t", &ctx, &[], false);
         // tx_to should be nullable (no NOT NULL)
         assert!(sql.contains("tx_to TEXT"));
         assert!(!sql.contains("tx_to TEXT NOT NULL"));
@@ -794,7 +980,7 @@ table = "usdc_approvals"
             },
         ];
 
-        let sql = generate_insert_sql("usdc_transfers", &[], &columns);
+        let sql = generate_insert_sql("usdc_transfers", &[], &columns, false);
         assert!(sql.contains("INSERT INTO usdc_transfers"));
         assert!(sql.contains("block_number, tx_hash, tx_index, log_index, from_address, to_address"));
         assert!(sql.contains("$1, $2, $3, $4, $5, $6"));
@@ -810,7 +996,7 @@ table = "usdc_approvals"
             pg_type: "numeric".to_string(),
         }];
 
-        let sql = generate_insert_sql("t", &ctx, &columns);
+        let sql = generate_insert_sql("t", &ctx, &columns, false);
         // Context columns between standard ($1-$4) and user columns
         assert!(sql.contains("block_timestamp, tx_from, value"));
         assert!(sql.contains("$5, $6, $7::numeric"));
@@ -819,7 +1005,7 @@ table = "usdc_approvals"
     #[test]
     fn generate_insert_tx_value_gets_numeric_cast() {
         let ctx = vec![ContextField::TxValue];
-        let sql = generate_insert_sql("t", &ctx, &[]);
+        let sql = generate_insert_sql("t", &ctx, &[], false);
         assert!(sql.contains("$5::numeric"));
     }
 
@@ -867,7 +1053,7 @@ table = "usdc_approvals"
         let dir = setup_test_dir("resolve", ERC20_ABI)?;
 
         let config: SieveConfig = toml::from_str(FULL_TOML)?;
-        let ResolvedConfig { index_config, resolved_events: resolved } = resolve_config(&config, &dir)?;
+        let ResolvedConfig { index_config, resolved_events: resolved, .. } = resolve_config(&config, &dir)?;
 
         assert_eq!(index_config.contracts.len(), 1);
         assert_eq!(resolved.len(), 2);
@@ -1141,5 +1327,67 @@ table = "robert'); drop table students;--"
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn parse_factory_toml() -> eyre::Result<()> {
+        let toml_str = r#"
+[[contracts]]
+name = "UniswapV3Pool"
+abi = "abis/pool.json"
+
+[contracts.factory]
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+event = "PoolCreated"
+param = "pool"
+start_block = 12369621
+
+[[contracts.events]]
+name = "Swap"
+table = "uniswap_swaps"
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        assert_eq!(config.contracts.len(), 1);
+
+        let c = &config.contracts[0];
+        assert!(c.address.is_none());
+        assert!(c.start_block.is_none());
+
+        let f = c.factory.as_ref().ok_or_else(|| eyre::eyre!("no factory"))?;
+        assert_eq!(f.address, "0x1F98431c8aD98523631AE4a59f267346ea31F984");
+        assert_eq!(f.event, "PoolCreated");
+        assert_eq!(f.param, "pool");
+        assert_eq!(f.start_block, 12_369_621);
+
+        Ok(())
+    }
+
+    #[test]
+    fn factory_child_table_has_contract_address() {
+        let columns = vec![ResolvedColumn {
+            column_name: "amount".to_string(),
+            param_name: "amount".to_string(),
+            pg_type: "numeric".to_string(),
+        }];
+
+        let sql = generate_create_table_sql("pool_swaps", &[], &columns, true);
+        assert!(sql.contains("contract_address TEXT NOT NULL"));
+        // UNIQUE constraint includes contract_address
+        assert!(sql.contains("contract_address, block_number, tx_index, log_index"));
+    }
+
+    #[test]
+    fn factory_child_insert_has_contract_address() {
+        let columns = vec![ResolvedColumn {
+            column_name: "amount".to_string(),
+            param_name: "amount".to_string(),
+            pg_type: "numeric".to_string(),
+        }];
+
+        let sql = generate_insert_sql("pool_swaps", &[], &columns, true);
+        assert!(sql.contains("contract_address"));
+        // contract_address is $5, user column starts at $6
+        assert!(sql.contains("$5"));
+        assert!(sql.contains("$6"));
     }
 }

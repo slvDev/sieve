@@ -9,9 +9,12 @@
 
 use crate::config::IndexConfig;
 use crate::sync::BlockPayload;
+use crate::toml_config::ResolvedFactory;
 use crate::types::BlockNumber;
-use alloy_primitives::{Log, LogData, B256};
-use tracing::warn;
+use alloy_dyn_abi::{DynSolValue, EventExt};
+use alloy_primitives::{Address, Log, LogData, B256};
+use std::collections::HashMap;
+use tracing::{debug, warn};
 
 /// A log that matched the user's filter criteria, with block context.
 pub struct FilteredLog {
@@ -100,6 +103,113 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
     }
 
     matched
+}
+
+// ── Factory discovery ────────────────────────────────────────────────
+
+/// A discovered factory-created child contract.
+#[derive(Debug)]
+pub struct FactoryDiscovery {
+    /// Name of the child contract (for handler/table lookup).
+    pub child_contract_name: String,
+    /// Address of the newly created child contract.
+    pub child_address: Address,
+    /// Block number where the creation event was emitted.
+    pub block_number: u64,
+}
+
+/// Scan a block's logs for factory creation events.
+///
+/// Returns discovered child addresses. Zero overhead if `factories` is empty.
+#[must_use]
+pub fn scan_factory_events(
+    payload: &BlockPayload,
+    factories: &[ResolvedFactory],
+) -> Vec<FactoryDiscovery> {
+    if factories.is_empty() {
+        return Vec::new();
+    }
+
+    // Build lookup: (factory_address, creation_selector) → &ResolvedFactory
+    let mut lookup: HashMap<(Address, B256), &ResolvedFactory> =
+        HashMap::with_capacity(factories.len());
+    for factory in factories {
+        lookup.insert(
+            (factory.factory_address, factory.creation_selector),
+            factory,
+        );
+    }
+
+    let mut discoveries = Vec::new();
+
+    for receipt in payload.receipts() {
+        for log in &receipt.logs {
+            let topics = log.data.topics();
+            let Some(&topic0) = topics.first() else {
+                continue;
+            };
+
+            let Some(factory) = lookup.get(&(log.address, topic0)) else {
+                continue;
+            };
+
+            if let Some(child_addr) = decode_child_address(log, factory) {
+                debug!(
+                    factory = %factory.child_contract_name,
+                    child = ?child_addr,
+                    block = payload.header().number,
+                    "discovered factory child"
+                );
+                discoveries.push(FactoryDiscovery {
+                    child_contract_name: factory.child_contract_name.clone(),
+                    child_address: child_addr,
+                    block_number: payload.header().number,
+                });
+            }
+        }
+    }
+
+    discoveries
+}
+
+/// Decode a creation log to extract the child contract address.
+fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> Option<Address> {
+    let decoded = factory.creation_event.decode_log(&log.data).ok()?;
+
+    // Search indexed params first, then body params
+    for (i, input) in factory.creation_event.inputs.iter().enumerate() {
+        if input.name == factory.child_address_param {
+            let value = if input.indexed {
+                // Find position among indexed params
+                let indexed_pos = factory
+                    .creation_event
+                    .inputs
+                    .iter()
+                    .take(i + 1)
+                    .filter(|p| p.indexed)
+                    .count()
+                    - 1;
+                decoded.indexed.get(indexed_pos)?
+            } else {
+                // Find position among body params
+                let body_pos = factory
+                    .creation_event
+                    .inputs
+                    .iter()
+                    .take(i + 1)
+                    .filter(|p| !p.indexed)
+                    .count()
+                    - 1;
+                decoded.body.get(body_pos)?
+            };
+
+            if let DynSolValue::Address(addr) = value {
+                return Some(*addr);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -206,6 +316,75 @@ mod tests {
 
         let matched = filter_block(&payload, &config);
         assert!(matched.is_empty());
+        Ok(())
+    }
+
+    // ── Factory tests ────────────────────────────────────────────────
+
+    #[test]
+    fn scan_factory_events_empty_when_no_factories() {
+        let header = Header::default();
+        let body = BlockBody {
+            transactions: vec![],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let payload = BlockPayload::new(header, body, vec![]);
+        let discoveries = scan_factory_events(&payload, &[]);
+        assert!(discoveries.is_empty());
+    }
+
+    #[test]
+    fn scan_factory_events_finds_creation() -> eyre::Result<()> {
+        // Build a minimal factory ABI for "PoolCreated(address indexed pool)"
+        let abi_json = r#"[
+            {"anonymous":false,"inputs":[
+                {"indexed":true,"internalType":"address","name":"pool","type":"address"}
+            ],"name":"PoolCreated","type":"event"}
+        ]"#;
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(abi_json)
+            .map_err(|e| eyre::eyre!("parse: {e}"))?;
+        let creation_event = abi.events.get("PoolCreated")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no PoolCreated event"))?;
+
+        let factory_addr = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
+        let child_addr = address!("8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8");
+
+        let factory = ResolvedFactory {
+            factory_address: factory_addr,
+            creation_event: creation_event.clone(),
+            creation_selector: creation_event.selector(),
+            child_address_param: "pool".to_string(),
+            child_contract_name: "UniswapV3Pool".to_string(),
+            start_block: 12_369_621,
+        };
+
+        // Build a log that matches the factory event
+        let child_topic = B256::left_padding_from(child_addr.as_slice());
+        let log = make_log(
+            factory_addr,
+            vec![creation_event.selector(), child_topic],
+            Bytes::new(),
+        );
+        let receipt = make_receipt(vec![log]);
+
+        let header = Header {
+            number: 12_369_700,
+            ..Default::default()
+        };
+        let body = BlockBody {
+            transactions: vec![],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let payload = BlockPayload::new(header, body, vec![receipt]);
+
+        let discoveries = scan_factory_events(&payload, &[factory]);
+        assert_eq!(discoveries.len(), 1);
+        assert_eq!(discoveries[0].child_address, child_addr);
+        assert_eq!(discoveries[0].child_contract_name, "UniswapV3Pool");
+        assert_eq!(discoveries[0].block_number, 12_369_700);
         Ok(())
     }
 }

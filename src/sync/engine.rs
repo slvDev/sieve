@@ -13,6 +13,7 @@ use crate::sync::scheduler::{
     PeerHealthConfig, PeerHealthTracker, PeerWorkScheduler, SchedulerConfig,
 };
 use crate::sync::{BlockPayload, SyncContext};
+use crate::toml_config::ResolvedFactory;
 use crate::types::BlockNumber;
 use crate::{decode, filter};
 
@@ -146,6 +147,7 @@ pub async fn run_sync(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.handlers),
         Arc::clone(&ctx.metrics),
+        Arc::clone(&ctx.factories),
     ));
 
     // Main fetch loop
@@ -600,6 +602,7 @@ async fn consume_payloads(
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
     metrics: Arc<SieveMetrics>,
+    factories: Arc<Vec<ResolvedFactory>>,
 ) -> ConsumerStats {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
@@ -609,6 +612,7 @@ async fn consume_payloads(
         config: &config,
         db: &db,
         handlers: &handlers,
+        factories: &factories,
     };
 
     while let Some(payload) = payload_rx.recv().await {
@@ -666,6 +670,7 @@ struct ProcessContext<'a> {
     config: &'a IndexConfig,
     db: &'a Database,
     handlers: &'a HandlerRegistry,
+    factories: &'a [ResolvedFactory],
 }
 
 /// Compute the sealed hash for a block header.
@@ -696,6 +701,14 @@ async fn process_block_events(
 ) -> eyre::Result<ProcessOutcome> {
     let block_number = BlockNumber::new(payload.header().number);
     let block_hash = compute_block_hash(payload.header());
+
+    // Step 0: factory pre-scan (discovers new child contracts)
+    if !ctx.factories.is_empty() {
+        let discoveries = filter::scan_factory_events(payload, ctx.factories);
+        for d in &discoveries {
+            register_factory_child(ctx, d).await?;
+        }
+    }
 
     // Step 1: filter
     let matched = filter::filter_block(payload, ctx.config);
@@ -792,6 +805,54 @@ fn build_event_context(
         tx_value: tx_signed.value(),
         tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
     })
+}
+
+/// Register a factory-discovered child contract in both config and database.
+async fn register_factory_child(
+    ctx: &ProcessContext<'_>,
+    discovery: &filter::FactoryDiscovery,
+) -> eyre::Result<()> {
+    // Find the contract index by name
+    let Some(contract_idx) = ctx
+        .config
+        .contracts
+        .iter()
+        .position(|c| c.name == discovery.child_contract_name)
+    else {
+        warn!(
+            factory = %discovery.child_contract_name,
+            "factory child references unknown contract"
+        );
+        return Ok(());
+    };
+
+    // Register in config (returns false if already known)
+    if ctx
+        .config
+        .register_factory_child(discovery.child_address, contract_idx)
+    {
+        // Persist to database
+        let mut tx = ctx.db.begin().await?;
+        db::store_factory_child(
+            &mut tx,
+            &discovery.child_contract_name,
+            &discovery.child_address,
+            discovery.block_number,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .wrap_err("failed to commit factory child registration")?;
+
+        info!(
+            factory = %discovery.child_contract_name,
+            child = ?discovery.child_address,
+            block = discovery.block_number,
+            "registered new factory child"
+        );
+    }
+
+    Ok(())
 }
 
 /// Decode matched logs into events, logging any decode failures.

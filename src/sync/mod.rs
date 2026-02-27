@@ -8,6 +8,7 @@ use crate::db::Database;
 use crate::handler::HandlerRegistry;
 use crate::metrics::SieveMetrics;
 use crate::p2p::PeerPool;
+use crate::toml_config::ResolvedFactory;
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives_traits::Header;
 use std::sync::Arc;
@@ -38,6 +39,8 @@ pub struct SyncContext {
     pub metrics: Arc<SieveMetrics>,
     /// Shutdown signal receiver.
     pub stop_rx: watch::Receiver<bool>,
+    /// Factory definitions for dynamic contract discovery.
+    pub factories: Arc<Vec<ResolvedFactory>>,
 }
 
 /// Full payload for a block: header, body, receipts.
@@ -96,4 +99,4 @@ const _: [(); 816] = [(); core::mem::size_of::<BlockPayload>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 32] = [(); core::mem::size_of::<FetchBatch>()];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 56] = [(); core::mem::size_of::<SyncContext>()];
+const _: [(); 64] = [(); core::mem::size_of::<SyncContext>()];

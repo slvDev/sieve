@@ -65,6 +65,12 @@ async fn main() -> eyre::Result<()> {
     let index_config = Arc::new(startup.index_config);
     info!(contracts = index_config.contracts.len(), "loaded index config");
 
+    // Load persisted factory children from previous runs
+    if !startup.factories.is_empty() {
+        db::load_factory_children(&db, &index_config).await?;
+    }
+    let factories = Arc::new(startup.factories);
+
     // Build handlers from resolved events
     let handlers: Vec<Box<dyn handler::EventHandler>> = startup
         .resolved_events
@@ -103,6 +109,7 @@ async fn main() -> eyre::Result<()> {
         handlers,
         metrics,
         stop_rx,
+        factories,
     };
 
     run_indexer(&cli, startup.start_block, ctx).await
@@ -114,6 +121,7 @@ struct StartupConfig {
     database_url: String,
     index_config: config::IndexConfig,
     resolved_events: Vec<toml_config::ResolvedEvent>,
+    factories: Vec<toml_config::ResolvedFactory>,
     start_block: BlockNumber,
 }
 
@@ -145,20 +153,28 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 
     let resolved = toml_config::resolve_config(&sieve_config, config_dir)?;
 
-    // Compute effective start_block: CLI override or minimum across contracts
+    // Compute effective start_block: CLI override or minimum across contracts and factories
     let start_block = BlockNumber::new(cli.start_block.unwrap_or_else(|| {
-        sieve_config
+        let contract_min = sieve_config
             .contracts
             .iter()
-            .map(|c| c.start_block)
+            .filter_map(|c| c.start_block)
             .min()
-            .unwrap_or(0)
+            .unwrap_or(u64::MAX);
+        let factory_min = resolved
+            .factories
+            .iter()
+            .map(|f| f.start_block)
+            .min()
+            .unwrap_or(u64::MAX);
+        contract_min.min(factory_min)
     }));
 
     Ok(StartupConfig {
         database_url,
         index_config: resolved.index_config,
         resolved_events: resolved.resolved_events,
+        factories: resolved.factories,
         start_block,
     })
 }

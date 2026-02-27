@@ -10,6 +10,7 @@ use crate::metrics::SieveMetrics;
 use crate::p2p::{discover_head_p2p, PeerPool};
 use crate::sync::reorg;
 use crate::sync::{run_sync, ReorgCheck, SyncContext};
+use crate::toml_config::ResolvedFactory;
 use crate::types::BlockNumber;
 
 use std::sync::atomic::Ordering;
@@ -27,6 +28,7 @@ struct FollowContext {
     handlers: Arc<HandlerRegistry>,
     metrics: Arc<SieveMetrics>,
     stop_rx: watch::Receiver<bool>,
+    factories: Arc<Vec<ResolvedFactory>>,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -51,6 +53,7 @@ pub async fn run_follow_loop(
         handlers: ctx.handlers,
         metrics: ctx.metrics,
         stop_rx: ctx.stop_rx,
+        factories: ctx.factories,
     };
 
     while !is_stopped(&fctx.stop_rx) {
@@ -126,6 +129,7 @@ async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
         &ctx.db,
         &ctx.pool,
         &ctx.handlers,
+        &ctx.config,
         baseline,
         ctx.start_block.as_u64(),
         &ctx.stop_rx,
@@ -153,6 +157,7 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
         handlers: Arc::clone(&ctx.handlers),
         metrics: Arc::clone(&ctx.metrics),
         stop_rx: ctx.stop_rx.clone(),
+        factories: Arc::clone(&ctx.factories),
     };
 
     let outcome = run_sync(
@@ -179,6 +184,7 @@ async fn should_rollback_reorg(
     db: &Database,
     pool: &PeerPool,
     handlers: &HandlerRegistry,
+    config: &crate::config::IndexConfig,
     baseline: u64,
     start_block: u64,
     stop_rx: &watch::Receiver<bool>,
@@ -195,7 +201,7 @@ async fn should_rollback_reorg(
             Ok(true)
         }
         ReorgCheck::ReorgDetected { anchor } => {
-            execute_rollback(db, handlers, &anchor, baseline).await?;
+            execute_rollback(db, handlers, config, &anchor, baseline).await?;
             Ok(true)
         }
     }
@@ -205,6 +211,7 @@ async fn should_rollback_reorg(
 async fn execute_rollback(
     db: &Database,
     handlers: &HandlerRegistry,
+    config: &crate::config::IndexConfig,
     anchor: &crate::p2p::NetworkPeer,
     baseline: u64,
 ) -> eyre::Result<()> {
@@ -215,6 +222,7 @@ async fn execute_rollback(
     let ancestor_block = BlockNumber::new(ancestor);
     let mut tx = db.begin().await?;
     handlers.rollback_all(ancestor_block, &mut tx).await?;
+    db::rollback_factory_children(&mut tx, ancestor_block, config).await?;
     db::rollback_to(&mut tx, ancestor_block).await?;
     tx.commit().await?;
     Ok(())

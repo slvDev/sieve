@@ -9,7 +9,7 @@ use crate::config::ContractConfig;
 use crate::filter::FilteredLog;
 use crate::types::BlockNumber;
 use alloy_dyn_abi::{DynSolValue, EventExt};
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use std::fmt;
 
 /// A single decoded parameter from an event log.
@@ -44,11 +44,13 @@ pub struct DecodedEvent {
     pub tx_index: usize,
     /// Log index within the transaction's receipt.
     pub log_index: usize,
+    /// Contract address that emitted this event.
+    pub contract_address: Address,
 }
 
 // Compile-time size assertion for hot type (reth pattern).
 #[cfg(target_pointer_width = "64")]
-const _: [(); 160] = [(); core::mem::size_of::<DecodedEvent>()];
+const _: [(); 184] = [(); core::mem::size_of::<DecodedEvent>()];
 
 impl fmt::Display for DecodedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -124,6 +126,7 @@ pub fn decode_log(log: &FilteredLog, contract: &ContractConfig) -> eyre::Result<
         tx_hash: log.tx_hash,
         tx_index: log.tx_index,
         log_index: log.log_index,
+        contract_address: log.log.address,
     })
 }
 

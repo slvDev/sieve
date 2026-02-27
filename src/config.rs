@@ -7,6 +7,7 @@
 use alloy_json_abi::{Event, JsonAbi};
 use alloy_primitives::{Address, B256};
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 /// Configuration for a single contract to index.
 #[derive(Debug)]
@@ -70,35 +71,93 @@ impl ContractConfig {
 }
 
 /// Top-level index configuration holding all contracts to watch.
-#[derive(Debug)]
 pub struct IndexConfig {
     /// All contract configurations.
     pub contracts: Vec<ContractConfig>,
     /// Fast lookup: address → index into `contracts`.
     address_to_contract: HashMap<Address, usize>,
+    /// Dynamically registered factory children: address → index into `contracts`.
+    factory_children: RwLock<HashMap<Address, usize>>,
+}
+
+impl std::fmt::Debug for IndexConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let children_count = self
+            .factory_children
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        f.debug_struct("IndexConfig")
+            .field("contracts", &self.contracts)
+            .field("static_addresses", &self.address_to_contract.len())
+            .field("factory_children", &children_count)
+            .finish()
+    }
 }
 
 impl IndexConfig {
     /// Build an index config from a list of contract configs.
+    ///
+    /// Skips `Address::ZERO` entries (factory-child placeholders) in the
+    /// static address map.
     #[must_use]
     pub fn new(contracts: Vec<ContractConfig>) -> Self {
         let mut address_to_contract = HashMap::with_capacity(contracts.len());
         for (idx, contract) in contracts.iter().enumerate() {
-            address_to_contract.insert(contract.address, idx);
+            // Skip placeholder addresses used by factory-child contracts
+            if contract.address != Address::ZERO {
+                address_to_contract.insert(contract.address, idx);
+            }
         }
         Self {
             contracts,
             address_to_contract,
+            factory_children: RwLock::new(HashMap::new()),
         }
     }
 
     /// Look up the contract config for a given address. O(1).
+    ///
+    /// Checks static addresses first, then dynamically registered factory children.
     #[must_use]
     pub fn contract_for_address(&self, address: &Address) -> Option<&ContractConfig> {
-        self.address_to_contract
-            .get(address)
-            .map(|&idx| &self.contracts[idx])
+        // Check static map first
+        if let Some(&idx) = self.address_to_contract.get(address) {
+            return Some(&self.contracts[idx]);
+        }
+
+        // Check dynamic factory children
+        let children = self
+            .factory_children
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.get(address).map(|&idx| &self.contracts[idx])
     }
+
+    /// Register a factory-created child contract address.
+    ///
+    /// Returns `false` if the address was already registered.
+    pub fn register_factory_child(&self, address: Address, contract_idx: usize) -> bool {
+        let mut children = self
+            .factory_children
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if children.contains_key(&address) {
+            return false;
+        }
+        children.insert(address, contract_idx);
+        true
+    }
+
+    /// Unregister a factory child address (used during reorg rollback).
+    pub fn unregister_factory_child(&self, address: &Address) {
+        let mut children = self
+            .factory_children
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.remove(address);
+    }
+
 }
 
 /// Hardcoded USDC Transfer config for tests.
@@ -161,6 +220,61 @@ mod tests {
         let wrong = address!("0000000000000000000000000000000000000001");
 
         assert!(config.contract_for_address(&wrong).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn register_and_lookup_factory_child() -> eyre::Result<()> {
+        let config = usdc_transfer_config()?;
+        let child = address!("0000000000000000000000000000000000000042");
+
+        // Not found before registration
+        assert!(config.contract_for_address(&child).is_none());
+
+        // Register child pointing to contract index 0 (USDC)
+        assert!(config.register_factory_child(child, 0));
+
+        // Now found
+        let found = config.contract_for_address(&child);
+        assert!(found.is_some());
+        assert_eq!(found.map(|c| c.name.as_str()), Some("USDC"));
+
+        // Duplicate registration returns false
+        assert!(!config.register_factory_child(child, 0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn unregister_factory_child() -> eyre::Result<()> {
+        let config = usdc_transfer_config()?;
+        let child = address!("0000000000000000000000000000000000000042");
+
+        config.register_factory_child(child, 0);
+        assert!(config.contract_for_address(&child).is_some());
+
+        config.unregister_factory_child(&child);
+        assert!(config.contract_for_address(&child).is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn zero_address_skipped_in_static_map() -> eyre::Result<()> {
+        let abi_json = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]"#;
+
+        let contract = ContractConfig::new(
+            "FactoryChild",
+            Address::ZERO,
+            abi_json,
+            &["Transfer"],
+        )?;
+
+        let config = IndexConfig::new(vec![contract]);
+
+        // Address::ZERO should not be in the static map
+        assert!(config.contract_for_address(&Address::ZERO).is_none());
+
         Ok(())
     }
 }

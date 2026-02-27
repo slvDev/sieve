@@ -8,12 +8,13 @@
 //! Transaction model: one Postgres transaction per block, so all handler
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
+use crate::config::IndexConfig;
 use crate::toml_config::ResolvedEvent;
 use crate::types::BlockNumber;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::info;
 
 /// PostgreSQL database wrapper.
@@ -183,6 +184,132 @@ pub async fn rollback_to(
     .wrap_err("failed to reset checkpoint after rollback")?;
 
     Ok(())
+}
+
+/// Load persisted factory children from the database into the config.
+///
+/// Called at startup to restore dynamically discovered child contracts.
+/// Returns the number of children loaded.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn load_factory_children(db: &Database, config: &IndexConfig) -> eyre::Result<u64> {
+    let rows = sqlx::query(
+        "SELECT factory_name, child_address FROM _sieve_factory_children",
+    )
+    .fetch_all(db.pool())
+    .await
+    .wrap_err("failed to load factory children")?;
+
+    let mut count = 0u64;
+    for row in &rows {
+        let factory_name: &str = row.try_get("factory_name")?;
+        let child_bytes: Vec<u8> = row.try_get("child_address")?;
+
+        if register_persisted_child(config, factory_name, &child_bytes) {
+            count = count.saturating_add(1);
+        }
+    }
+
+    if count > 0 {
+        info!(count, "loaded factory children from database");
+    }
+    Ok(count)
+}
+
+/// Validate and register a single persisted factory child.
+///
+/// Returns `true` if the child was successfully registered.
+fn register_persisted_child(
+    config: &IndexConfig,
+    factory_name: &str,
+    child_bytes: &[u8],
+) -> bool {
+    if child_bytes.len() != 20 {
+        tracing::warn!(
+            factory = factory_name,
+            len = child_bytes.len(),
+            "invalid child address length in DB, skipping"
+        );
+        return false;
+    }
+
+    let child_address = Address::from_slice(child_bytes);
+
+    let Some(contract_idx) = config
+        .contracts
+        .iter()
+        .position(|c| c.name == factory_name)
+    else {
+        tracing::warn!(
+            factory = factory_name,
+            "factory child references unknown contract, skipping"
+        );
+        return false;
+    };
+
+    config.register_factory_child(child_address, contract_idx)
+}
+
+/// Persist a newly discovered factory child in the database.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT fails.
+pub async fn store_factory_child(
+    tx: &mut Transaction<'_, Postgres>,
+    factory_name: &str,
+    child_address: &Address,
+    block_number: u64,
+) -> eyre::Result<()> {
+    sqlx::query(
+        "INSERT INTO _sieve_factory_children (factory_name, child_address, block_number) \
+         VALUES ($1, $2, $3) ON CONFLICT (child_address) DO NOTHING",
+    )
+    .bind(factory_name)
+    .bind(child_address.as_slice())
+    .bind(block_number as i64)
+    .execute(&mut **tx)
+    .await
+    .wrap_err("failed to store factory child")?;
+    Ok(())
+}
+
+/// Roll back factory children discovered after the given block number.
+///
+/// Returns the addresses that were removed (for unregistering from config).
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn rollback_factory_children(
+    tx: &mut Transaction<'_, Postgres>,
+    block_number: BlockNumber,
+    config: &IndexConfig,
+) -> eyre::Result<Vec<Address>> {
+    let rows = sqlx::query(
+        "DELETE FROM _sieve_factory_children WHERE block_number > $1 RETURNING child_address",
+    )
+    .bind(block_number.as_u64() as i64)
+    .fetch_all(&mut **tx)
+    .await
+    .wrap_err("failed to rollback factory children")?;
+
+    let mut removed = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let child_bytes: Vec<u8> = row.try_get("child_address")?;
+        if child_bytes.len() == 20 {
+            let addr = Address::from_slice(&child_bytes);
+            config.unregister_factory_child(&addr);
+            removed.push(addr);
+        }
+    }
+
+    if !removed.is_empty() {
+        info!(count = removed.len(), "rolled back factory children");
+    }
+    Ok(removed)
 }
 
 /// Create user-defined tables from resolved TOML config.
