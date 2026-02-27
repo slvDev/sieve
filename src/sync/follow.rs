@@ -8,13 +8,24 @@ use crate::config::IndexConfig;
 use crate::db::{self, Database};
 use crate::handler::HandlerRegistry;
 use crate::p2p::{discover_head_p2p, PeerPool};
-use crate::sync::engine::run_sync;
-use crate::sync::reorg::{self, ReorgCheck};
+use crate::sync::reorg;
+use crate::sync::{run_sync, ReorgCheck};
+use crate::types::BlockNumber;
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
+
+/// Shared state for the follow loop, reducing argument counts.
+struct FollowContext {
+    pool: Arc<PeerPool>,
+    start_block: BlockNumber,
+    config: Arc<IndexConfig>,
+    db: Arc<Database>,
+    handlers: Arc<HandlerRegistry>,
+    stop_rx: watch::Receiver<bool>,
+}
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
 ///
@@ -23,77 +34,133 @@ use tracing::{debug, info, warn};
 /// # Errors
 ///
 /// Returns an error on unrecoverable failures (DB errors, deep reorgs).
+#[instrument(skip_all, fields(start_block = start_block.as_u64()))]
 pub async fn run_follow_loop(
     pool: Arc<PeerPool>,
-    start_block: u64,
+    start_block: BlockNumber,
     config: Arc<IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
     stop_rx: watch::Receiver<bool>,
 ) -> eyre::Result<()> {
-    info!(start_block, "entering follow mode");
+    info!(start_block = start_block.as_u64(), "entering follow mode");
 
-    loop {
-        if *stop_rx.borrow() {
-            info!("follow loop: shutdown signal received");
-            break;
-        }
+    let ctx = FollowContext {
+        pool,
+        start_block,
+        config,
+        db,
+        handlers,
+        stop_rx,
+    };
 
-        let baseline = db
-            .last_checkpoint()
-            .await?
-            .unwrap_or_else(|| start_block.saturating_sub(1));
-
-        let Some(observed_head) = discover_head_p2p(&pool, baseline, 3, 1024).await? else {
-            debug!("no new blocks discovered, waiting");
-            if wait_or_stop(&stop_rx, Duration::from_secs(1)).await {
-                break;
-            }
-            continue;
-        };
-
-        let next_block = baseline + 1;
-        if next_block > observed_head {
-            debug!(next_block, observed_head, "at tip, waiting");
-            if wait_or_stop(&stop_rx, Duration::from_secs(1)).await {
-                break;
-            }
-            continue;
-        }
-
-        if should_rollback_reorg(&db, &pool, &handlers, baseline, start_block, &stop_rx).await? {
-            continue;
-        }
-
-        let gap = observed_head.saturating_sub(next_block) + 1;
-        info!(next_block, observed_head, gap, "follow epoch: syncing gap");
-
-        let outcome = run_sync(
-            Arc::clone(&pool),
-            next_block,
-            observed_head,
-            Arc::clone(&config),
-            Arc::clone(&db),
-            Arc::clone(&handlers),
-            stop_rx.clone(),
-        )
-        .await?;
-
-        info!(
-            blocks = outcome.blocks_fetched,
-            events_stored = outcome.events_stored,
-            elapsed_ms = outcome.elapsed.as_millis() as u64,
-            "follow epoch complete"
-        );
-
-        // Near tip: back off to avoid busy-looping
-        if gap <= 2 && wait_or_stop(&stop_rx, Duration::from_millis(500)).await {
+    while !is_stopped(&ctx.stop_rx) {
+        if run_follow_epoch(&ctx).await? {
             break;
         }
     }
 
     info!("follow loop exited");
     Ok(())
+}
+
+/// Run a single follow epoch. Returns `true` if the loop should exit.
+async fn run_follow_epoch(ctx: &FollowContext) -> eyre::Result<bool> {
+    match discover_gap(ctx).await? {
+        EpochAction::Wait => {
+            Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await)
+        }
+        EpochAction::Reorg => Ok(false),
+        EpochAction::Sync { next_block, head } => {
+            let gap = sync_epoch(ctx, next_block, head).await?;
+            let should_exit =
+                gap <= 2 && wait_or_stop(&ctx.stop_rx, Duration::from_millis(500)).await;
+            Ok(should_exit)
+        }
+    }
+}
+
+/// Check if the stop signal has been received.
+fn is_stopped(stop_rx: &watch::Receiver<bool>) -> bool {
+    let stopped = *stop_rx.borrow();
+    if stopped {
+        info!("follow loop: shutdown signal received");
+    }
+    stopped
+}
+
+/// What the follow loop should do this epoch.
+enum EpochAction {
+    /// No new blocks or at tip — wait before retrying.
+    Wait,
+    /// Reorg detected and rolled back — restart the loop immediately.
+    Reorg,
+    /// New blocks available — sync from `next_block` to `head`.
+    Sync { next_block: u64, head: u64 },
+}
+
+/// Discover the current chain head and determine the epoch action.
+async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
+    let baseline = ctx
+        .db
+        .last_checkpoint()
+        .await?
+        .map_or_else(|| ctx.start_block.as_u64().saturating_sub(1), BlockNumber::as_u64);
+
+    let Some(observed_head) = discover_head_p2p(&ctx.pool, baseline, 3, 1024).await? else {
+        debug!("no new blocks discovered, waiting");
+        return Ok(EpochAction::Wait);
+    };
+
+    let next_block = baseline + 1;
+    if next_block > observed_head {
+        debug!(next_block, observed_head, "at tip, waiting");
+        return Ok(EpochAction::Wait);
+    }
+
+    if should_rollback_reorg(
+        &ctx.db,
+        &ctx.pool,
+        &ctx.handlers,
+        baseline,
+        ctx.start_block.as_u64(),
+        &ctx.stop_rx,
+    )
+    .await?
+    {
+        return Ok(EpochAction::Reorg);
+    }
+
+    Ok(EpochAction::Sync {
+        next_block,
+        head: observed_head,
+    })
+}
+
+/// Run one sync epoch, returning the gap size.
+async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Result<u64> {
+    let gap = head.saturating_sub(next_block) + 1;
+    info!(next_block, head, gap, "follow epoch: syncing gap");
+
+    let outcome = run_sync(
+        Arc::clone(&ctx.pool),
+        BlockNumber::new(next_block),
+        BlockNumber::new(head),
+        Arc::clone(&ctx.config),
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.handlers),
+        ctx.stop_rx.clone(),
+    )
+    .await?;
+
+    info!(
+        blocks = outcome.blocks_fetched,
+        events_stored = outcome.events_stored,
+        elapsed_ms = outcome.elapsed.as_millis() as u64,
+        "follow epoch complete"
+    );
+
+    Ok(gap)
 }
 
 /// Run reorg preflight and rollback if needed.
@@ -119,18 +186,29 @@ async fn should_rollback_reorg(
             Ok(true)
         }
         ReorgCheck::ReorgDetected { anchor } => {
-            warn!(block = baseline, "reorg detected, finding common ancestor");
-            let ancestor = reorg::find_common_ancestor(db, &anchor, baseline).await?;
-
-            info!(ancestor, "rolling back to common ancestor");
-            let mut tx = db.begin().await?;
-            handlers.rollback_all(ancestor, &mut tx).await?;
-            db::rollback_to(&mut tx, ancestor).await?;
-            tx.commit().await?;
-
+            execute_rollback(db, handlers, &anchor, baseline).await?;
             Ok(true)
         }
     }
+}
+
+/// Find the common ancestor and roll back all indexed data above it.
+async fn execute_rollback(
+    db: &Database,
+    handlers: &HandlerRegistry,
+    anchor: &crate::p2p::NetworkPeer,
+    baseline: u64,
+) -> eyre::Result<()> {
+    warn!(block = baseline, "reorg detected, finding common ancestor");
+    let ancestor = reorg::find_common_ancestor(db, anchor, baseline).await?;
+
+    info!(ancestor, "rolling back to common ancestor");
+    let ancestor_block = BlockNumber::new(ancestor);
+    let mut tx = db.begin().await?;
+    handlers.rollback_all(ancestor_block, &mut tx).await?;
+    db::rollback_to(&mut tx, ancestor_block).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Sleep for `duration`, but return early if `stop_rx` signals shutdown.

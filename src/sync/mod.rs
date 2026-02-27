@@ -12,35 +12,41 @@ pub mod follow;
 pub mod reorg;
 pub mod scheduler;
 
+pub use engine::run_sync;
+pub use follow::run_follow_loop;
+pub use reorg::ReorgCheck;
+
 /// Full payload for a block: header, body, receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockPayload {
-    pub header: Header,
-    pub body: BlockBody,
-    pub receipts: Vec<Receipt>,
+    header: Header,
+    body: BlockBody,
+    receipts: Vec<Receipt>,
 }
 
-/// High-level sync state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncStatus {
-    LookingForPeers,
-    Fetching,
-    Finalizing,
-    UpToDate,
-    Following,
-}
-
-impl SyncStatus {
-    /// Machine-readable status string for logging and metrics.
+impl BlockPayload {
+    /// Create a new block payload.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::LookingForPeers => "looking_for_peers",
-            Self::Fetching => "fetching",
-            Self::Finalizing => "finalizing",
-            Self::UpToDate => "up_to_date",
-            Self::Following => "following",
-        }
+    pub const fn new(header: Header, body: BlockBody, receipts: Vec<Receipt>) -> Self {
+        Self { header, body, receipts }
+    }
+
+    /// Block header.
+    #[must_use]
+    pub const fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Block body (transactions, ommers, withdrawals).
+    #[must_use]
+    pub const fn body(&self) -> &BlockBody {
+        &self.body
+    }
+
+    /// Transaction receipts (one per transaction, in order).
+    #[must_use]
+    pub fn receipts(&self) -> &[Receipt] {
+        &self.receipts
     }
 }
 
@@ -59,3 +65,9 @@ pub struct FetchBatch {
     pub blocks: Vec<u64>,
     pub mode: FetchMode,
 }
+
+// Compile-time size assertions for hot types (reth pattern).
+#[cfg(target_pointer_width = "64")]
+const _: [(); 816] = [(); core::mem::size_of::<BlockPayload>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 32] = [(); core::mem::size_of::<FetchBatch>()];

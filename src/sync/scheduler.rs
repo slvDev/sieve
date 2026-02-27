@@ -333,9 +333,6 @@ impl PeerHealthTracker {
         }
     }
 
-    pub(crate) async fn peer_count(&self) -> usize {
-        self.health.lock().await.len()
-    }
 }
 
 // ── BlockPeerBackoff ─────────────────────────────────────────────────
@@ -459,25 +456,6 @@ impl PeerWorkScheduler {
             blocks: Vec::new(),
             mode: FetchMode::Normal,
         }
-    }
-
-    /// Append a contiguous range of blocks to the pending queue.
-    pub async fn enqueue_range(&self, range: std::ops::RangeInclusive<u64>) -> usize {
-        let start = *range.start();
-        let end = *range.end();
-        if end < start {
-            return 0;
-        }
-        let mut pending = self.pending.lock().await;
-        let mut queued = self.queued.lock().await;
-        let mut added = 0usize;
-        for block in start..=end {
-            if queued.insert(block) {
-                pending.push(Reverse(block));
-                added += 1;
-            }
-        }
-        added
     }
 
     async fn pop_next_batch_for_head(

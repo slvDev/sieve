@@ -7,6 +7,7 @@ use eyre::{eyre, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
+use tracing::instrument;
 
 // ── FetchIngestOutcome ───────────────────────────────────────────────
 
@@ -14,6 +15,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 pub struct FetchIngestOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
+    #[expect(dead_code, reason = "populated during fetch for future metrics/logging")]
     pub fetch_stats: crate::p2p::FetchStageStats,
 }
 
@@ -75,6 +77,7 @@ pub struct FetchTaskParams {
 // ── Fetch task execution ─────────────────────────────────────────────
 
 /// Execute a single fetch task for a batch of blocks from a peer.
+#[instrument(skip_all, fields(peer_id = ?params.peer.peer_id, blocks = params.blocks.len()))]
 pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
     let FetchTaskParams {
         peer,
@@ -119,7 +122,7 @@ async fn handle_fetch_success(
         fetch_stats: _,
     } = outcome;
 
-    let completed: Vec<u64> = payloads.iter().map(|p| p.header.number).collect();
+    let completed: Vec<u64> = payloads.iter().map(|p| p.header().number).collect();
     if !completed.is_empty() {
         let _ = ctx.scheduler.mark_completed(&completed).await;
     }

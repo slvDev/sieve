@@ -12,6 +12,7 @@ use crate::sync::scheduler::{
     PeerHealthConfig, PeerHealthTracker, PeerWorkScheduler, SchedulerConfig,
 };
 use crate::sync::BlockPayload;
+use crate::types::BlockNumber;
 use crate::{decode, filter};
 
 use alloy_consensus::transaction::SignerRecoverable;
@@ -21,15 +22,32 @@ use eyre::WrapErr;
 use reth_network_api::PeerId;
 use reth_primitives_traits::SealedHeader;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 const MAX_CONCURRENT_FETCHES: usize = 32;
 const PAYLOAD_CHANNEL_SIZE: usize = 256;
+
+/// RAII guard that increments an atomic counter on creation and decrements on drop.
+struct ActiveTaskGuard(Arc<AtomicUsize>);
+
+impl ActiveTaskGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for ActiveTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Outcome of a sync run.
 #[derive(Debug)]
@@ -52,6 +70,20 @@ struct ConsumerStats {
     events_stored: u64,
 }
 
+/// Outcome of processing events from a single block.
+#[derive(Debug)]
+struct ProcessOutcome {
+    matched: u64,
+    decoded: u64,
+    stored: u64,
+}
+
+// Compile-time size assertions for hot types (reth pattern).
+#[cfg(target_pointer_width = "64")]
+const _: [(); 56] = [(); core::mem::size_of::<SyncOutcome>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 24] = [(); core::mem::size_of::<ProcessOutcome>()];
+
 /// Run sync for a block range, fetching from the peer pool.
 ///
 /// The `stop_rx` watch channel allows external callers (follow loop, shutdown
@@ -61,25 +93,26 @@ struct ConsumerStats {
 /// # Errors
 ///
 /// Returns an error if the sync encounters an unrecoverable failure.
+#[instrument(skip_all, fields(start_block = start_block.as_u64(), end_block = end_block.as_u64()))]
 pub async fn run_sync(
     pool: Arc<PeerPool>,
-    start_block: u64,
-    end_block: u64,
+    start_block: BlockNumber,
+    end_block: BlockNumber,
     config: Arc<IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
     stop_rx: watch::Receiver<bool>,
 ) -> eyre::Result<SyncOutcome> {
     let started = Instant::now();
-    let total_blocks = end_block.saturating_sub(start_block) + 1;
+    let total_blocks = end_block.as_u64().saturating_sub(start_block.as_u64()) + 1;
 
-    info!(start_block, end_block, total_blocks, "starting sync");
+    info!(start_block = start_block.as_u64(), end_block = end_block.as_u64(), total_blocks, "starting sync");
 
     // Setup scheduler
     let sched_config = SchedulerConfig::default();
     let peer_health_config = PeerHealthConfig::from_scheduler_config(&sched_config);
     let peer_health = Arc::new(PeerHealthTracker::new(peer_health_config));
-    let blocks: Vec<u64> = (start_block..=end_block).collect();
+    let blocks: Vec<u64> = (start_block.as_u64()..=end_block.as_u64()).collect();
     let scheduler = Arc::new(PeerWorkScheduler::new_with_health(
         sched_config,
         blocks,
@@ -104,10 +137,12 @@ pub async fn run_sync(
     let consumer_handle = tokio::spawn(consume_payloads(payload_rx, config, db, handlers));
 
     // Main fetch loop
+    let active_tasks = Arc::new(AtomicUsize::new(0));
     let ctx = FetchLoopContext {
         scheduler: &scheduler,
         peer_health: &peer_health,
         pool: &pool,
+        active_tasks: &active_tasks,
         start_block,
         end_block,
         payload_tx: &payload_tx,
@@ -179,84 +214,130 @@ struct FetchLoopContext<'a> {
     scheduler: &'a Arc<PeerWorkScheduler>,
     peer_health: &'a Arc<PeerHealthTracker>,
     pool: &'a Arc<PeerPool>,
-    start_block: u64,
-    end_block: u64,
+    active_tasks: &'a Arc<AtomicUsize>,
+    start_block: BlockNumber,
+    end_block: BlockNumber,
     payload_tx: &'a mpsc::Sender<BlockPayload>,
     ready_tx: &'a mpsc::UnboundedSender<NetworkPeer>,
 }
 
+/// Mutable state carried across fetch loop iterations.
+struct FetchLoopState {
+    fetch_tasks: JoinSet<()>,
+    ready_peers: Vec<NetworkPeer>,
+    ready_set: HashSet<PeerId>,
+    last_progress_check: Instant,
+    last_progress_completed: u64,
+}
+
+#[instrument(skip_all)]
 async fn run_fetch_loop(
     ctx: &FetchLoopContext<'_>,
     mut ready_rx: mpsc::UnboundedReceiver<NetworkPeer>,
     stop_rx: &watch::Receiver<bool>,
 ) {
     let fetch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
-    let mut fetch_tasks: JoinSet<()> = JoinSet::new();
-    let mut ready_peers: Vec<NetworkPeer> = Vec::new();
-    let mut ready_set: HashSet<PeerId> = HashSet::new();
-    let mut last_progress_check = Instant::now();
-    let mut last_progress_completed = 0u64;
+    let mut state = FetchLoopState {
+        fetch_tasks: JoinSet::new(),
+        ready_peers: Vec::new(),
+        ready_set: HashSet::new(),
+        last_progress_check: Instant::now(),
+        last_progress_completed: 0,
+    };
 
     loop {
-        // Check for external shutdown signal
         if *stop_rx.borrow() {
             debug!("fetch loop: stop signal received");
             break;
         }
 
-        // Drain ready peers, refreshing head from pool
-        drain_ready_peers(&mut ready_rx, ctx.pool, &mut ready_peers, &mut ready_set);
+        drain_ready_peers(
+            &mut ready_rx,
+            ctx.pool,
+            &mut state.ready_peers,
+            &mut state.ready_set,
+        );
 
-        if ready_peers.is_empty() {
-            // Block until at least one peer arrives
-            let Some(mut peer) = ready_rx.recv().await else {
+        if state.ready_peers.is_empty() {
+            if !await_first_peer(
+                &mut ready_rx,
+                ctx.pool,
+                &mut state.ready_peers,
+                &mut state.ready_set,
+            )
+            .await
+            {
                 break;
-            };
-            if let Some(h) = ctx.pool.get_peer_head(peer.peer_id) {
-                peer.head_number = h;
-            }
-            if ready_set.insert(peer.peer_id) {
-                ready_peers.push(peer);
             }
             continue;
         }
 
-        // Reap completed fetch tasks
-        while fetch_tasks.try_join_next().is_some() {}
-
-        // Progress check every 30s (stall detection)
-        check_progress(
-            ctx.scheduler,
-            &mut last_progress_check,
-            &mut last_progress_completed,
-            ready_peers.len(),
-        )
-        .await;
-
-        if ctx.scheduler.is_done().await {
-            debug!("scheduler: all work complete");
+        if !try_dispatch_iteration(ctx, &fetch_semaphore, &mut state).await {
             break;
         }
-
-        // Try to acquire a semaphore permit (non-blocking)
-        let Ok(permit) = fetch_semaphore.clone().try_acquire_owned() else {
-            sleep(Duration::from_millis(10)).await;
-            continue;
-        };
-
-        // Pick best peer and try to dispatch a fetch task
-        dispatch_best_peer(
-            ctx,
-            &mut ready_peers,
-            &mut ready_set,
-            &mut fetch_tasks,
-            permit,
-        )
-        .await;
     }
 
-    // Drain remaining fetch tasks
-    while fetch_tasks.join_next().await.is_some() {}
+    while state.fetch_tasks.join_next().await.is_some() {}
+}
+
+/// Run one dispatch iteration: reap tasks, check progress, acquire permit,
+/// dispatch. Returns `false` if the scheduler is done.
+async fn try_dispatch_iteration(
+    ctx: &FetchLoopContext<'_>,
+    semaphore: &Arc<Semaphore>,
+    state: &mut FetchLoopState,
+) -> bool {
+    while state.fetch_tasks.try_join_next().is_some() {}
+
+    check_progress(
+        ctx.scheduler,
+        ctx.active_tasks,
+        &mut state.last_progress_check,
+        &mut state.last_progress_completed,
+        state.ready_peers.len(),
+    )
+    .await;
+
+    if ctx.scheduler.is_done().await {
+        debug!("scheduler: all work complete");
+        return false;
+    }
+
+    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+        sleep(Duration::from_millis(10)).await;
+        return true;
+    };
+
+    dispatch_best_peer(
+        ctx,
+        &mut state.ready_peers,
+        &mut state.ready_set,
+        &mut state.fetch_tasks,
+        permit,
+    )
+    .await;
+
+    true
+}
+
+/// Block until the first peer arrives, add it to the ready set.
+/// Returns `false` if the channel closed.
+async fn await_first_peer(
+    ready_rx: &mut mpsc::UnboundedReceiver<NetworkPeer>,
+    pool: &PeerPool,
+    ready_peers: &mut Vec<NetworkPeer>,
+    ready_set: &mut HashSet<PeerId>,
+) -> bool {
+    let Some(mut peer) = ready_rx.recv().await else {
+        return false;
+    };
+    if let Some(h) = pool.get_peer_head(peer.peer_id) {
+        peer.head_number = h;
+    }
+    if ready_set.insert(peer.peer_id) {
+        ready_peers.push(peer);
+    }
+    true
 }
 
 /// Pick the best peer, check health, get a batch, and spawn a fetch task.
@@ -292,7 +373,7 @@ async fn dispatch_best_peer(
 
     // Head cap: use peer's head, or end_block if unprobed
     let head_cap = if peer.head_number == 0 {
-        ctx.end_block
+        ctx.end_block.as_u64()
     } else {
         peer.head_number
     };
@@ -335,7 +416,11 @@ async fn dispatch_best_peer(
         permit,
     };
 
-    fetch_tasks.spawn(run_fetch_task(task_ctx, params));
+    let counter = Arc::clone(ctx.active_tasks);
+    fetch_tasks.spawn(async move {
+        let _guard = ActiveTaskGuard::new(&counter);
+        run_fetch_task(task_ctx, params).await;
+    });
 }
 
 /// What to do with an ineligible peer.
@@ -360,8 +445,8 @@ async fn check_peer_eligibility(
     }
 
     // Stale-head detection: peer's probed head is below our work range
-    if peer.head_number > 0 && peer.head_number < ctx.start_block {
-        let gap = ctx.start_block.saturating_sub(peer.head_number);
+    if peer.head_number > 0 && peer.head_number < ctx.start_block.as_u64() {
+        let gap = ctx.start_block.as_u64().saturating_sub(peer.head_number);
 
         // Peers more than 10k blocks behind are useless — drop entirely
         if gap > 10_000 {
@@ -377,7 +462,7 @@ async fn check_peer_eligibility(
         debug!(
             peer_id = ?peer.peer_id,
             peer_head = peer.head_number,
-            start_block = ctx.start_block,
+            start_block = ctx.start_block.as_u64(),
             "peer head below work range, cooling down for 120s"
         );
         ctx.peer_health
@@ -445,6 +530,7 @@ fn recycle_peer(
 
 async fn check_progress(
     scheduler: &PeerWorkScheduler,
+    active_tasks: &AtomicUsize,
     last_check: &mut Instant,
     last_completed: &mut u64,
     ready_count: usize,
@@ -456,6 +542,7 @@ async fn check_progress(
     let pending = scheduler.pending_count().await;
     let inflight = scheduler.inflight_count().await;
     let escalation = scheduler.escalation_len().await;
+    let active = active_tasks.load(Ordering::Relaxed);
 
     if current_completed == *last_completed && (pending > 0 || escalation > 0) {
         warn!(
@@ -463,6 +550,7 @@ async fn check_progress(
             pending,
             inflight,
             escalation,
+            active,
             ready_count,
             "stall detected: no progress in 30s"
         );
@@ -473,6 +561,7 @@ async fn check_progress(
             pending,
             inflight,
             escalation,
+            active,
             ready_count,
             "progress check"
         );
@@ -481,6 +570,7 @@ async fn check_progress(
     *last_check = Instant::now();
 }
 
+#[instrument(skip_all)]
 async fn consume_payloads(
     mut payload_rx: mpsc::Receiver<BlockPayload>,
     config: Arc<IndexConfig>,
@@ -500,17 +590,17 @@ async fn consume_payloads(
         stats.blocks_fetched = stats.blocks_fetched.saturating_add(1);
         stats.total_receipts = stats
             .total_receipts
-            .saturating_add(payload.receipts.len() as u64);
+            .saturating_add(payload.receipts().len() as u64);
 
         match process_block_events(&payload, &ctx).await {
-            Ok((matched, decoded, stored)) => {
-                stats.events_matched = stats.events_matched.saturating_add(matched);
-                stats.events_decoded = stats.events_decoded.saturating_add(decoded);
-                stats.events_stored = stats.events_stored.saturating_add(stored);
+            Ok(outcome) => {
+                stats.events_matched = stats.events_matched.saturating_add(outcome.matched);
+                stats.events_decoded = stats.events_decoded.saturating_add(outcome.decoded);
+                stats.events_stored = stats.events_stored.saturating_add(outcome.stored);
             }
             Err(e) => {
                 warn!(
-                    block = payload.header.number,
+                    block = payload.header().number,
                     error = %e,
                     "failed to process block events"
                 );
@@ -524,7 +614,7 @@ async fn consume_payloads(
                 events_matched = stats.events_matched,
                 events_decoded = stats.events_decoded,
                 events_stored = stats.events_stored,
-                block_number = payload.header.number,
+                block_number = payload.header().number,
                 "sync progress"
             );
             last_log = Instant::now();
@@ -549,7 +639,7 @@ fn compute_block_hash(header: &reth_primitives_traits::Header) -> alloy_primitiv
 /// Commit block hash and checkpoint for a block with no events to store.
 async fn commit_block_bookkeeping(
     db_ref: &Database,
-    block_number: u64,
+    block_number: BlockNumber,
     block_hash: &[u8],
 ) -> eyre::Result<()> {
     let mut tx = db_ref.begin().await?;
@@ -557,25 +647,26 @@ async fn commit_block_bookkeeping(
     db::update_checkpoint(&mut tx, block_number).await?;
     tx.commit()
         .await
-        .wrap_err_with(|| format!("failed to commit block {block_number}"))?;
+        .wrap_err_with(|| format!("failed to commit block {}", block_number.as_u64()))?;
     Ok(())
 }
 
 /// Filter, decode, and store events from a single block payload.
-/// Returns (matched_count, decoded_count, stored_count).
+#[instrument(skip_all, fields(block_number = payload.header().number))]
 async fn process_block_events(
     payload: &BlockPayload,
     ctx: &ProcessContext<'_>,
-) -> eyre::Result<(u64, u64, u64)> {
-    let block_hash = compute_block_hash(&payload.header);
+) -> eyre::Result<ProcessOutcome> {
+    let block_number = BlockNumber::new(payload.header().number);
+    let block_hash = compute_block_hash(payload.header());
 
     // Step 1: filter
     let matched = filter::filter_block(payload, ctx.config);
     let matched_count = matched.len() as u64;
 
     if matched.is_empty() {
-        commit_block_bookkeeping(ctx.db, payload.header.number, block_hash.as_slice()).await?;
-        return Ok((0, 0, 0));
+        commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
+        return Ok(ProcessOutcome { matched: 0, decoded: 0, stored: 0 });
     }
 
     // Step 2: decode (CPU work, no DB)
@@ -583,15 +674,15 @@ async fn process_block_events(
     let decoded_count = decoded_events.len() as u64;
 
     if decoded_events.is_empty() {
-        commit_block_bookkeeping(ctx.db, payload.header.number, block_hash.as_slice()).await?;
-        return Ok((matched_count, 0, 0));
+        commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
+        return Ok(ProcessOutcome { matched: matched_count, decoded: 0, stored: 0 });
     }
 
     // Step 3: store in one transaction per block
     let mut tx = ctx.db.begin().await?;
     let mut stored_count = 0u64;
 
-    db::store_block_hash(&mut tx, payload.header.number, block_hash.as_slice()).await?;
+    db::store_block_hash(&mut tx, block_number, block_hash.as_slice()).await?;
 
     // Cache sender recovery per tx_index (multiple events may share a tx)
     let mut sender_cache: HashMap<usize, Address> = HashMap::new();
@@ -606,13 +697,17 @@ async fn process_block_events(
         stored_count = stored_count.saturating_add(dispatched);
     }
 
-    db::update_checkpoint(&mut tx, payload.header.number).await?;
+    db::update_checkpoint(&mut tx, block_number).await?;
 
     tx.commit()
         .await
-        .wrap_err_with(|| format!("failed to commit block {}", payload.header.number))?;
+        .wrap_err_with(|| format!("failed to commit block {}", block_number.as_u64()))?;
 
-    Ok((matched_count, decoded_count, stored_count))
+    Ok(ProcessOutcome {
+        matched: matched_count,
+        decoded: decoded_count,
+        stored: stored_count,
+    })
 }
 
 /// Build an [`EventContext`] from a block payload for a given decoded event.
@@ -626,14 +721,14 @@ fn build_event_context(
     sender_cache: &mut HashMap<usize, Address>,
 ) -> eyre::Result<EventContext> {
     let tx_signed = payload
-        .body
+        .body()
         .transactions
         .get(event.tx_index)
         .ok_or_else(|| {
             eyre::eyre!(
                 "tx_index {} out of range for block {}",
                 event.tx_index,
-                payload.header.number
+                payload.header().number
             )
         })?;
 
@@ -653,12 +748,12 @@ fn build_event_context(
     };
 
     Ok(EventContext {
-        block_timestamp: payload.header.timestamp,
+        block_timestamp: payload.header().timestamp,
         block_hash,
         tx_from,
         tx_to,
         tx_value: tx_signed.value(),
-        tx_gas_price: tx_signed.effective_gas_price(payload.header.base_fee_per_gas),
+        tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
     })
 }
 
@@ -679,7 +774,7 @@ fn decode_matched_logs(
             }
             Err(e) => {
                 warn!(
-                    block = filtered_log.block_number,
+                    block = filtered_log.block_number.as_u64(),
                     tx_index = filtered_log.tx_index,
                     error = %e,
                     "failed to decode log"

@@ -98,12 +98,6 @@ impl PeerPool {
         self.peers.read().len()
     }
 
-    /// Whether the pool has no peers.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.peers.read().is_empty()
-    }
-
     /// Clone the current list of peers (snapshot in time).
     #[must_use]
     pub fn snapshot(&self) -> Vec<NetworkPeer> {
@@ -148,6 +142,7 @@ impl PeerPool {
 
 /// Timing and request counts per fetch stage.
 #[derive(Debug, Clone, Copy, Default)]
+#[expect(dead_code, reason = "stats populated during fetch for future metrics/logging")]
 pub struct FetchStageStats {
     pub headers_ms: u64,
     pub bodies_ms: u64,
@@ -166,9 +161,9 @@ struct HeadersChunkedResponse {
 
 /// Chunked response with partial results (None = missing item).
 #[derive(Debug)]
-pub struct ChunkedResponse<T> {
-    pub results: Vec<Option<T>>,
-    pub requests: u64,
+struct ChunkedResponse<T> {
+    results: Vec<Option<T>>,
+    requests: u64,
 }
 
 /// Outcome of a full payload fetch for a peer.
@@ -184,8 +179,12 @@ pub struct PayloadFetchOutcome {
 /// Keeps the network handle alive and provides access to the peer pool.
 #[derive(Debug)]
 pub struct NetworkSession {
+    /// Must be held alive to keep the P2P network running.
+    #[expect(dead_code, reason = "held alive to keep network running")]
     pub handle: NetworkHandle<EthNetworkPrimitives>,
     pub pool: Arc<PeerPool>,
+    /// Aggregate connection statistics.
+    #[expect(dead_code, reason = "populated for future metrics/logging")]
     pub p2p_stats: Arc<P2pStats>,
 }
 
@@ -617,6 +616,13 @@ async fn request_receipts70(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<V
 
 // ── Mid-level request functions ──────────────────────────────────────
 
+/// Fetch `count` sequential headers starting from `start_block`.
+///
+/// Chunks large requests to stay within protocol limits.
+///
+/// # Errors
+///
+/// Returns an error if the P2P request times out or the peer disconnects.
 pub async fn request_headers_batch(
     peer: &NetworkPeer,
     start_block: u64,
@@ -658,6 +664,11 @@ async fn request_headers_chunked_with_stats(
     Ok(HeadersChunkedResponse { headers, requests })
 }
 
+/// Fetch receipts for blocks identified by hash, using the peer's ETH version.
+///
+/// # Errors
+///
+/// Returns an error if the P2P request times out or the peer disconnects.
 pub async fn request_receipts(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
     match peer.eth_version {
         EthVersion::Eth70 => request_receipts70(peer, hashes).await,
@@ -836,11 +847,7 @@ pub async fn fetch_payloads_for_peer(
                     missing_blocks.push(number);
                     continue;
                 }
-                payloads.push(BlockPayload {
-                    header,
-                    body,
-                    receipts: block_receipts,
-                });
+                payloads.push(BlockPayload::new(header, body, block_receipts));
             }
             _ => {
                 missing_blocks.push(number);
