@@ -378,6 +378,17 @@ fn default_pg_type(solidity_type: &str) -> &'static str {
 
 // ── Identifier validation ─────────────────────────────────────────────
 
+/// PostgreSQL reserved words that cannot be used as unquoted identifiers.
+const SQL_RESERVED: &[&str] = &[
+    "all", "alter", "and", "as", "between", "by", "case", "check", "column", "constraint",
+    "create", "cross", "default", "delete", "distinct", "drop", "else", "end", "except", "exists",
+    "false", "fetch", "for", "foreign", "from", "grant", "group", "having", "in", "index", "inner",
+    "insert", "intersect", "into", "is", "join", "left", "like", "limit", "not", "null", "offset",
+    "on", "or", "order", "outer", "primary", "references", "returning", "right", "select", "set",
+    "table", "then", "true", "union", "unique", "update", "using", "values", "view", "when",
+    "where", "with",
+];
+
 /// Validate that a SQL identifier (table or column name) is safe.
 ///
 /// Allows lowercase ASCII letters, digits, and underscores. Must start
@@ -401,6 +412,12 @@ fn validate_identifier(name: &str, kind: &str) -> eyre::Result<()> {
         return Err(eyre::eyre!(
             "{kind} name '{name}' contains invalid characters (only a-z, 0-9, _ allowed)"
         ));
+    }
+    // Only reject reserved words for table names (user-chosen in TOML config).
+    // Column names come from ABI parameters (e.g. "from" in Transfer events)
+    // and are quoted in generated SQL, so they're safe.
+    if kind == "table" && SQL_RESERVED.contains(&name) {
+        return Err(eyre::eyre!("{kind} name '{name}' is a SQL reserved word"));
     }
     Ok(())
 }
@@ -1991,6 +2008,17 @@ context = ["block_timestamp", "tx_from"]
         };
         assert!(err.to_string().contains("must start with"));
         Ok(())
+    }
+
+    #[test]
+    fn validate_identifier_rejects_reserved_words() {
+        assert!(validate_identifier("select", "table").is_err());
+        assert!(validate_identifier("order", "table").is_err());
+        assert!(validate_identifier("where", "table").is_err());
+        // Column names from ABIs are allowed (e.g. "from" in Transfer events)
+        assert!(validate_identifier("from", "column").is_ok());
+        // Non-reserved words still pass
+        assert!(validate_identifier("transfers", "table").is_ok());
     }
 
     #[test]
