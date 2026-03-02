@@ -460,6 +460,16 @@ fn generate_indexes_sql(table: &str) -> Vec<String> {
     )]
 }
 
+/// Write a SQL parameter placeholder, adding a `::numeric` cast when needed.
+fn write_param(out: &mut String, idx: usize, needs_numeric_cast: bool) {
+    use std::fmt::Write;
+    if needs_numeric_cast {
+        let _ = write!(out, "${idx}::numeric");
+    } else {
+        let _ = write!(out, "${idx}");
+    }
+}
+
 /// Generate the INSERT SQL with positional parameters.
 ///
 /// For factory-child tables, `contract_address` is inserted as `$5`
@@ -471,8 +481,6 @@ fn generate_insert_sql(
     columns: &[ResolvedColumn],
     is_factory_child: bool,
 ) -> String {
-    use std::fmt::Write;
-
     let mut col_names = String::from("block_number, tx_hash, tx_index, log_index");
 
     // Standard columns are $1-$4; factory children add contract_address as $5
@@ -502,21 +510,13 @@ fn generate_insert_sql(
 
     for cf in context_fields {
         params.push_str(", ");
-        if matches!(cf, ContextField::TxValue) {
-            let _ = write!(params, "${param_idx}::numeric");
-        } else {
-            let _ = write!(params, "${param_idx}");
-        }
+        write_param(&mut params, param_idx, matches!(cf, ContextField::TxValue));
         param_idx += 1;
     }
 
     for col in columns {
         params.push_str(", ");
-        if col.pg_type == "numeric" {
-            let _ = write!(params, "${param_idx}::numeric");
-        } else {
-            let _ = write!(params, "${param_idx}");
-        }
+        write_param(&mut params, param_idx, col.pg_type == "numeric");
         param_idx += 1;
     }
 
@@ -577,8 +577,6 @@ fn generate_transfer_insert_sql(
     table: &str,
     context_fields: &[ContextField],
 ) -> String {
-    use std::fmt::Write;
-
     let mut col_names =
         String::from("block_number, tx_hash, tx_index, from_address, to_address, value");
     let mut params = String::from("$1, $2, $3, $4, $5, $6::numeric");
@@ -588,11 +586,7 @@ fn generate_transfer_insert_sql(
         col_names.push_str(", ");
         col_names.push_str(cf.pg_column_name());
         params.push_str(", ");
-        if matches!(cf, ContextField::TxValue) {
-            let _ = write!(params, "${param_idx}::numeric");
-        } else {
-            let _ = write!(params, "${param_idx}");
-        }
+        write_param(&mut params, param_idx, matches!(cf, ContextField::TxValue));
         param_idx += 1;
     }
 
@@ -658,8 +652,6 @@ fn generate_call_insert_sql(
     columns: &[ResolvedColumn],
     is_factory_child: bool,
 ) -> String {
-    use std::fmt::Write;
-
     let mut col_names = String::from("block_number, tx_hash, tx_index");
 
     let mut param_idx = if is_factory_child {
@@ -687,21 +679,13 @@ fn generate_call_insert_sql(
 
     for cf in context_fields {
         params.push_str(", ");
-        if matches!(cf, ContextField::TxValue) {
-            let _ = write!(params, "${param_idx}::numeric");
-        } else {
-            let _ = write!(params, "${param_idx}");
-        }
+        write_param(&mut params, param_idx, matches!(cf, ContextField::TxValue));
         param_idx += 1;
     }
 
     for col in columns {
         params.push_str(", ");
-        if col.pg_type == "numeric" {
-            let _ = write!(params, "${param_idx}::numeric");
-        } else {
-            let _ = write!(params, "${param_idx}");
-        }
+        write_param(&mut params, param_idx, col.pg_type == "numeric");
         param_idx += 1;
     }
 
