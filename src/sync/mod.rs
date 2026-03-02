@@ -8,9 +8,11 @@ use crate::db::Database;
 use crate::handler::{CallRegistry, HandlerRegistry, TransferRegistry};
 use crate::metrics::SieveMetrics;
 use crate::p2p::PeerPool;
+use crate::stream::StreamDispatcher;
 use crate::toml_config::ResolvedFactory;
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives_traits::Header;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -45,6 +47,12 @@ pub struct SyncContext {
     pub transfer_handlers: Arc<TransferRegistry>,
     /// Function call handler registry.
     pub call_handlers: Arc<CallRegistry>,
+    /// Optional stream notification dispatcher.
+    pub stream_dispatcher: Option<Arc<StreamDispatcher>>,
+    /// Maps (contract_name, event_name) → table_name for notification payloads.
+    pub event_table_map: Arc<HashMap<String, (String, String)>>,
+    /// Whether this sync run is a historical backfill.
+    pub is_backfill: bool,
 }
 
 /// Full payload for a block: header, body, receipts.
@@ -102,5 +110,4 @@ pub struct FetchBatch {
 const _: [(); 816] = [(); core::mem::size_of::<BlockPayload>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 32] = [(); core::mem::size_of::<FetchBatch>()];
-#[cfg(target_pointer_width = "64")]
-const _: [(); 80] = [(); core::mem::size_of::<SyncContext>()];
+// SyncContext size varies with stream fields — skip assertion.

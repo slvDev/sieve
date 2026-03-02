@@ -24,6 +24,9 @@ pub struct SieveConfig {
     /// Native ETH transfer definitions.
     #[serde(default)]
     pub transfers: Vec<TomlTransfer>,
+    /// Stream/webhook notification sinks.
+    #[serde(default)]
+    pub streams: Vec<TomlStream>,
 }
 
 /// Database section.
@@ -134,6 +137,25 @@ pub struct TomlTransferFilter {
     pub to: Option<Vec<String>>,
 }
 
+/// A stream/webhook notification sink from TOML.
+#[derive(Debug, Deserialize)]
+pub struct TomlStream {
+    /// Unique name for this stream.
+    pub name: String,
+    /// Stream type (currently only "webhook").
+    #[serde(rename = "type")]
+    pub stream_type: String,
+    /// Webhook URL (required for type = "webhook").
+    pub url: Option<String>,
+    /// Whether to send notifications during historical backfill. Defaults to true.
+    #[serde(default = "default_true")]
+    pub backfill: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 // ── Context fields ────────────────────────────────────────────────────
 
 /// A context field that enriches events with block/transaction data.
@@ -227,6 +249,19 @@ pub struct ResolvedConfig {
     pub transfers: Vec<ResolvedTransfer>,
     /// Function call definitions.
     pub calls: Vec<ResolvedCall>,
+    /// Stream/webhook notification sinks.
+    pub streams: Vec<ResolvedStream>,
+}
+
+/// A fully resolved stream/webhook sink definition.
+#[derive(Debug, Clone)]
+pub struct ResolvedStream {
+    /// Unique name for this stream.
+    pub name: String,
+    /// Webhook URL.
+    pub url: String,
+    /// Whether to send notifications during historical backfill.
+    pub backfill: bool,
 }
 
 /// A resolved factory contract definition.
@@ -791,6 +826,51 @@ fn parse_address_list(
         .collect()
 }
 
+// ── Stream resolution ──────────────────────────────────────────────────
+
+/// Resolve and validate `[[streams]]` definitions from TOML config.
+///
+/// # Errors
+///
+/// Returns an error if stream names are duplicated, names fail identifier
+/// validation, types are unknown, or required fields are missing.
+fn resolve_streams(streams: &[TomlStream]) -> eyre::Result<Vec<ResolvedStream>> {
+    let mut resolved = Vec::with_capacity(streams.len());
+    let mut seen_names = HashSet::new();
+
+    for s in streams {
+        validate_identifier(&s.name, "stream")?;
+
+        if !seen_names.insert(s.name.clone()) {
+            return Err(eyre::eyre!("duplicate stream name '{}'", s.name));
+        }
+
+        if s.stream_type != "webhook" {
+            return Err(eyre::eyre!(
+                "unknown stream type '{}' for stream '{}' (supported: webhook)",
+                s.stream_type,
+                s.name
+            ));
+        }
+
+        let url = s.url.as_deref().unwrap_or("").to_string();
+        if url.is_empty() {
+            return Err(eyre::eyre!(
+                "stream '{}' of type 'webhook' requires a 'url'",
+                s.name
+            ));
+        }
+
+        resolved.push(ResolvedStream {
+            name: s.name.clone(),
+            url,
+            backfill: s.backfill,
+        });
+    }
+
+    Ok(resolved)
+}
+
 // ── Config loading and resolution ─────────────────────────────────────
 
 /// Load and parse a `sieve.toml` config file.
@@ -845,6 +925,9 @@ pub fn resolve_config(
         resolved_transfers.push(resolve_transfer(t, &mut table_names)?);
     }
 
+    // Resolve streams (webhooks)
+    let resolved_streams = resolve_streams(&config.streams)?;
+
     let index_config = IndexConfig::new(contract_configs);
 
     info!(
@@ -853,6 +936,7 @@ pub fn resolve_config(
         factories = resolved_factories.len(),
         transfers = resolved_transfers.len(),
         calls = resolved_calls.len(),
+        streams = resolved_streams.len(),
         "resolved TOML config"
     );
 
@@ -862,6 +946,7 @@ pub fn resolve_config(
         factories: resolved_factories,
         transfers: resolved_transfers,
         calls: resolved_calls,
+        streams: resolved_streams,
     })
 }
 
@@ -2556,6 +2641,144 @@ columns = [
         assert_eq!(contract.functions.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    // ── Stream config tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_toml_with_streams() -> eyre::Result<()> {
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[[streams]]
+name = "my_webhook"
+type = "webhook"
+url = "http://localhost:8080/events"
+backfill = false
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        assert_eq!(config.streams.len(), 1);
+        assert_eq!(config.streams[0].name, "my_webhook");
+        assert_eq!(config.streams[0].stream_type, "webhook");
+        assert_eq!(config.streams[0].url.as_deref(), Some("http://localhost:8080/events"));
+        assert!(!config.streams[0].backfill);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_backfill_defaults_to_true() -> eyre::Result<()> {
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[[streams]]
+name = "my_webhook"
+type = "webhook"
+url = "http://localhost:8080/events"
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        assert!(config.streams[0].backfill);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_streams_rejects_duplicate_names() {
+        let streams = vec![
+            TomlStream {
+                name: "dup".to_string(),
+                stream_type: "webhook".to_string(),
+                url: Some("http://a".to_string()),
+                backfill: true,
+            },
+            TomlStream {
+                name: "dup".to_string(),
+                stream_type: "webhook".to_string(),
+                url: Some("http://b".to_string()),
+                backfill: true,
+            },
+        ];
+        let result = resolve_streams(&streams);
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("duplicate stream name"));
+    }
+
+    #[test]
+    fn resolve_streams_rejects_unknown_type() {
+        let streams = vec![TomlStream {
+            name: "bad".to_string(),
+            stream_type: "kafka".to_string(),
+            url: Some("http://a".to_string()),
+            backfill: true,
+        }];
+        let result = resolve_streams(&streams);
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("unknown stream type"));
+    }
+
+    #[test]
+    fn resolve_streams_rejects_missing_url() {
+        let streams = vec![TomlStream {
+            name: "no_url".to_string(),
+            stream_type: "webhook".to_string(),
+            url: None,
+            backfill: true,
+        }];
+        let result = resolve_streams(&streams);
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("requires a 'url'"));
+    }
+
+    #[test]
+    fn resolve_streams_rejects_empty_url() {
+        let streams = vec![TomlStream {
+            name: "empty_url".to_string(),
+            stream_type: "webhook".to_string(),
+            url: Some(String::new()),
+            backfill: true,
+        }];
+        let result = resolve_streams(&streams);
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("requires a 'url'"));
+    }
+
+    #[test]
+    fn resolve_streams_valid() -> eyre::Result<()> {
+        let streams = vec![
+            TomlStream {
+                name: "hook_a".to_string(),
+                stream_type: "webhook".to_string(),
+                url: Some("http://localhost:8080".to_string()),
+                backfill: true,
+            },
+            TomlStream {
+                name: "hook_b".to_string(),
+                stream_type: "webhook".to_string(),
+                url: Some("http://localhost:9090".to_string()),
+                backfill: false,
+            },
+        ];
+        let resolved = resolve_streams(&streams)?;
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "hook_a");
+        assert!(resolved[0].backfill);
+        assert_eq!(resolved[1].name, "hook_b");
+        assert!(!resolved[1].backfill);
         Ok(())
     }
 }

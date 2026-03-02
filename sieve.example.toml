@@ -53,3 +53,13 @@ context = ["block_timestamp", "tx_gas_price"]
 [transfers.filter]
 from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
 # to = ["0x..."]  # uncomment to filter by recipient
+
+# ── Webhook notifications ──────────────────────────────────────────────
+# Fires a JSON POST after each block is committed to the database.
+# Payload: { block_number, block_timestamp, tables: [{ name, event, count }] }
+
+# [[streams]]
+# name = "my_webhook"
+# type = "webhook"
+# url = "http://localhost:8080/sieve-events"
+# backfill = false   # skip during historical sync

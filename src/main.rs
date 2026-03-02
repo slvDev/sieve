@@ -18,6 +18,7 @@ mod filter;
 mod handler;
 mod metrics;
 mod p2p;
+mod stream;
 mod sync;
 mod toml_config;
 mod types;
@@ -27,6 +28,7 @@ mod test_utils;
 use types::BlockNumber;
 
 use clap::Parser;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -65,22 +67,7 @@ async fn main() -> eyre::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(shutdown_handler(stop_tx));
 
-    // Database — connect early so checkpoint check is fast (before P2P)
-    let db = Arc::new(db::Database::connect(&startup.database_url).await?);
-    if cli.fresh {
-        warn!("--fresh: dropping all tables");
-        db::drop_all_tables(
-            &db,
-            &startup.resolved_events,
-            &startup.resolved_transfers,
-            &startup.resolved_calls,
-        )
-        .await?;
-    }
-    db::create_internal_tables(&db).await?;
-    db::create_user_tables(&db, &startup.resolved_events).await?;
-    db::create_transfer_tables(&db, &startup.resolved_transfers).await?;
-    db::create_call_tables(&db, &startup.resolved_calls).await?;
+    let db = Arc::new(setup_database(&cli, &startup).await?);
 
     let index_config = Arc::new(startup.index_config);
     info!(contracts = index_config.contracts.len(), "loaded index config");
@@ -122,6 +109,9 @@ async fn main() -> eyre::Result<()> {
         });
     }
 
+    // Build event_table_map: "contract:event" → (table_name, event_name)
+    let event_table_map = build_event_table_map(&startup.resolved_events);
+
     // Build transfer handlers from resolved transfers
     let transfer_handlers: Vec<handler::TransferHandler> = startup
         .resolved_transfers
@@ -138,9 +128,20 @@ async fn main() -> eyre::Result<()> {
         .collect();
     let call_handlers = Arc::new(handler::CallRegistry::new(call_handlers));
 
+    // Stream dispatcher (webhooks)
+    let stream_dispatcher = if startup.resolved_streams.is_empty() {
+        None
+    } else {
+        let sinks = build_stream_sinks(&startup.resolved_streams);
+        info!(streams = sinks.len(), "configured stream sinks");
+        Some(Arc::new(stream::StreamDispatcher::new(sinks, 256)))
+    };
+
     // P2P
     let session = p2p::connect_mainnet_peers().await?;
     info!(peers = session.pool.len(), "connected to ethereum p2p network");
+
+    let is_backfill = cli.end_block.is_some();
 
     let ctx = sync::SyncContext {
         pool: Arc::clone(&session.pool),
@@ -152,6 +153,9 @@ async fn main() -> eyre::Result<()> {
         factories,
         transfer_handlers,
         call_handlers,
+        stream_dispatcher,
+        event_table_map: Arc::new(event_table_map),
+        is_backfill,
     };
 
     run_indexer(&cli, startup.start_block, ctx).await
@@ -166,6 +170,7 @@ struct StartupConfig {
     factories: Vec<toml_config::ResolvedFactory>,
     resolved_transfers: Vec<toml_config::ResolvedTransfer>,
     resolved_calls: Vec<toml_config::ResolvedCall>,
+    resolved_streams: Vec<toml_config::ResolvedStream>,
     start_block: BlockNumber,
 }
 
@@ -227,6 +232,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         factories: resolved.factories,
         resolved_transfers: resolved.transfers,
         resolved_calls: resolved.calls,
+        resolved_streams: resolved.streams,
         start_block,
     })
 }
@@ -273,6 +279,30 @@ async fn run_indexer(
     }
 
     Ok(())
+}
+
+/// Connect to PostgreSQL, optionally drop tables, and create schema.
+///
+/// # Errors
+///
+/// Returns an error if the database connection or DDL fails.
+async fn setup_database(cli: &cli::Cli, startup: &StartupConfig) -> eyre::Result<db::Database> {
+    let db = db::Database::connect(&startup.database_url).await?;
+    if cli.fresh {
+        warn!("--fresh: dropping all tables");
+        db::drop_all_tables(
+            &db,
+            &startup.resolved_events,
+            &startup.resolved_transfers,
+            &startup.resolved_calls,
+        )
+        .await?;
+    }
+    db::create_internal_tables(&db).await?;
+    db::create_user_tables(&db, &startup.resolved_events).await?;
+    db::create_transfer_tables(&db, &startup.resolved_transfers).await?;
+    db::create_call_tables(&db, &startup.resolved_calls).await?;
+    Ok(db)
 }
 
 /// Determine the effective start block, accounting for checkpoint resume.
@@ -322,4 +352,35 @@ async fn shutdown_handler(stop_tx: watch::Sender<bool>) {
         .ok();
     warn!("second shutdown signal received; forcing exit");
     std::process::exit(130);
+}
+
+/// Build the event table map: `"contract:event"` → `(table_name, event_name)`.
+///
+/// Used by the sync engine to map decoded events to table names for
+/// stream notification payloads.
+fn build_event_table_map(
+    events: &[toml_config::ResolvedEvent],
+) -> HashMap<String, (String, String)> {
+    let mut map = HashMap::with_capacity(events.len());
+    for re in events {
+        let key = format!("{}:{}", re.contract_name, re.event_name);
+        map.insert(key, (re.table_name.clone(), re.event_name.clone()));
+    }
+    map
+}
+
+/// Build stream sinks from resolved stream definitions.
+///
+/// Returns `Vec<(sink, backfill)>` for the `StreamDispatcher`.
+fn build_stream_sinks(
+    streams: &[toml_config::ResolvedStream],
+) -> Vec<(Box<dyn stream::StreamSink>, bool)> {
+    streams
+        .iter()
+        .map(|s| {
+            let sink: Box<dyn stream::StreamSink> =
+                Box::new(stream::webhook::WebhookSink::new(s.name.clone(), s.url.clone()));
+            (sink, s.backfill)
+        })
+        .collect()
 }

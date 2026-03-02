@@ -471,6 +471,11 @@ impl TransferRegistry {
         Self { handlers }
     }
 
+    /// Iterate over the table names of all registered transfer handlers.
+    pub fn table_names(&self) -> impl Iterator<Item = &str> {
+        self.handlers.iter().map(|h| h.resolved.table_name.as_str())
+    }
+
     /// Dispatch a native transfer to all matching handlers.
     ///
     /// Returns the number of handlers that processed the transfer.
@@ -665,6 +670,13 @@ impl CallRegistry {
     #[must_use]
     pub const fn new(handlers: Vec<CallHandler>) -> Self {
         Self { handlers }
+    }
+
+    /// Iterate over `(table_name, function_name)` for all registered call handlers.
+    pub fn table_entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.handlers
+            .iter()
+            .map(|h| (h.resolved.table_name.as_str(), h.resolved.function_name.as_str()))
     }
 
     /// Dispatch a decoded call to all matching handlers.

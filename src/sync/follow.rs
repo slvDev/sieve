@@ -8,11 +8,13 @@ use crate::db::{self, Database};
 use crate::handler::{CallRegistry, HandlerRegistry, TransferRegistry};
 use crate::metrics::SieveMetrics;
 use crate::p2p::{discover_head_p2p, PeerPool};
+use crate::stream::StreamDispatcher;
 use crate::sync::reorg;
 use crate::sync::{run_sync, ReorgCheck, SyncContext};
 use crate::toml_config::ResolvedFactory;
 use crate::types::BlockNumber;
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,8 @@ struct FollowContext {
     factories: Arc<Vec<ResolvedFactory>>,
     transfer_handlers: Arc<TransferRegistry>,
     call_handlers: Arc<CallRegistry>,
+    stream_dispatcher: Option<Arc<StreamDispatcher>>,
+    event_table_map: Arc<HashMap<String, (String, String)>>,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -58,6 +62,8 @@ pub async fn run_follow_loop(
         factories: ctx.factories,
         transfer_handlers: ctx.transfer_handlers,
         call_handlers: ctx.call_handlers,
+        stream_dispatcher: ctx.stream_dispatcher,
+        event_table_map: ctx.event_table_map,
     };
 
     while !is_stopped(&fctx.stop_rx) {
@@ -166,6 +172,9 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
         factories: Arc::clone(&ctx.factories),
         transfer_handlers: Arc::clone(&ctx.transfer_handlers),
         call_handlers: Arc::clone(&ctx.call_handlers),
+        stream_dispatcher: ctx.stream_dispatcher.clone(),
+        event_table_map: Arc::clone(&ctx.event_table_map),
+        is_backfill: false,
     };
 
     let outcome = run_sync(
