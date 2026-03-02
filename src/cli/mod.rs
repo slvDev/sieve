@@ -25,6 +25,10 @@ pub struct Cli {
     /// Port for the GraphQL API server. Omit to disable.
     #[arg(long)]
     pub api_port: Option<u16>,
+
+    /// Drop and recreate all tables before indexing. Use to start fresh.
+    #[arg(long)]
+    pub fresh: bool,
 }
 
 #[cfg(test)]
@@ -93,6 +97,20 @@ mod tests {
     fn api_port_is_optional() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["sieve"])?;
         assert!(cli.api_port.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_defaults_to_false() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve"])?;
+        assert!(!cli.fresh);
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_flag_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "--fresh"])?;
+        assert!(cli.fresh);
         Ok(())
     }
 }

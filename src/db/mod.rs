@@ -1,9 +1,12 @@
 //! Database layer — PostgreSQL storage for indexed events.
 //!
-//! Uses `sqlx` with async connection pooling and embedded migrations.
+//! Uses `sqlx` with async connection pooling. Internal tables are created
+//! at runtime via `create_internal_tables()`, same as user tables.
 //!
 //! Internal tables:
 //! - `_sieve_checkpoints`: track which blocks have been indexed
+//! - `_sieve_block_hashes`: store block hashes for reorg detection
+//! - `_sieve_factory_children`: persist dynamically discovered factory children
 //!
 //! Transaction model: one Postgres transaction per block, so all handler
 //! INSERTs + checkpoint UPDATE are committed atomically.
@@ -24,11 +27,11 @@ pub struct Database {
 }
 
 impl Database {
-    /// Connect to PostgreSQL and run embedded migrations.
+    /// Connect to PostgreSQL.
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection or migrations fail.
+    /// Returns an error if the connection fails.
     pub async fn connect(url: &str) -> eyre::Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -36,12 +39,7 @@ impl Database {
             .await
             .wrap_err("failed to connect to database")?;
 
-        sqlx::migrate!()
-            .run(&pool)
-            .await
-            .wrap_err("failed to run migrations")?;
-
-        info!("database connected and migrations applied");
+        info!("database connected");
         Ok(Self { pool })
     }
 
@@ -312,6 +310,109 @@ pub async fn rollback_factory_children(
     Ok(removed)
 }
 
+/// Drop all sieve tables (user + internal) for a fresh start.
+///
+/// Drops user tables first, then internal tables. Also removes the legacy
+/// `_sqlx_migrations` table if it exists from before the migration removal.
+///
+/// # Errors
+///
+/// Returns an error if any DROP statement fails.
+pub async fn drop_all_tables(
+    db: &Database,
+    events: &[ResolvedEvent],
+    transfers: &[ResolvedTransfer],
+    calls: &[ResolvedCall],
+) -> eyre::Result<()> {
+    // User tables
+    for event in events {
+        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", event.table_name);
+        sqlx::raw_sql(&sql)
+            .execute(db.pool())
+            .await
+            .wrap_err_with(|| format!("failed to drop table '{}'", event.table_name))?;
+    }
+    for transfer in transfers {
+        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", transfer.table_name);
+        sqlx::raw_sql(&sql)
+            .execute(db.pool())
+            .await
+            .wrap_err_with(|| format!("failed to drop table '{}'", transfer.table_name))?;
+    }
+    for call in calls {
+        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", call.table_name);
+        sqlx::raw_sql(&sql)
+            .execute(db.pool())
+            .await
+            .wrap_err_with(|| format!("failed to drop table '{}'", call.table_name))?;
+    }
+
+    // Internal tables
+    for table in [
+        "_sieve_factory_children",
+        "_sieve_block_hashes",
+        "_sieve_checkpoints",
+        "_sqlx_migrations",
+    ] {
+        let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
+        sqlx::raw_sql(&sql)
+            .execute(db.pool())
+            .await
+            .wrap_err_with(|| format!("failed to drop table '{table}'"))?;
+    }
+
+    info!("all tables dropped (--fresh)");
+    Ok(())
+}
+
+/// Create sieve-internal tables at runtime.
+///
+/// Uses `CREATE TABLE IF NOT EXISTS` so it is safe to call on every startup.
+/// This replaces the old `sqlx::migrate!()` approach — all DDL is now runtime.
+///
+/// # Errors
+///
+/// Returns an error if any DDL statement fails.
+pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS _sieve_checkpoints (
+            id SMALLINT PRIMARY KEY DEFAULT 1,
+            block_number BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        INSERT INTO _sieve_checkpoints (id, block_number) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;",
+    )
+    .execute(db.pool())
+    .await
+    .wrap_err("failed to create _sieve_checkpoints")?;
+
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS _sieve_block_hashes (
+            block_number BIGINT PRIMARY KEY,
+            block_hash BYTEA NOT NULL
+        );",
+    )
+    .execute(db.pool())
+    .await
+    .wrap_err("failed to create _sieve_block_hashes")?;
+
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS _sieve_factory_children (
+            id BIGSERIAL PRIMARY KEY,
+            factory_name TEXT NOT NULL,
+            child_address BYTEA NOT NULL,
+            block_number BIGINT NOT NULL,
+            UNIQUE (child_address)
+        );",
+    )
+    .execute(db.pool())
+    .await
+    .wrap_err("failed to create _sieve_factory_children")?;
+
+    info!("internal tables ready");
+    Ok(())
+}
+
 /// Create user-defined tables from resolved TOML config.
 ///
 /// Runs `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`
@@ -416,7 +517,9 @@ mod tests {
     async fn test_db() -> eyre::Result<Database> {
         let url = std::env::var("DATABASE_URL")
             .wrap_err("DATABASE_URL not set")?;
-        Database::connect(&url).await
+        let db = Database::connect(&url).await?;
+        create_internal_tables(&db).await?;
+        Ok(db)
     }
 
     #[tokio::test]

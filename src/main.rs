@@ -1,3 +1,10 @@
+//! Sieve — Ethereum event indexer over P2P.
+//!
+//! Entry point: loads TOML config, connects to PostgreSQL, optionally spawns
+//! the GraphQL API server, then runs the P2P sync engine. Supports historical
+//! backfill (`--end-block`) and live head-following modes. Graceful shutdown
+//! on first Ctrl+C, hard exit on second.
+
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -60,6 +67,17 @@ async fn main() -> eyre::Result<()> {
 
     // Database — connect early so checkpoint check is fast (before P2P)
     let db = Arc::new(db::Database::connect(&startup.database_url).await?);
+    if cli.fresh {
+        warn!("--fresh: dropping all tables");
+        db::drop_all_tables(
+            &db,
+            &startup.resolved_events,
+            &startup.resolved_transfers,
+            &startup.resolved_calls,
+        )
+        .await?;
+    }
+    db::create_internal_tables(&db).await?;
     db::create_user_tables(&db, &startup.resolved_events).await?;
     db::create_transfer_tables(&db, &startup.resolved_transfers).await?;
     db::create_call_tables(&db, &startup.resolved_calls).await?;
