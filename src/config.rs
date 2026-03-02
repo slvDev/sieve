@@ -37,6 +37,7 @@ impl ContractConfig {
     ///
     /// Returns an error if the ABI JSON is invalid or an event name is
     /// not found in the ABI.
+    #[cfg(test)]
     pub fn new(
         name: impl Into<String>,
         address: Address,

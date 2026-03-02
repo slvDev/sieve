@@ -18,6 +18,10 @@ pub struct DecodedParam {
     /// Parameter name from the ABI (e.g. "from", "to", "value").
     pub name: String,
     /// Solidity type string (e.g. "address", "uint256").
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "diagnostic metadata; only read in tests")
+    )]
     pub solidity_type: String,
     /// Decoded value.
     pub value: DynSolValue,

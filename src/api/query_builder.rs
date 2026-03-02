@@ -113,6 +113,7 @@ pub const DEFAULT_LIMIT: i64 = 100;
 ///
 /// `select_clause` is the pre-built column list with casts (from
 /// `build_select_clause`). Returns the SQL string and ordered parameter list.
+#[cfg(test)]
 #[must_use]
 pub fn build_select(
     table: &str,
