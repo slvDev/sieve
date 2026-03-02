@@ -16,7 +16,7 @@ Sieve skips all of that. It speaks Ethereum's native P2P protocol directly, the 
 - **Minimal storage** — only the events you define are stored. Full mainnet history in MBs, not hundreds of GBs
 - **No RPC bills** — connect to Ethereum peers directly, no API keys or rate limits
 - **Simple config** — one TOML file defines what to index. No code to write
-- **Production-ready** — auto-generated GraphQL API, Prometheus metrics, health probes, cursor pagination, reorg handling
+- **Production-ready** — auto-generated GraphQL API, Prometheus metrics, health probes, cursor pagination, reorg handling, webhook streaming
 
 ## Quick Start
 
@@ -184,6 +184,35 @@ event = "PoolCreated"
 parameter = "pool"
 ```
 
+### Webhook Streaming
+
+Get notified via HTTP POST after each block is committed to the database. Useful for triggering materialized view refreshes, downstream pipelines, or cache invalidation.
+
+```toml
+[[streams]]
+name = "my_webhook"
+type = "webhook"
+url = "http://localhost:8080/sieve-events"
+backfill = false   # skip during historical sync (default: true)
+```
+
+Payload:
+
+```json
+{
+  "block_number": 22516100,
+  "block_timestamp": 1700000000,
+  "tables": [
+    { "name": "usdc_transfers", "event": "Transfer", "count": 3 },
+    { "name": "eth_transfers", "event": "transfer", "count": 1 }
+  ]
+}
+```
+
+- Best-effort delivery (failures are logged, never block indexing)
+- `backfill = false` skips notifications during historical sync
+- Multiple webhooks supported — each gets every block notification
+
 ## GraphQL API
 
 Sieve auto-generates a full GraphQL schema from your TOML config. Every table gets:
@@ -229,6 +258,7 @@ Options:
   --end-block <NUM>       Stop at this block (omit for follow mode)
   --database-url <URL>    PostgreSQL URL (or set DATABASE_URL env var)
   --api-port <PORT>       Enable GraphQL API on this port
+  --fresh                 Drop and recreate all tables before indexing
 ```
 
 ## Docker Compose
@@ -289,7 +319,7 @@ Ethereum P2P Network
        └────────────────┴──────────────────┘
                         │
                         ▼
-                  PostgreSQL
+                  PostgreSQL ──────► Webhooks
                         │
                         ▼
                   GraphQL API
