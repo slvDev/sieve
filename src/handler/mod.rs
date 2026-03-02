@@ -8,7 +8,7 @@
 //! SQL dynamically from resolved event definitions.
 
 use crate::decode::{DecodedEvent, DecodedParam};
-use crate::toml_config::{ContextField, ResolvedEvent};
+use crate::toml_config::{ContextField, ResolvedEvent, ResolvedTransfer};
 use crate::types::BlockNumber;
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, U256};
@@ -346,6 +346,174 @@ fn bind_context_field<'q>(
         }
         ContextField::TxValue => query.bind(context.tx_value.to_string()),
         ContextField::TxGasPrice => query.bind(context.tx_gas_price as i64),
+    }
+}
+
+// ── Native ETH transfer types ─────────────────────────────────────────
+
+/// A native ETH transfer extracted from a transaction.
+pub struct NativeTransfer {
+    /// Block number containing this transfer.
+    pub block_number: BlockNumber,
+    /// Transaction hash.
+    pub tx_hash: B256,
+    /// Index of the transaction within the block.
+    pub tx_index: usize,
+    /// Sender address (recovered from signature).
+    pub from_address: Address,
+    /// Recipient address.
+    pub to_address: Address,
+    /// ETH value in wei.
+    pub value: U256,
+}
+
+/// Handler for a single native transfer table, driven by TOML config.
+#[derive(Debug)]
+pub struct TransferHandler {
+    resolved: ResolvedTransfer,
+}
+
+impl TransferHandler {
+    /// Create a new transfer handler from a resolved transfer definition.
+    #[must_use]
+    pub const fn new(resolved: ResolvedTransfer) -> Self {
+        Self { resolved }
+    }
+
+    /// Check if a native transfer matches this handler's address filters.
+    ///
+    /// Empty filter lists match all addresses.
+    #[must_use]
+    pub fn matches_filter(&self, transfer: &NativeTransfer) -> bool {
+        let from_ok = self.resolved.filter_from.is_empty()
+            || self.resolved.filter_from.contains(&transfer.from_address);
+        let to_ok = self.resolved.filter_to.is_empty()
+            || self.resolved.filter_to.contains(&transfer.to_address);
+        from_ok && to_ok
+    }
+
+    /// Store a native transfer into the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the INSERT query fails.
+    pub async fn handle(
+        &self,
+        transfer: &NativeTransfer,
+        context: &EventContext,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        debug!(
+            handler = %self.resolved.name,
+            block = transfer.block_number.as_u64(),
+            table = %self.resolved.table_name,
+            "inserting native transfer"
+        );
+
+        let mut query = sqlx::query(&self.resolved.insert_sql);
+
+        // Bind fixed columns: $1-$6
+        query = query
+            .bind(transfer.block_number.as_u64() as i64)
+            .bind(transfer.tx_hash.as_slice())
+            .bind(transfer.tx_index as i32)
+            .bind(Address::to_checksum(&transfer.from_address, None))
+            .bind(Address::to_checksum(&transfer.to_address, None))
+            .bind(transfer.value.to_string());
+
+        // Bind context columns ($7+)
+        for cf in &self.resolved.context_fields {
+            query = bind_context_field(query, *cf, context);
+        }
+
+        query
+            .execute(&mut **tx)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to insert native transfer into '{}'",
+                    self.resolved.table_name
+                )
+            })?;
+
+        Ok(())
+    }
+
+    /// Roll back this handler's data above `block_number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DELETE query fails.
+    pub async fn rollback(
+        &self,
+        block_number: BlockNumber,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        sqlx::query(&self.resolved.rollback_sql)
+            .bind(block_number.as_u64() as i64)
+            .execute(&mut **tx)
+            .await
+            .wrap_err_with(|| format!("failed to rollback '{}'", self.resolved.table_name))?;
+        Ok(())
+    }
+}
+
+/// Registry of native transfer handlers.
+#[derive(Debug)]
+pub struct TransferRegistry {
+    handlers: Vec<TransferHandler>,
+}
+
+impl TransferRegistry {
+    /// Create a new registry with the given handlers.
+    #[must_use]
+    pub const fn new(handlers: Vec<TransferHandler>) -> Self {
+        Self { handlers }
+    }
+
+    /// Dispatch a native transfer to all matching handlers.
+    ///
+    /// Returns the number of handlers that processed the transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any matching handler fails.
+    pub async fn dispatch(
+        &self,
+        transfer: &NativeTransfer,
+        context: &EventContext,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<u64> {
+        let mut count = 0u64;
+        for handler in &self.handlers {
+            if handler.matches_filter(transfer) {
+                handler.handle(transfer, context, tx).await?;
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Roll back all handlers' data above `block_number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any handler's rollback fails.
+    pub async fn rollback_all(
+        &self,
+        block_number: BlockNumber,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        for handler in &self.handlers {
+            handler.rollback(block_number, tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the registry has no handlers.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
     }
 }
 
@@ -721,5 +889,101 @@ mod tests {
             .wrap_err("cleanup failed")?;
 
         Ok(())
+    }
+
+    // ── Transfer handler tests ───────────────────────────────────────
+
+    fn make_test_transfer() -> NativeTransfer {
+        NativeTransfer {
+            block_number: BlockNumber::new(21_000_042),
+            tx_hash: B256::repeat_byte(0xAA),
+            tx_index: 3,
+            from_address: address!("28C6c06298d514Db089934071355E5743bf21d60"),
+            to_address: address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
+            value: U256::from(1_000_000_000_000_000_000u64),
+        }
+    }
+
+    fn make_transfer_handler(
+        filter_from: Vec<Address>,
+        filter_to: Vec<Address>,
+    ) -> TransferHandler {
+        use crate::toml_config::ResolvedTransfer;
+
+        TransferHandler::new(ResolvedTransfer {
+            name: "eth_transfers".to_string(),
+            table_name: "eth_transfers".to_string(),
+            context_fields: vec![],
+            create_table_sql: String::new(),
+            create_indexes_sql: vec![],
+            insert_sql: String::new(),
+            rollback_sql: String::new(),
+            filter_from,
+            filter_to,
+        })
+    }
+
+    #[test]
+    fn matches_filter_empty_matches_all() {
+        let handler = make_transfer_handler(vec![], vec![]);
+        let transfer = make_test_transfer();
+        assert!(handler.matches_filter(&transfer));
+    }
+
+    #[test]
+    fn matches_filter_from_only() {
+        let transfer = make_test_transfer();
+
+        // Matching from
+        let handler = make_transfer_handler(
+            vec![address!("28C6c06298d514Db089934071355E5743bf21d60")],
+            vec![],
+        );
+        assert!(handler.matches_filter(&transfer));
+
+        // Non-matching from
+        let handler = make_transfer_handler(
+            vec![address!("1111111111111111111111111111111111111111")],
+            vec![],
+        );
+        assert!(!handler.matches_filter(&transfer));
+    }
+
+    #[test]
+    fn matches_filter_to_only() {
+        let transfer = make_test_transfer();
+
+        // Matching to
+        let handler = make_transfer_handler(
+            vec![],
+            vec![address!("dAC17F958D2ee523a2206206994597C13D831ec7")],
+        );
+        assert!(handler.matches_filter(&transfer));
+
+        // Non-matching to
+        let handler = make_transfer_handler(
+            vec![],
+            vec![address!("2222222222222222222222222222222222222222")],
+        );
+        assert!(!handler.matches_filter(&transfer));
+    }
+
+    #[test]
+    fn matches_filter_from_and_to() {
+        let transfer = make_test_transfer();
+
+        // Both match
+        let handler = make_transfer_handler(
+            vec![address!("28C6c06298d514Db089934071355E5743bf21d60")],
+            vec![address!("dAC17F958D2ee523a2206206994597C13D831ec7")],
+        );
+        assert!(handler.matches_filter(&transfer));
+
+        // From matches, to doesn't
+        let handler = make_transfer_handler(
+            vec![address!("28C6c06298d514Db089934071355E5743bf21d60")],
+            vec![address!("2222222222222222222222222222222222222222")],
+        );
+        assert!(!handler.matches_filter(&transfer));
     }
 }

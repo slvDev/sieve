@@ -5,7 +5,7 @@
 
 use crate::config::IndexConfig;
 use crate::db::{self, Database};
-use crate::handler::{EventContext, HandlerRegistry};
+use crate::handler::{EventContext, HandlerRegistry, NativeTransfer, TransferRegistry};
 use crate::metrics::SieveMetrics;
 use crate::p2p::{NetworkPeer, PeerPool};
 use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
@@ -21,6 +21,7 @@ use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256, TxKind};
 use eyre::WrapErr;
+use sqlx::Postgres;
 use prometheus_client::metrics::gauge::Gauge;
 use reth_network_api::PeerId;
 use reth_primitives_traits::SealedHeader;
@@ -69,6 +70,7 @@ pub struct SyncOutcome {
     pub events_matched: u64,
     pub events_decoded: u64,
     pub events_stored: u64,
+    pub transfers_stored: u64,
     pub elapsed: Duration,
 }
 
@@ -80,6 +82,7 @@ struct ConsumerStats {
     events_matched: u64,
     events_decoded: u64,
     events_stored: u64,
+    transfers_stored: u64,
 }
 
 /// Outcome of processing events from a single block.
@@ -88,13 +91,14 @@ struct ProcessOutcome {
     matched: u64,
     decoded: u64,
     stored: u64,
+    transfers: u64,
 }
 
 // Compile-time size assertions for hot types (reth pattern).
 #[cfg(target_pointer_width = "64")]
-const _: [(); 56] = [(); core::mem::size_of::<SyncOutcome>()];
+const _: [(); 64] = [(); core::mem::size_of::<SyncOutcome>()];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 24] = [(); core::mem::size_of::<ProcessOutcome>()];
+const _: [(); 32] = [(); core::mem::size_of::<ProcessOutcome>()];
 
 /// Run sync for a block range, fetching from the peer pool.
 ///
@@ -148,6 +152,7 @@ pub async fn run_sync(
         Arc::clone(&ctx.handlers),
         Arc::clone(&ctx.metrics),
         Arc::clone(&ctx.factories),
+        Arc::clone(&ctx.transfer_handlers),
     ));
 
     // Main fetch loop
@@ -181,6 +186,7 @@ pub async fn run_sync(
         events_matched: stats.events_matched,
         events_decoded: stats.events_decoded,
         events_stored: stats.events_stored,
+        transfers_stored: stats.transfers_stored,
         elapsed,
     })
 }
@@ -603,6 +609,7 @@ async fn consume_payloads(
     handlers: Arc<HandlerRegistry>,
     metrics: Arc<SieveMetrics>,
     factories: Arc<Vec<ResolvedFactory>>,
+    transfer_handlers: Arc<TransferRegistry>,
 ) -> ConsumerStats {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
@@ -613,6 +620,7 @@ async fn consume_payloads(
         db: &db,
         handlers: &handlers,
         factories: &factories,
+        transfer_handlers: &transfer_handlers,
     };
 
     while let Some(payload) = payload_rx.recv().await {
@@ -626,11 +634,13 @@ async fn consume_payloads(
                 stats.events_matched = stats.events_matched.saturating_add(outcome.matched);
                 stats.events_decoded = stats.events_decoded.saturating_add(outcome.decoded);
                 stats.events_stored = stats.events_stored.saturating_add(outcome.stored);
+                stats.transfers_stored = stats.transfers_stored.saturating_add(outcome.transfers);
 
                 // Update Prometheus counters
                 metrics.blocks_indexed.inc();
                 metrics.events_matched.inc_by(outcome.matched);
                 metrics.events_stored.inc_by(outcome.stored);
+                metrics.transfers_stored.inc_by(outcome.transfers);
 
                 // Only advance the gauge forward (payloads arrive out of order)
                 let block_num = payload.header().number;
@@ -655,6 +665,7 @@ async fn consume_payloads(
                 events_matched = stats.events_matched,
                 events_decoded = stats.events_decoded,
                 events_stored = stats.events_stored,
+                transfers_stored = stats.transfers_stored,
                 block_number = payload.header().number,
                 "sync progress"
             );
@@ -671,6 +682,7 @@ struct ProcessContext<'a> {
     db: &'a Database,
     handlers: &'a HandlerRegistry,
     factories: &'a [ResolvedFactory],
+    transfer_handlers: &'a TransferRegistry,
 }
 
 /// Compute the sealed hash for a block header.
@@ -713,19 +725,20 @@ async fn process_block_events(
     // Step 1: filter
     let matched = filter::filter_block(payload, ctx.config);
     let matched_count = matched.len() as u64;
+    let has_transfers = !ctx.transfer_handlers.is_empty();
 
-    if matched.is_empty() {
+    if matched.is_empty() && !has_transfers {
         commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
-        return Ok(ProcessOutcome { matched: 0, decoded: 0, stored: 0 });
+        return Ok(ProcessOutcome { matched: 0, decoded: 0, stored: 0, transfers: 0 });
     }
 
     // Step 2: decode (CPU work, no DB)
     let decoded_events = decode_matched_logs(&matched, ctx.config);
     let decoded_count = decoded_events.len() as u64;
 
-    if decoded_events.is_empty() {
+    if decoded_events.is_empty() && !has_transfers {
         commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
-        return Ok(ProcessOutcome { matched: matched_count, decoded: 0, stored: 0 });
+        return Ok(ProcessOutcome { matched: matched_count, decoded: 0, stored: 0, transfers: 0 });
     }
 
     // Step 3: store in one transaction per block
@@ -747,6 +760,20 @@ async fn process_block_events(
         stored_count = stored_count.saturating_add(dispatched);
     }
 
+    // Step 4: scan native transfers
+    let transfer_count = if has_transfers {
+        scan_and_store_transfers(
+            payload,
+            block_hash,
+            &mut sender_cache,
+            ctx.transfer_handlers,
+            &mut tx,
+        )
+        .await?
+    } else {
+        0u64
+    };
+
     db::update_checkpoint(&mut tx, block_number).await?;
 
     tx.commit()
@@ -757,6 +784,7 @@ async fn process_block_events(
         matched: matched_count,
         decoded: decoded_count,
         stored: stored_count,
+        transfers: transfer_count,
     })
 }
 
@@ -853,6 +881,76 @@ async fn register_factory_child(
     }
 
     Ok(())
+}
+
+/// Scan block transactions for native ETH transfers and store them.
+///
+/// Iterates all transactions in the block body, skipping zero-value,
+/// contract-creation, and reverted transactions. Uses the shared sender cache.
+///
+/// Returns the number of transfers stored.
+async fn scan_and_store_transfers(
+    payload: &BlockPayload,
+    block_hash: B256,
+    sender_cache: &mut HashMap<usize, Address>,
+    transfer_handlers: &TransferRegistry,
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+) -> eyre::Result<u64> {
+    let block_number = BlockNumber::new(payload.header().number);
+    let receipts = payload.receipts();
+    let mut count = 0u64;
+
+    for (tx_index, tx_signed) in payload.body().transactions.iter().enumerate() {
+        // Skip zero-value transactions (no ETH transfer)
+        if tx_signed.value().is_zero() {
+            continue;
+        }
+
+        // Skip reverted transactions (value not actually transferred)
+        if !receipts.get(tx_index).is_some_and(|r| r.success) {
+            continue;
+        }
+
+        // Skip contract creations (no recipient)
+        let to_address = match tx_signed.kind() {
+            TxKind::Call(addr) => addr,
+            TxKind::Create => continue,
+        };
+
+        // Recover sender (use cache)
+        let from_address = if let Some(&cached) = sender_cache.get(&tx_index) {
+            cached
+        } else {
+            let sender = tx_signed
+                .recover_signer_unchecked()
+                .wrap_err("failed to recover tx sender for transfer")?;
+            sender_cache.insert(tx_index, sender);
+            sender
+        };
+
+        let transfer = NativeTransfer {
+            block_number,
+            tx_hash: *tx_signed.tx_hash(),
+            tx_index,
+            from_address,
+            to_address,
+            value: tx_signed.value(),
+        };
+
+        let context = EventContext {
+            block_timestamp: payload.header().timestamp,
+            block_hash,
+            tx_from: from_address,
+            tx_to: Some(to_address),
+            tx_value: tx_signed.value(),
+            tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
+        };
+
+        let dispatched = transfer_handlers.dispatch(&transfer, &context, tx).await?;
+        count = count.saturating_add(dispatched);
+    }
+
+    Ok(count)
 }
 
 /// Decode matched logs into events, logging any decode failures.

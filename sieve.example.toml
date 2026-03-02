@@ -23,3 +23,16 @@ columns = [
 name = "Approval"
 table = "usdc_approvals"
 # columns omitted → auto-generated from ABI params with default type mapping
+
+# ── Native ETH transfer indexing ─────────────────────────────────────
+
+[[transfers]]
+name = "eth_transfers"
+table = "eth_transfers"
+start_block = 21_000_000
+context = ["block_timestamp", "tx_gas_price"]
+
+# Optional address filters (omit for all transfers)
+[transfers.filter]
+from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
+# to = ["0x..."]  # uncomment to filter by recipient

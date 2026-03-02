@@ -5,7 +5,7 @@
 //! GraphQL `TypeRef` values.
 
 use async_graphql::dynamic::TypeRef;
-use crate::toml_config::{ContextField, ResolvedEvent};
+use crate::toml_config::{ContextField, ResolvedEvent, ResolvedTransfer};
 use serde_json::Value as JsonValue;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -58,6 +58,33 @@ pub fn build_columns_meta(event: &ResolvedEvent) -> Vec<ColumnMeta> {
             name: col.column_name.clone(),
             pg_type: col.pg_type.clone(),
             nullable: false,
+        });
+    }
+
+    cols
+}
+
+/// Build column metadata from a resolved native transfer definition.
+///
+/// Fixed columns: id, block_number, tx_hash, tx_index, from_address, to_address, value.
+/// Plus context columns.
+#[must_use]
+pub fn build_transfer_columns_meta(transfer: &ResolvedTransfer) -> Vec<ColumnMeta> {
+    let mut cols = vec![
+        ColumnMeta { name: "id".to_string(), pg_type: "bigserial".to_string(), nullable: false },
+        ColumnMeta { name: "block_number".to_string(), pg_type: "bigint".to_string(), nullable: false },
+        ColumnMeta { name: "tx_hash".to_string(), pg_type: "bytea".to_string(), nullable: false },
+        ColumnMeta { name: "tx_index".to_string(), pg_type: "integer".to_string(), nullable: false },
+        ColumnMeta { name: "from_address".to_string(), pg_type: "text".to_string(), nullable: false },
+        ColumnMeta { name: "to_address".to_string(), pg_type: "text".to_string(), nullable: false },
+        ColumnMeta { name: "value".to_string(), pg_type: "numeric".to_string(), nullable: false },
+    ];
+
+    for cf in &transfer.context_fields {
+        cols.push(ColumnMeta {
+            name: cf.pg_column_name().to_string(),
+            pg_type: context_field_base_type(*cf).to_string(),
+            nullable: *cf == ContextField::TxTo,
         });
     }
 
@@ -379,5 +406,47 @@ mod tests {
         assert!(ca.is_some());
         assert_eq!(ca.map(|c| c.pg_type.as_str()), Some("text"));
         assert!(!ca.is_none_or(|c| c.nullable));
+    }
+
+    fn test_transfer() -> ResolvedTransfer {
+        ResolvedTransfer {
+            name: "eth_transfers".to_string(),
+            table_name: "eth_transfers".to_string(),
+            context_fields: vec![],
+            create_table_sql: String::new(),
+            create_indexes_sql: vec![],
+            insert_sql: String::new(),
+            rollback_sql: String::new(),
+            filter_from: vec![],
+            filter_to: vec![],
+        }
+    }
+
+    #[test]
+    fn transfer_columns_meta_includes_correct_columns() {
+        let transfer = test_transfer();
+        let meta = build_transfer_columns_meta(&transfer);
+        let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "block_number", "tx_hash", "tx_index",
+                 "from_address", "to_address", "value"]
+        );
+        // No log_index for transfers
+        assert!(meta.iter().all(|c| c.name != "log_index"));
+    }
+
+    #[test]
+    fn transfer_columns_meta_with_context() {
+        let mut transfer = test_transfer();
+        transfer.context_fields = vec![ContextField::BlockTimestamp, ContextField::TxGasPrice];
+        let meta = build_transfer_columns_meta(&transfer);
+        let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "block_number", "tx_hash", "tx_index",
+                 "from_address", "to_address", "value",
+                 "block_timestamp", "tx_gas_price"]
+        );
     }
 }

@@ -11,10 +11,10 @@ use crate::api::query_builder::{
     validate_order_column, Cursor, SelectParams, WhereClause, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use crate::api::types::{
-    build_columns_meta, build_select_clause, operators_for_type, pg_to_graphql_type, row_to_json,
-    to_pascal_case, ColumnMeta,
+    build_columns_meta, build_select_clause, build_transfer_columns_meta, operators_for_type,
+    pg_to_graphql_type, row_to_json, to_pascal_case, ColumnMeta,
 };
-use crate::toml_config::ResolvedEvent;
+use crate::toml_config::{ResolvedEvent, ResolvedTransfer};
 
 use async_graphql::dynamic::{
     Enum, EnumItem, Field, FieldFuture, FieldValue, InputObject, InputValue, Object, Schema,
@@ -37,7 +37,11 @@ struct TableMeta {
 /// # Errors
 ///
 /// Returns an error if schema construction fails.
-pub fn build_schema(events: &[ResolvedEvent], pool: PgPool) -> eyre::Result<Schema> {
+pub fn build_schema(
+    events: &[ResolvedEvent],
+    transfers: &[ResolvedTransfer],
+    pool: PgPool,
+) -> eyre::Result<Schema> {
     let mut builder: SchemaBuilder = Schema::build("Query", None, None);
 
     // Register shared enums
@@ -87,6 +91,37 @@ pub fn build_schema(events: &[ResolvedEvent], pool: PgPool) -> eyre::Result<Sche
         // Add query field
         query = query.field(build_query_field(
             &event.table_name,
+            &connection_type_name,
+            &filter_type_name,
+            &order_by_type_name,
+            pool.clone(),
+            Arc::clone(&meta),
+        ));
+    }
+
+    // Per-transfer table (same pattern as events, different column metadata)
+    for transfer in transfers {
+        let type_name = to_pascal_case(&transfer.table_name);
+        let filter_type_name = format!("{type_name}Filter");
+        let order_by_type_name = format!("{type_name}OrderBy");
+        let connection_type_name = format!("{type_name}Connection");
+
+        let columns_meta = build_transfer_columns_meta(transfer);
+        let select_clause = build_select_clause(&columns_meta);
+
+        let meta = Arc::new(TableMeta {
+            table_name: transfer.table_name.clone(),
+            select_clause,
+            columns: columns_meta.clone(),
+        });
+
+        builder = builder.register(build_output_object(&type_name, &columns_meta));
+        builder = builder.register(build_filter_input(&filter_type_name, &columns_meta));
+        builder = builder.register(build_order_by_enum(&order_by_type_name, &columns_meta));
+        builder = builder.register(build_connection_type(&connection_type_name, &type_name));
+
+        query = query.field(build_query_field(
+            &transfer.table_name,
             &connection_type_name,
             &filter_type_name,
             &order_by_type_name,

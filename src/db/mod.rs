@@ -9,7 +9,7 @@
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
 use crate::config::IndexConfig;
-use crate::toml_config::ResolvedEvent;
+use crate::toml_config::{ResolvedEvent, ResolvedTransfer};
 use crate::types::BlockNumber;
 use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
@@ -337,6 +337,41 @@ pub async fn create_user_tables(db: &Database, events: &[ResolvedEvent]) -> eyre
         }
 
         info!(table = %event.table_name, "created user table");
+    }
+    Ok(())
+}
+
+/// Create native transfer tables from resolved TOML config.
+///
+/// Runs `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`
+/// for each resolved transfer. Safe to run repeatedly (idempotent DDL).
+///
+/// # Errors
+///
+/// Returns an error if any DDL statement fails.
+pub async fn create_transfer_tables(
+    db: &Database,
+    transfers: &[ResolvedTransfer],
+) -> eyre::Result<()> {
+    for transfer in transfers {
+        sqlx::raw_sql(&transfer.create_table_sql)
+            .execute(db.pool())
+            .await
+            .wrap_err_with(|| format!("failed to create table '{}'", transfer.table_name))?;
+
+        for index_sql in &transfer.create_indexes_sql {
+            sqlx::raw_sql(index_sql)
+                .execute(db.pool())
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create index for table '{}'",
+                        transfer.table_name
+                    )
+                })?;
+        }
+
+        info!(table = %transfer.table_name, "created transfer table");
     }
     Ok(())
 }

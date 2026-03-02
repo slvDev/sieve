@@ -21,6 +21,9 @@ pub struct SieveConfig {
     pub database: Option<DatabaseConfig>,
     /// Contracts to index.
     pub contracts: Vec<TomlContract>,
+    /// Native ETH transfer definitions.
+    #[serde(default)]
+    pub transfers: Vec<TomlTransfer>,
 }
 
 /// Database section.
@@ -85,6 +88,30 @@ pub struct TomlColumn {
     /// Postgres type (defaults to auto-mapping from Solidity type).
     #[serde(rename = "type")]
     pub pg_type: Option<String>,
+}
+
+/// A native ETH transfer definition from TOML.
+#[derive(Debug, Deserialize)]
+pub struct TomlTransfer {
+    /// Human-readable name (e.g. "eth_transfers").
+    pub name: String,
+    /// Postgres table name.
+    pub table: String,
+    /// Block number to start indexing from.
+    pub start_block: Option<u64>,
+    /// Optional context fields to enrich transfers with block/tx data.
+    pub context: Option<Vec<String>>,
+    /// Optional address filters for from/to.
+    pub filter: Option<TomlTransferFilter>,
+}
+
+/// Address filter for native ETH transfers.
+#[derive(Debug, Deserialize)]
+pub struct TomlTransferFilter {
+    /// Only include transfers from these addresses.
+    pub from: Option<Vec<String>>,
+    /// Only include transfers to these addresses.
+    pub to: Option<Vec<String>>,
 }
 
 // ── Context fields ────────────────────────────────────────────────────
@@ -176,6 +203,8 @@ pub struct ResolvedConfig {
     pub resolved_events: Vec<ResolvedEvent>,
     /// Factory definitions for dynamic contract discovery.
     pub factories: Vec<ResolvedFactory>,
+    /// Native ETH transfer definitions.
+    pub transfers: Vec<ResolvedTransfer>,
 }
 
 /// A resolved factory contract definition.
@@ -193,6 +222,29 @@ pub struct ResolvedFactory {
     pub child_contract_name: String,
     /// Block number to start scanning for factory events.
     pub start_block: u64,
+}
+
+/// A fully resolved native ETH transfer definition.
+#[derive(Debug, Clone)]
+pub struct ResolvedTransfer {
+    /// Human-readable name.
+    pub name: String,
+    /// Postgres table name.
+    pub table_name: String,
+    /// Context fields to enrich transfers with block/tx data.
+    pub context_fields: Vec<ContextField>,
+    /// Pre-built CREATE TABLE SQL.
+    pub create_table_sql: String,
+    /// Pre-built CREATE INDEX SQL statements.
+    pub create_indexes_sql: Vec<String>,
+    /// Pre-built INSERT SQL.
+    pub insert_sql: String,
+    /// Pre-built DELETE (rollback) SQL.
+    pub rollback_sql: String,
+    /// Filter: only include transfers from these addresses.
+    pub filter_from: Vec<Address>,
+    /// Filter: only include transfers to these addresses.
+    pub filter_to: Vec<Address>,
 }
 
 /// A fully resolved event with pre-built SQL statements.
@@ -421,6 +473,149 @@ fn generate_rollback_sql(table: &str) -> String {
     format!("DELETE FROM {table} WHERE block_number > $1")
 }
 
+// ── Transfer SQL generators ───────────────────────────────────────────
+
+/// Generate `CREATE TABLE IF NOT EXISTS` SQL for a native transfer table.
+///
+/// Fixed columns: `id`, `block_number`, `tx_hash`, `tx_index`, `from_address`,
+/// `to_address`, `value`. Context columns inserted between `value` and the
+/// UNIQUE constraint. No `log_index` column (one transfer per transaction).
+#[must_use]
+fn generate_transfer_create_table_sql(
+    table: &str,
+    context_fields: &[ContextField],
+) -> String {
+    use std::fmt::Write;
+
+    let mut sql = format!(
+        "CREATE TABLE IF NOT EXISTS {table} (\n  \
+         id BIGSERIAL PRIMARY KEY,\n  \
+         block_number BIGINT NOT NULL,\n  \
+         tx_hash BYTEA NOT NULL,\n  \
+         tx_index INTEGER NOT NULL,\n  \
+         from_address TEXT NOT NULL,\n  \
+         to_address TEXT NOT NULL,\n  \
+         value NUMERIC NOT NULL"
+    );
+
+    for cf in context_fields {
+        let _ = write!(sql, ",\n  {} {}", cf.pg_column_name(), cf.pg_type());
+    }
+
+    sql.push_str(",\n  UNIQUE (block_number, tx_index)\n)");
+    sql
+}
+
+/// Generate INSERT SQL for a native transfer table.
+///
+/// Fixed params: `$1=block_number, $2=tx_hash, $3=tx_index, $4=from_address,
+/// $5=to_address, $6=value::numeric`. Context columns follow.
+#[must_use]
+fn generate_transfer_insert_sql(
+    table: &str,
+    context_fields: &[ContextField],
+) -> String {
+    use std::fmt::Write;
+
+    let mut col_names =
+        String::from("block_number, tx_hash, tx_index, from_address, to_address, value");
+    let mut params = String::from("$1, $2, $3, $4, $5, $6::numeric");
+    let mut param_idx = 7;
+
+    for cf in context_fields {
+        col_names.push_str(", ");
+        col_names.push_str(cf.pg_column_name());
+        params.push_str(", ");
+        if matches!(cf, ContextField::TxValue) {
+            let _ = write!(params, "${param_idx}::numeric");
+        } else {
+            let _ = write!(params, "${param_idx}");
+        }
+        param_idx += 1;
+    }
+
+    format!(
+        "INSERT INTO {table} ({col_names}) VALUES ({params}) \
+         ON CONFLICT (block_number, tx_index) DO NOTHING"
+    )
+}
+
+/// Resolve a single `TomlTransfer` into a `ResolvedTransfer`.
+///
+/// Validates the table name, checks for collisions with event tables,
+/// parses context fields and filter addresses.
+///
+/// # Errors
+///
+/// Returns an error if the table name is invalid/duplicate, context fields
+/// are invalid, or filter addresses fail to parse.
+fn resolve_transfer(
+    t: &TomlTransfer,
+    table_names: &mut HashSet<String>,
+) -> eyre::Result<ResolvedTransfer> {
+    validate_identifier(&t.table, "table")?;
+    if !table_names.insert(t.table.clone()) {
+        return Err(eyre::eyre!(
+            "duplicate table name '{}' (collision between events and transfers)",
+            t.table
+        ));
+    }
+
+    let context_fields =
+        resolve_context_fields(t.context.as_deref(), &t.name, "transfer")?;
+
+    let filter_from = parse_address_list(
+        t.filter.as_ref().and_then(|f| f.from.as_deref()),
+        &t.name,
+        "from",
+    )?;
+    let filter_to = parse_address_list(
+        t.filter.as_ref().and_then(|f| f.to.as_deref()),
+        &t.name,
+        "to",
+    )?;
+
+    let create_table_sql = generate_transfer_create_table_sql(&t.table, &context_fields);
+    let create_indexes_sql = generate_indexes_sql(&t.table);
+    let insert_sql = generate_transfer_insert_sql(&t.table, &context_fields);
+    let rollback_sql = generate_rollback_sql(&t.table);
+
+    Ok(ResolvedTransfer {
+        name: t.name.clone(),
+        table_name: t.table.clone(),
+        context_fields,
+        create_table_sql,
+        create_indexes_sql,
+        insert_sql,
+        rollback_sql,
+        filter_from,
+        filter_to,
+    })
+}
+
+/// Parse a list of hex address strings into `Vec<Address>`.
+///
+/// # Errors
+///
+/// Returns an error if any address string is invalid.
+fn parse_address_list(
+    addrs: Option<&[String]>,
+    transfer_name: &str,
+    field: &str,
+) -> eyre::Result<Vec<Address>> {
+    let Some(addrs) = addrs else {
+        return Ok(Vec::new());
+    };
+    addrs
+        .iter()
+        .map(|a| {
+            a.parse::<Address>().wrap_err_with(|| {
+                format!("invalid {field} address '{a}' in transfer '{transfer_name}'")
+            })
+        })
+        .collect()
+}
+
 // ── Config loading and resolution ─────────────────────────────────────
 
 /// Load and parse a `sieve.toml` config file.
@@ -533,12 +728,19 @@ pub fn resolve_config(
         contract_configs.push(contract_config);
     }
 
+    // Resolve native ETH transfers (table_names set is shared with events)
+    let mut resolved_transfers = Vec::with_capacity(config.transfers.len());
+    for t in &config.transfers {
+        resolved_transfers.push(resolve_transfer(t, &mut table_names)?);
+    }
+
     let index_config = IndexConfig::new(contract_configs);
 
     info!(
         contracts = config.contracts.len(),
         events = resolved_events.len(),
         factories = resolved_factories.len(),
+        transfers = resolved_transfers.len(),
         "resolved TOML config"
     );
 
@@ -546,6 +748,7 @@ pub fn resolve_config(
         index_config,
         resolved_events,
         factories: resolved_factories,
+        transfers: resolved_transfers,
     })
 }
 
@@ -1389,5 +1592,94 @@ table = "uniswap_swaps"
         // contract_address is $5, user column starts at $6
         assert!(sql.contains("$5"));
         assert!(sql.contains("$6"));
+    }
+
+    // ── Transfer tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_toml_with_transfers() -> eyre::Result<()> {
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[[transfers]]
+name = "eth_transfers"
+table = "eth_transfers"
+start_block = 21000000
+context = ["block_timestamp", "tx_gas_price"]
+
+[transfers.filter]
+from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
+to = ["0xdAC17F958D2ee523a2206206994597C13D831ec7"]
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        assert_eq!(config.transfers.len(), 1);
+        let t = &config.transfers[0];
+        assert_eq!(t.name, "eth_transfers");
+        assert_eq!(t.table, "eth_transfers");
+        assert_eq!(t.start_block, Some(21_000_000));
+        assert_eq!(t.context.as_ref().map(Vec::len), Some(2));
+        let f = t.filter.as_ref().ok_or_else(|| eyre::eyre!("no filter"))?;
+        assert_eq!(f.from.as_ref().map(Vec::len), Some(1));
+        assert_eq!(f.to.as_ref().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_toml_without_transfers_is_empty() -> eyre::Result<()> {
+        let config: SieveConfig = toml::from_str(MINIMAL_TOML)?;
+        assert!(config.transfers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn transfer_create_table_sql() {
+        let sql = generate_transfer_create_table_sql("eth_transfers", &[]);
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS eth_transfers"));
+        assert!(sql.contains("id BIGSERIAL PRIMARY KEY"));
+        assert!(sql.contains("block_number BIGINT NOT NULL"));
+        assert!(sql.contains("tx_hash BYTEA NOT NULL"));
+        assert!(sql.contains("tx_index INTEGER NOT NULL"));
+        assert!(sql.contains("from_address TEXT NOT NULL"));
+        assert!(sql.contains("to_address TEXT NOT NULL"));
+        assert!(sql.contains("value NUMERIC NOT NULL"));
+        assert!(sql.contains("UNIQUE (block_number, tx_index)"));
+        // No log_index for transfer tables
+        assert!(!sql.contains("log_index"));
+    }
+
+    #[test]
+    fn transfer_insert_sql_with_context() {
+        let ctx = vec![ContextField::BlockTimestamp, ContextField::TxGasPrice];
+        let sql = generate_transfer_insert_sql("eth_transfers", &ctx);
+        assert!(sql.contains("from_address, to_address, value, block_timestamp, tx_gas_price"));
+        assert!(sql.contains("$6::numeric, $7, $8"));
+        assert!(sql.contains("ON CONFLICT (block_number, tx_index) DO NOTHING"));
+    }
+
+    #[test]
+    fn transfer_table_name_collision_with_events() -> eyre::Result<()> {
+        let mut table_names = HashSet::new();
+        table_names.insert("usdc_transfers".to_string());
+
+        let t = TomlTransfer {
+            name: "eth".to_string(),
+            table: "usdc_transfers".to_string(),
+            start_block: None,
+            context: None,
+            filter: None,
+        };
+        let Err(err) = resolve_transfer(&t, &mut table_names) else {
+            return Err(eyre::eyre!("expected error for duplicate table name"));
+        };
+        assert!(err.to_string().contains("duplicate table name"));
+        Ok(())
     }
 }

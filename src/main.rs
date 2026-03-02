@@ -61,6 +61,7 @@ async fn main() -> eyre::Result<()> {
     // Database — connect early so checkpoint check is fast (before P2P)
     let db = Arc::new(db::Database::connect(&startup.database_url).await?);
     db::create_user_tables(&db, &startup.resolved_events).await?;
+    db::create_transfer_tables(&db, &startup.resolved_transfers).await?;
 
     let index_config = Arc::new(startup.index_config);
     info!(contracts = index_config.contracts.len(), "loaded index config");
@@ -85,10 +86,13 @@ async fn main() -> eyre::Result<()> {
     // Metrics
     let metrics = Arc::new(metrics::SieveMetrics::new());
 
-    // GraphQL API server (optional)
+    // GraphQL API server (optional — must be built before transfers are consumed)
     if let Some(api_port) = cli.api_port {
-        let schema =
-            api::build_schema(&startup.resolved_events, db.pool().clone())?;
+        let schema = api::build_schema(
+            &startup.resolved_events,
+            &startup.resolved_transfers,
+            db.pool().clone(),
+        )?;
         let api_stop = stop_rx.clone();
         let api_metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
@@ -97,6 +101,14 @@ async fn main() -> eyre::Result<()> {
             }
         });
     }
+
+    // Build transfer handlers from resolved transfers
+    let transfer_handlers: Vec<handler::TransferHandler> = startup
+        .resolved_transfers
+        .into_iter()
+        .map(handler::TransferHandler::new)
+        .collect();
+    let transfer_handlers = Arc::new(handler::TransferRegistry::new(transfer_handlers));
 
     // P2P
     let session = p2p::connect_mainnet_peers().await?;
@@ -110,6 +122,7 @@ async fn main() -> eyre::Result<()> {
         metrics,
         stop_rx,
         factories,
+        transfer_handlers,
     };
 
     run_indexer(&cli, startup.start_block, ctx).await
@@ -122,6 +135,7 @@ struct StartupConfig {
     index_config: config::IndexConfig,
     resolved_events: Vec<toml_config::ResolvedEvent>,
     factories: Vec<toml_config::ResolvedFactory>,
+    resolved_transfers: Vec<toml_config::ResolvedTransfer>,
     start_block: BlockNumber,
 }
 
@@ -153,7 +167,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 
     let resolved = toml_config::resolve_config(&sieve_config, config_dir)?;
 
-    // Compute effective start_block: CLI override or minimum across contracts and factories
+    // Compute effective start_block: CLI override or minimum across contracts, factories, and transfers
     let start_block = BlockNumber::new(cli.start_block.unwrap_or_else(|| {
         let contract_min = sieve_config
             .contracts
@@ -167,7 +181,13 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
             .map(|f| f.start_block)
             .min()
             .unwrap_or(u64::MAX);
-        contract_min.min(factory_min)
+        let transfer_min = sieve_config
+            .transfers
+            .iter()
+            .filter_map(|t| t.start_block)
+            .min()
+            .unwrap_or(u64::MAX);
+        contract_min.min(factory_min).min(transfer_min)
     }));
 
     Ok(StartupConfig {
@@ -175,6 +195,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         index_config: resolved.index_config,
         resolved_events: resolved.resolved_events,
         factories: resolved.factories,
+        resolved_transfers: resolved.transfers,
         start_block,
     })
 }
@@ -211,6 +232,7 @@ async fn run_indexer(
             events_matched = outcome.events_matched,
             events_decoded = outcome.events_decoded,
             events_stored = outcome.events_stored,
+            transfers_stored = outcome.transfers_stored,
             elapsed_ms = outcome.elapsed.as_millis() as u64,
             "sync complete"
         );
