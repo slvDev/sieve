@@ -23,6 +23,8 @@ pub struct SieveMetrics {
     pub events_stored: Counter,
     /// Total native ETH transfers stored to database.
     pub transfers_stored: Counter,
+    /// Total function calls stored to database.
+    pub calls_stored: Counter,
 
     // Gauges (point-in-time)
     /// Latest observed chain head block number.
@@ -50,6 +52,7 @@ impl SieveMetrics {
         let events_matched = Counter::default();
         let events_stored = Counter::default();
         let transfers_stored = Counter::default();
+        let calls_stored = Counter::default();
         let chain_head = Gauge::default();
         let indexed_block = Gauge::default();
         let connected_peers = Gauge::default();
@@ -75,6 +78,11 @@ impl SieveMetrics {
             "sieve_transfers_stored",
             "Total native ETH transfers stored to database",
             transfers_stored.clone(),
+        );
+        registry.register(
+            "sieve_calls_stored",
+            "Total function calls stored to database",
+            calls_stored.clone(),
         );
         registry.register(
             "sieve_chain_head",
@@ -108,6 +116,7 @@ impl SieveMetrics {
             events_matched,
             events_stored,
             transfers_stored,
+            calls_stored,
             chain_head,
             indexed_block,
             connected_peers,
@@ -158,6 +167,7 @@ mod tests {
         assert!(text.contains("sieve_active_fetches"));
         assert!(text.contains("sieve_pending_blocks"));
         assert!(text.contains("sieve_transfers_stored"));
+        assert!(text.contains("sieve_calls_stored"));
     }
 
     #[test]

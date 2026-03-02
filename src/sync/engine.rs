@@ -5,7 +5,11 @@
 
 use crate::config::IndexConfig;
 use crate::db::{self, Database};
-use crate::handler::{EventContext, HandlerRegistry, NativeTransfer, TransferRegistry};
+use crate::config::Selector;
+use crate::decode::DecodedParam;
+use crate::handler::{
+    CallRegistry, DecodedCall, EventContext, HandlerRegistry, NativeTransfer, TransferRegistry,
+};
 use crate::metrics::SieveMetrics;
 use crate::p2p::{NetworkPeer, PeerPool};
 use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
@@ -19,6 +23,7 @@ use crate::{decode, filter};
 
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::Transaction;
+use alloy_dyn_abi::JsonAbiExt;
 use alloy_primitives::{Address, B256, TxKind};
 use eyre::WrapErr;
 use sqlx::Postgres;
@@ -71,6 +76,7 @@ pub struct SyncOutcome {
     pub events_decoded: u64,
     pub events_stored: u64,
     pub transfers_stored: u64,
+    pub calls_stored: u64,
     pub elapsed: Duration,
 }
 
@@ -83,6 +89,7 @@ struct ConsumerStats {
     events_decoded: u64,
     events_stored: u64,
     transfers_stored: u64,
+    calls_stored: u64,
 }
 
 /// Outcome of processing events from a single block.
@@ -92,13 +99,14 @@ struct ProcessOutcome {
     decoded: u64,
     stored: u64,
     transfers: u64,
+    calls: u64,
 }
 
 // Compile-time size assertions for hot types (reth pattern).
 #[cfg(target_pointer_width = "64")]
-const _: [(); 64] = [(); core::mem::size_of::<SyncOutcome>()];
+const _: [(); 72] = [(); core::mem::size_of::<SyncOutcome>()];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 32] = [(); core::mem::size_of::<ProcessOutcome>()];
+const _: [(); 40] = [(); core::mem::size_of::<ProcessOutcome>()];
 
 /// Run sync for a block range, fetching from the peer pool.
 ///
@@ -153,6 +161,7 @@ pub async fn run_sync(
         Arc::clone(&ctx.metrics),
         Arc::clone(&ctx.factories),
         Arc::clone(&ctx.transfer_handlers),
+        Arc::clone(&ctx.call_handlers),
     ));
 
     // Main fetch loop
@@ -187,6 +196,7 @@ pub async fn run_sync(
         events_decoded: stats.events_decoded,
         events_stored: stats.events_stored,
         transfers_stored: stats.transfers_stored,
+        calls_stored: stats.calls_stored,
         elapsed,
     })
 }
@@ -601,6 +611,7 @@ async fn check_progress(
     *last_check = Instant::now();
 }
 
+#[expect(clippy::too_many_arguments, reason = "grouping these into a struct would add complexity without benefit")]
 #[instrument(skip_all)]
 async fn consume_payloads(
     mut payload_rx: mpsc::Receiver<BlockPayload>,
@@ -610,6 +621,7 @@ async fn consume_payloads(
     metrics: Arc<SieveMetrics>,
     factories: Arc<Vec<ResolvedFactory>>,
     transfer_handlers: Arc<TransferRegistry>,
+    call_handlers: Arc<CallRegistry>,
 ) -> ConsumerStats {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
@@ -621,6 +633,7 @@ async fn consume_payloads(
         handlers: &handlers,
         factories: &factories,
         transfer_handlers: &transfer_handlers,
+        call_handlers: &call_handlers,
     };
 
     while let Some(payload) = payload_rx.recv().await {
@@ -635,12 +648,14 @@ async fn consume_payloads(
                 stats.events_decoded = stats.events_decoded.saturating_add(outcome.decoded);
                 stats.events_stored = stats.events_stored.saturating_add(outcome.stored);
                 stats.transfers_stored = stats.transfers_stored.saturating_add(outcome.transfers);
+                stats.calls_stored = stats.calls_stored.saturating_add(outcome.calls);
 
                 // Update Prometheus counters
                 metrics.blocks_indexed.inc();
                 metrics.events_matched.inc_by(outcome.matched);
                 metrics.events_stored.inc_by(outcome.stored);
                 metrics.transfers_stored.inc_by(outcome.transfers);
+                metrics.calls_stored.inc_by(outcome.calls);
 
                 // Only advance the gauge forward (payloads arrive out of order)
                 let block_num = payload.header().number;
@@ -666,6 +681,7 @@ async fn consume_payloads(
                 events_decoded = stats.events_decoded,
                 events_stored = stats.events_stored,
                 transfers_stored = stats.transfers_stored,
+                calls_stored = stats.calls_stored,
                 block_number = payload.header().number,
                 "sync progress"
             );
@@ -683,6 +699,7 @@ struct ProcessContext<'a> {
     handlers: &'a HandlerRegistry,
     factories: &'a [ResolvedFactory],
     transfer_handlers: &'a TransferRegistry,
+    call_handlers: &'a CallRegistry,
 }
 
 /// Compute the sealed hash for a block header.
@@ -726,19 +743,20 @@ async fn process_block_events(
     let matched = filter::filter_block(payload, ctx.config);
     let matched_count = matched.len() as u64;
     let has_transfers = !ctx.transfer_handlers.is_empty();
+    let has_calls = !ctx.call_handlers.is_empty();
 
-    if matched.is_empty() && !has_transfers {
+    if matched.is_empty() && !has_transfers && !has_calls {
         commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
-        return Ok(ProcessOutcome { matched: 0, decoded: 0, stored: 0, transfers: 0 });
+        return Ok(ProcessOutcome { matched: 0, decoded: 0, stored: 0, transfers: 0, calls: 0 });
     }
 
     // Step 2: decode (CPU work, no DB)
     let decoded_events = decode_matched_logs(&matched, ctx.config);
     let decoded_count = decoded_events.len() as u64;
 
-    if decoded_events.is_empty() && !has_transfers {
+    if decoded_events.is_empty() && !has_transfers && !has_calls {
         commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
-        return Ok(ProcessOutcome { matched: matched_count, decoded: 0, stored: 0, transfers: 0 });
+        return Ok(ProcessOutcome { matched: matched_count, decoded: 0, stored: 0, transfers: 0, calls: 0 });
     }
 
     // Step 3: store in one transaction per block
@@ -774,6 +792,21 @@ async fn process_block_events(
         0u64
     };
 
+    // Step 5: scan function calls
+    let call_count = if has_calls {
+        scan_and_store_calls(
+            payload,
+            block_hash,
+            &mut sender_cache,
+            ctx.config,
+            ctx.call_handlers,
+            &mut tx,
+        )
+        .await?
+    } else {
+        0u64
+    };
+
     db::update_checkpoint(&mut tx, block_number).await?;
 
     tx.commit()
@@ -785,6 +818,7 @@ async fn process_block_events(
         decoded: decoded_count,
         stored: stored_count,
         transfers: transfer_count,
+        calls: call_count,
     })
 }
 
@@ -947,6 +981,122 @@ async fn scan_and_store_transfers(
         };
 
         let dispatched = transfer_handlers.dispatch(&transfer, &context, tx).await?;
+        count = count.saturating_add(dispatched);
+    }
+
+    Ok(count)
+}
+
+/// Scan block transactions for function calls and store them.
+///
+/// Iterates all transactions in the block body, matching calldata selectors
+/// against configured functions. Skips contract creations, short calldata,
+/// and reverted transactions. Uses `JsonAbiExt::abi_decode_input` to decode
+/// the calldata arguments.
+///
+/// Returns the number of calls stored.
+async fn scan_and_store_calls(
+    payload: &BlockPayload,
+    block_hash: B256,
+    sender_cache: &mut HashMap<usize, Address>,
+    config: &IndexConfig,
+    call_handlers: &CallRegistry,
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+) -> eyre::Result<u64> {
+    let block_number = BlockNumber::new(payload.header().number);
+    let receipts = payload.receipts();
+    let mut count = 0u64;
+
+    for (tx_index, tx_signed) in payload.body().transactions.iter().enumerate() {
+        let input = tx_signed.input();
+
+        // Skip transactions with no calldata or too short for a selector
+        if input.len() < 4 {
+            continue;
+        }
+
+        // Skip contract creations (no recipient)
+        let to_address = match tx_signed.kind() {
+            TxKind::Call(addr) => addr,
+            TxKind::Create => continue,
+        };
+
+        // Look up contract config for this address
+        let Some(contract) = config.contract_for_address(&to_address) else {
+            continue;
+        };
+
+        // Extract 4-byte function selector
+        let selector = Selector::from_slice(&input[..4]);
+
+        // Look up function ABI
+        let Some(function) = contract.functions.get(&selector) else {
+            continue;
+        };
+
+        // Skip reverted transactions (call had no effect)
+        if !receipts.get(tx_index).is_some_and(|r| r.success) {
+            continue;
+        }
+
+        // Decode function arguments (calldata without 4-byte selector prefix)
+        let decoded_values = match function.abi_decode_input(&input[4..]) {
+            Ok(values) => values,
+            Err(e) => {
+                warn!(
+                    block = block_number.as_u64(),
+                    tx_index,
+                    function = %function.name,
+                    error = %e,
+                    "failed to decode function call"
+                );
+                continue;
+            }
+        };
+
+        // Build decoded params from function inputs + decoded values
+        let params: Vec<DecodedParam> = function
+            .inputs
+            .iter()
+            .zip(decoded_values)
+            .map(|(input_param, value)| DecodedParam {
+                name: input_param.name.clone(),
+                solidity_type: input_param.ty.clone(),
+                value,
+            })
+            .collect();
+
+        // Recover sender (use cache)
+        let from_address = if let Some(&cached) = sender_cache.get(&tx_index) {
+            cached
+        } else {
+            let sender = tx_signed
+                .recover_signer_unchecked()
+                .wrap_err("failed to recover tx sender for call")?;
+            sender_cache.insert(tx_index, sender);
+            sender
+        };
+
+        let decoded_call = DecodedCall {
+            function_name: function.name.clone(),
+            contract_name: contract.name.clone(),
+            params,
+            block_number,
+            tx_hash: *tx_signed.tx_hash(),
+            tx_index,
+            contract_address: to_address,
+        };
+
+        let context = EventContext {
+            block_timestamp: payload.header().timestamp,
+            block_hash,
+            tx_from: from_address,
+            tx_to: Some(to_address),
+            tx_value: tx_signed.value(),
+            tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
+        };
+
+        let dispatched = call_handlers.dispatch(&decoded_call, &context, tx).await?;
         count = count.saturating_add(dispatched);
     }
 

@@ -5,7 +5,7 @@
 
 use crate::config::IndexConfig;
 use crate::db::Database;
-use crate::handler::{HandlerRegistry, TransferRegistry};
+use crate::handler::{CallRegistry, HandlerRegistry, TransferRegistry};
 use crate::metrics::SieveMetrics;
 use crate::p2p::PeerPool;
 use crate::toml_config::ResolvedFactory;
@@ -43,6 +43,8 @@ pub struct SyncContext {
     pub factories: Arc<Vec<ResolvedFactory>>,
     /// Native ETH transfer handler registry.
     pub transfer_handlers: Arc<TransferRegistry>,
+    /// Function call handler registry.
+    pub call_handlers: Arc<CallRegistry>,
 }
 
 /// Full payload for a block: header, body, receipts.
@@ -101,4 +103,4 @@ const _: [(); 816] = [(); core::mem::size_of::<BlockPayload>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 32] = [(); core::mem::size_of::<FetchBatch>()];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 72] = [(); core::mem::size_of::<SyncContext>()];
+const _: [(); 80] = [(); core::mem::size_of::<SyncContext>()];

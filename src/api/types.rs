@@ -5,7 +5,7 @@
 //! GraphQL `TypeRef` values.
 
 use async_graphql::dynamic::TypeRef;
-use crate::toml_config::{ContextField, ResolvedEvent, ResolvedTransfer};
+use crate::toml_config::{ContextField, ResolvedCall, ResolvedEvent, ResolvedTransfer};
 use serde_json::Value as JsonValue;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -85,6 +85,46 @@ pub fn build_transfer_columns_meta(transfer: &ResolvedTransfer) -> Vec<ColumnMet
             name: cf.pg_column_name().to_string(),
             pg_type: context_field_base_type(*cf).to_string(),
             nullable: *cf == ContextField::TxTo,
+        });
+    }
+
+    cols
+}
+
+/// Build column metadata from a resolved function call definition.
+///
+/// Standard columns: id, block_number, tx_hash, tx_index (no log_index).
+/// Plus optional contract_address, context columns, and user columns.
+#[must_use]
+pub fn build_call_columns_meta(call: &ResolvedCall) -> Vec<ColumnMeta> {
+    let mut cols = vec![
+        ColumnMeta { name: "id".to_string(), pg_type: "bigserial".to_string(), nullable: false },
+        ColumnMeta { name: "block_number".to_string(), pg_type: "bigint".to_string(), nullable: false },
+        ColumnMeta { name: "tx_hash".to_string(), pg_type: "bytea".to_string(), nullable: false },
+        ColumnMeta { name: "tx_index".to_string(), pg_type: "integer".to_string(), nullable: false },
+    ];
+
+    if call.is_factory_child {
+        cols.push(ColumnMeta {
+            name: "contract_address".to_string(),
+            pg_type: "text".to_string(),
+            nullable: false,
+        });
+    }
+
+    for cf in &call.context_fields {
+        cols.push(ColumnMeta {
+            name: cf.pg_column_name().to_string(),
+            pg_type: context_field_base_type(*cf).to_string(),
+            nullable: *cf == ContextField::TxTo,
+        });
+    }
+
+    for col in &call.columns {
+        cols.push(ColumnMeta {
+            name: col.column_name.clone(),
+            pg_type: col.pg_type.clone(),
+            nullable: false,
         });
     }
 
@@ -305,6 +345,7 @@ mod tests {
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
             is_factory_child: false,
+            topic_filters: vec![],
         }
     }
 
@@ -434,6 +475,59 @@ mod tests {
         );
         // No log_index for transfers
         assert!(meta.iter().all(|c| c.name != "log_index"));
+    }
+
+    fn test_call() -> ResolvedCall {
+        ResolvedCall {
+            function_name: "exactInputSingle".to_string(),
+            contract_name: "UniswapV3Router".to_string(),
+            table_name: "uniswap_swaps".to_string(),
+            context_fields: vec![ContextField::BlockTimestamp],
+            columns: vec![
+                ResolvedColumn {
+                    column_name: "recipient".to_string(),
+                    param_name: "recipient".to_string(),
+                    pg_type: "text".to_string(),
+                },
+                ResolvedColumn {
+                    column_name: "amount_in".to_string(),
+                    param_name: "amountIn".to_string(),
+                    pg_type: "numeric".to_string(),
+                },
+            ],
+            insert_sql: String::new(),
+            create_table_sql: String::new(),
+            create_indexes_sql: vec![],
+            rollback_sql: String::new(),
+            is_factory_child: false,
+        }
+    }
+
+    #[test]
+    fn call_columns_meta_includes_correct_columns() {
+        let call = test_call();
+        let meta = build_call_columns_meta(&call);
+        let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "block_number", "tx_hash", "tx_index",
+                 "block_timestamp", "recipient", "amount_in"]
+        );
+        // No log_index for calls
+        assert!(meta.iter().all(|c| c.name != "log_index"));
+    }
+
+    #[test]
+    fn call_columns_meta_factory_child() {
+        let mut call = test_call();
+        call.is_factory_child = true;
+        let meta = build_call_columns_meta(&call);
+        let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "block_number", "tx_hash", "tx_index",
+                 "contract_address", "block_timestamp", "recipient", "amount_in"]
+        );
     }
 
     #[test]

@@ -11,10 +11,11 @@ use crate::api::query_builder::{
     validate_order_column, Cursor, SelectParams, WhereClause, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use crate::api::types::{
-    build_columns_meta, build_select_clause, build_transfer_columns_meta, operators_for_type,
-    pg_to_graphql_type, row_to_json, to_pascal_case, ColumnMeta,
+    build_call_columns_meta, build_columns_meta, build_select_clause,
+    build_transfer_columns_meta, operators_for_type, pg_to_graphql_type, row_to_json,
+    to_pascal_case, ColumnMeta,
 };
-use crate::toml_config::{ResolvedEvent, ResolvedTransfer};
+use crate::toml_config::{ResolvedCall, ResolvedEvent, ResolvedTransfer};
 
 use async_graphql::dynamic::{
     Enum, EnumItem, Field, FieldFuture, FieldValue, InputObject, InputValue, Object, Schema,
@@ -40,6 +41,7 @@ struct TableMeta {
 pub fn build_schema(
     events: &[ResolvedEvent],
     transfers: &[ResolvedTransfer],
+    calls: &[ResolvedCall],
     pool: PgPool,
 ) -> eyre::Result<Schema> {
     let mut builder: SchemaBuilder = Schema::build("Query", None, None);
@@ -122,6 +124,37 @@ pub fn build_schema(
 
         query = query.field(build_query_field(
             &transfer.table_name,
+            &connection_type_name,
+            &filter_type_name,
+            &order_by_type_name,
+            pool.clone(),
+            Arc::clone(&meta),
+        ));
+    }
+
+    // Per-call table (same pattern as events/transfers, different column metadata)
+    for call in calls {
+        let type_name = to_pascal_case(&call.table_name);
+        let filter_type_name = format!("{type_name}Filter");
+        let order_by_type_name = format!("{type_name}OrderBy");
+        let connection_type_name = format!("{type_name}Connection");
+
+        let columns_meta = build_call_columns_meta(call);
+        let select_clause = build_select_clause(&columns_meta);
+
+        let meta = Arc::new(TableMeta {
+            table_name: call.table_name.clone(),
+            select_clause,
+            columns: columns_meta.clone(),
+        });
+
+        builder = builder.register(build_output_object(&type_name, &columns_meta));
+        builder = builder.register(build_filter_input(&filter_type_name, &columns_meta));
+        builder = builder.register(build_order_by_enum(&order_by_type_name, &columns_meta));
+        builder = builder.register(build_connection_type(&connection_type_name, &type_name));
+
+        query = query.field(build_query_field(
+            &call.table_name,
             &connection_type_name,
             &filter_type_name,
             &order_by_type_name,
@@ -581,6 +614,7 @@ mod tests {
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
             is_factory_child: false,
+            topic_filters: vec![],
         }
     }
 

@@ -9,7 +9,7 @@
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
 use crate::config::IndexConfig;
-use crate::toml_config::{ResolvedEvent, ResolvedTransfer};
+use crate::toml_config::{ResolvedCall, ResolvedEvent, ResolvedTransfer};
 use crate::types::BlockNumber;
 use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
@@ -372,6 +372,38 @@ pub async fn create_transfer_tables(
         }
 
         info!(table = %transfer.table_name, "created transfer table");
+    }
+    Ok(())
+}
+
+/// Create function call tables from resolved TOML config.
+///
+/// Runs `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`
+/// for each resolved call. Safe to run repeatedly (idempotent DDL).
+///
+/// # Errors
+///
+/// Returns an error if any DDL statement fails.
+pub async fn create_call_tables(
+    db: &Database,
+    calls: &[ResolvedCall],
+) -> eyre::Result<()> {
+    for call in calls {
+        sqlx::raw_sql(&call.create_table_sql)
+            .execute(db.pool())
+            .await
+            .wrap_err_with(|| format!("failed to create table '{}'", call.table_name))?;
+
+        for index_sql in &call.create_indexes_sql {
+            sqlx::raw_sql(index_sql)
+                .execute(db.pool())
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to create index for table '{}'", call.table_name)
+                })?;
+        }
+
+        info!(table = %call.table_name, "created call table");
     }
     Ok(())
 }

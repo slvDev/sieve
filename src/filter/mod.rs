@@ -90,6 +90,18 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
 
             // Check topic0 matches a configured event
             if contract.events.contains_key(&topic0) {
+                // Check indexed parameter filters (if any configured for this event)
+                if let Some(filters) = contract.topic_filters.get(&topic0) {
+                    let pass = filters.iter().all(|tf| {
+                        topics
+                            .get(tf.topic_index)
+                            .is_some_and(|t| tf.values.contains(t))
+                    });
+                    if !pass {
+                        continue;
+                    }
+                }
+
                 matched.push(FilteredLog {
                     log: log.clone(),
                     block_number,
@@ -316,6 +328,165 @@ mod tests {
 
         let matched = filter_block(&payload, &config);
         assert!(matched.is_empty());
+        Ok(())
+    }
+
+    // ── Factory tests ────────────────────────────────────────────────
+
+    #[test]
+    fn filter_with_topic_filter_matches() -> eyre::Result<()> {
+        use crate::toml_config::TopicFilter;
+        use std::collections::HashSet;
+
+        let mut config = usdc_transfer_config()?;
+        let usdc_addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let transfer_selector: B256 =
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                .parse()
+                .map_err(|e| eyre::eyre!("parse: {e}"))?;
+
+        // Filter: only topic2 (to) matching a specific address
+        let target_addr = address!("0000000000000000000000000000000000000042");
+        let target_topic = B256::left_padding_from(target_addr.as_slice());
+        config.contracts[0].topic_filters.insert(
+            transfer_selector,
+            vec![TopicFilter {
+                topic_index: 2,
+                values: HashSet::from([target_topic]),
+            }],
+        );
+
+        // Log matching the filter (to = target)
+        let matching_log = make_log(
+            usdc_addr,
+            vec![transfer_selector, B256::ZERO, target_topic],
+            bytes!("0000000000000000000000000000000000000000000000000000000000000064"),
+        );
+
+        // Log NOT matching the filter (to = something else)
+        let non_matching_log = make_log(
+            usdc_addr,
+            vec![transfer_selector, B256::ZERO, B256::ZERO],
+            bytes!("0000000000000000000000000000000000000000000000000000000000000064"),
+        );
+
+        let receipt = make_receipt(vec![matching_log, non_matching_log]);
+        let tx1 = build_test_transaction();
+        let tx2 = build_test_transaction();
+        let body = BlockBody {
+            transactions: vec![tx1, tx2],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let header = Header {
+            number: 21_000_042,
+            ..Default::default()
+        };
+        // Two txs but one receipt — need to match
+        let receipt2 = make_receipt(vec![]);
+        let payload = BlockPayload::new(header, body, vec![receipt, receipt2]);
+
+        let matched = filter_block(&payload, &config);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].log_index, 0); // Only the first log matched
+        Ok(())
+    }
+
+    #[test]
+    fn filter_without_topic_filter_accepts_all() -> eyre::Result<()> {
+        // This is the existing behavior — no topic filters means all events match
+        let config = usdc_transfer_config()?;
+        assert!(config.contracts[0].topic_filters.is_empty());
+
+        let usdc_addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let transfer_selector: B256 =
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                .parse()
+                .map_err(|e| eyre::eyre!("parse: {e}"))?;
+
+        let log = make_log(
+            usdc_addr,
+            vec![transfer_selector, B256::ZERO, B256::ZERO],
+            bytes!("0000000000000000000000000000000000000000000000000000000000000064"),
+        );
+        let receipt = make_receipt(vec![log]);
+        let tx = build_test_transaction();
+        let body = BlockBody {
+            transactions: vec![tx],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let payload = BlockPayload::new(Header::default(), body, vec![receipt]);
+
+        let matched = filter_block(&payload, &config);
+        assert_eq!(matched.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_with_multi_param_and_logic() -> eyre::Result<()> {
+        use crate::toml_config::TopicFilter;
+        use std::collections::HashSet;
+
+        let mut config = usdc_transfer_config()?;
+        let usdc_addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let transfer_selector: B256 =
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                .parse()
+                .map_err(|e| eyre::eyre!("parse: {e}"))?;
+
+        let from_addr = address!("0000000000000000000000000000000000000001");
+        let to_addr = address!("0000000000000000000000000000000000000002");
+        let from_topic = B256::left_padding_from(from_addr.as_slice());
+        let to_topic = B256::left_padding_from(to_addr.as_slice());
+
+        // Filter: both from AND to must match
+        config.contracts[0].topic_filters.insert(
+            transfer_selector,
+            vec![
+                TopicFilter {
+                    topic_index: 1,
+                    values: HashSet::from([from_topic]),
+                },
+                TopicFilter {
+                    topic_index: 2,
+                    values: HashSet::from([to_topic]),
+                },
+            ],
+        );
+
+        // Log with correct from but wrong to → should NOT match
+        let log_wrong_to = make_log(
+            usdc_addr,
+            vec![transfer_selector, from_topic, B256::ZERO],
+            bytes!("0000000000000000000000000000000000000000000000000000000000000064"),
+        );
+
+        // Log with correct from AND to → should match
+        let log_match = make_log(
+            usdc_addr,
+            vec![transfer_selector, from_topic, to_topic],
+            bytes!("0000000000000000000000000000000000000000000000000000000000000064"),
+        );
+
+        let receipt1 = make_receipt(vec![log_wrong_to]);
+        let receipt2 = make_receipt(vec![log_match]);
+        let tx1 = build_test_transaction();
+        let tx2 = build_test_transaction();
+        let body = BlockBody {
+            transactions: vec![tx1, tx2],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let header = Header {
+            number: 21_000_042,
+            ..Default::default()
+        };
+        let payload = BlockPayload::new(header, body, vec![receipt1, receipt2]);
+
+        let matched = filter_block(&payload, &config);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].tx_index, 1); // Only the second tx's log matched
         Ok(())
     }
 

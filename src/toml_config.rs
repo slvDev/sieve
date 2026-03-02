@@ -5,10 +5,10 @@
 
 use crate::config::{ContractConfig, IndexConfig};
 use alloy_json_abi::JsonAbi;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::info;
 
@@ -46,6 +46,9 @@ pub struct TomlContract {
     pub start_block: Option<u64>,
     /// Events to index from this contract.
     pub events: Vec<TomlEvent>,
+    /// Function calls to index from this contract.
+    #[serde(default)]
+    pub calls: Vec<TomlCall>,
     /// Optional factory config for dynamically-created contracts.
     pub factory: Option<TomlFactory>,
 }
@@ -76,6 +79,10 @@ pub struct TomlEvent {
     pub context: Option<Vec<String>>,
     /// Optional explicit column mappings. If omitted, auto-generated from ABI.
     pub columns: Option<Vec<TomlColumn>>,
+    /// Optional indexed parameter filters. Keys are indexed param names from the
+    /// ABI, values are lists of allowed hex values. All conditions are AND'd;
+    /// each filter is OR'd internally.
+    pub filter: Option<HashMap<String, Vec<String>>>,
 }
 
 /// An explicit column mapping from TOML.
@@ -88,6 +95,19 @@ pub struct TomlColumn {
     /// Postgres type (defaults to auto-mapping from Solidity type).
     #[serde(rename = "type")]
     pub pg_type: Option<String>,
+}
+
+/// A function call definition from TOML.
+#[derive(Debug, Deserialize)]
+pub struct TomlCall {
+    /// Function name as it appears in the ABI (e.g. "exactInputSingle").
+    pub name: String,
+    /// Postgres table name for this call's data.
+    pub table: String,
+    /// Optional context fields to enrich calls with block/tx data.
+    pub context: Option<Vec<String>>,
+    /// Optional explicit column mappings. If omitted, auto-generated from ABI.
+    pub columns: Option<Vec<TomlColumn>>,
 }
 
 /// A native ETH transfer definition from TOML.
@@ -205,6 +225,8 @@ pub struct ResolvedConfig {
     pub factories: Vec<ResolvedFactory>,
     /// Native ETH transfer definitions.
     pub transfers: Vec<ResolvedTransfer>,
+    /// Function call definitions.
+    pub calls: Vec<ResolvedCall>,
 }
 
 /// A resolved factory contract definition.
@@ -247,6 +269,44 @@ pub struct ResolvedTransfer {
     pub filter_to: Vec<Address>,
 }
 
+/// A fully resolved function call definition with pre-built SQL.
+#[derive(Debug, Clone)]
+pub struct ResolvedCall {
+    /// Function name from the ABI.
+    pub function_name: String,
+    /// Contract name.
+    pub contract_name: String,
+    /// Postgres table name.
+    pub table_name: String,
+    /// Context fields to enrich calls with block/tx data.
+    pub context_fields: Vec<ContextField>,
+    /// User-defined columns (mapped from ABI function inputs).
+    pub columns: Vec<ResolvedColumn>,
+    /// Pre-built INSERT SQL.
+    pub insert_sql: String,
+    /// Pre-built CREATE TABLE SQL.
+    pub create_table_sql: String,
+    /// Pre-built CREATE INDEX SQL statements.
+    pub create_indexes_sql: Vec<String>,
+    /// Pre-built DELETE (rollback) SQL.
+    pub rollback_sql: String,
+    /// Whether this call belongs to a factory-child contract.
+    pub is_factory_child: bool,
+}
+
+/// A filter on a single indexed event parameter (topic).
+///
+/// At sync time, a log must have its `topic[topic_index]` value contained in
+/// `values` to pass the filter. Multiple `TopicFilter`s for the same event
+/// are AND'd (all must match).
+#[derive(Debug, Clone)]
+pub struct TopicFilter {
+    /// Topic position: 1, 2, or 3 (topic0 is the event selector).
+    pub topic_index: usize,
+    /// Allowed topic values. The log must match at least one.
+    pub values: HashSet<B256>,
+}
+
 /// A fully resolved event with pre-built SQL statements.
 #[derive(Debug, Clone)]
 pub struct ResolvedEvent {
@@ -270,6 +330,8 @@ pub struct ResolvedEvent {
     pub rollback_sql: String,
     /// Whether this event belongs to a factory-child contract.
     pub is_factory_child: bool,
+    /// Indexed parameter filters for pre-decode filtering.
+    pub topic_filters: Vec<TopicFilter>,
 }
 
 // ── Type mapping ──────────────────────────────────────────────────────
@@ -540,6 +602,118 @@ fn generate_transfer_insert_sql(
     )
 }
 
+// ── Call SQL generators ────────────────────────────────────────────
+
+/// Generate `CREATE TABLE IF NOT EXISTS` SQL for a function call table.
+///
+/// Fixed columns: `id`, `block_number`, `tx_hash`, `tx_index` (no `log_index`).
+/// Optional `contract_address` for factory children. Context + user columns.
+/// UNIQUE on `(block_number, tx_index)`.
+#[must_use]
+fn generate_call_create_table_sql(
+    table: &str,
+    context_fields: &[ContextField],
+    columns: &[ResolvedColumn],
+    is_factory_child: bool,
+) -> String {
+    use std::fmt::Write;
+
+    let mut sql = format!(
+        "CREATE TABLE IF NOT EXISTS {table} (\n  \
+         id BIGSERIAL PRIMARY KEY,\n  \
+         block_number BIGINT NOT NULL,\n  \
+         tx_hash BYTEA NOT NULL,\n  \
+         tx_index INTEGER NOT NULL"
+    );
+
+    if is_factory_child {
+        sql.push_str(",\n  contract_address TEXT NOT NULL");
+    }
+
+    for cf in context_fields {
+        let _ = write!(sql, ",\n  {} {}", cf.pg_column_name(), cf.pg_type());
+    }
+
+    for col in columns {
+        let _ = write!(sql, ",\n  {} {} NOT NULL", col.column_name, col.pg_type);
+    }
+
+    if is_factory_child {
+        sql.push_str(",\n  UNIQUE (contract_address, block_number, tx_index)\n)");
+    } else {
+        sql.push_str(",\n  UNIQUE (block_number, tx_index)\n)");
+    }
+
+    sql
+}
+
+/// Generate INSERT SQL for a function call table.
+///
+/// Fixed params: `$1=block_number, $2=tx_hash, $3=tx_index`.
+/// Optional `$4=contract_address` for factory children. Context + user columns follow.
+#[must_use]
+fn generate_call_insert_sql(
+    table: &str,
+    context_fields: &[ContextField],
+    columns: &[ResolvedColumn],
+    is_factory_child: bool,
+) -> String {
+    use std::fmt::Write;
+
+    let mut col_names = String::from("block_number, tx_hash, tx_index");
+
+    let mut param_idx = if is_factory_child {
+        col_names.push_str(", contract_address");
+        5
+    } else {
+        4
+    };
+
+    for cf in context_fields {
+        col_names.push_str(", ");
+        col_names.push_str(cf.pg_column_name());
+    }
+
+    for col in columns {
+        col_names.push_str(", ");
+        col_names.push_str(&col.column_name);
+    }
+
+    let mut params = String::from("$1, $2, $3");
+
+    if is_factory_child {
+        params.push_str(", $4");
+    }
+
+    for cf in context_fields {
+        params.push_str(", ");
+        if matches!(cf, ContextField::TxValue) {
+            let _ = write!(params, "${param_idx}::numeric");
+        } else {
+            let _ = write!(params, "${param_idx}");
+        }
+        param_idx += 1;
+    }
+
+    for col in columns {
+        params.push_str(", ");
+        if col.pg_type == "numeric" {
+            let _ = write!(params, "${param_idx}::numeric");
+        } else {
+            let _ = write!(params, "${param_idx}");
+        }
+        param_idx += 1;
+    }
+
+    let conflict = if is_factory_child {
+        "ON CONFLICT (contract_address, block_number, tx_index) DO NOTHING"
+    } else {
+        "ON CONFLICT (block_number, tx_index) DO NOTHING"
+    };
+
+    format!("INSERT INTO {table} ({col_names}) VALUES ({params}) {conflict}")
+}
+
 /// Resolve a single `TomlTransfer` into a `ResolvedTransfer`.
 ///
 /// Validates the table name, checks for collisions with event tables,
@@ -649,81 +823,17 @@ pub fn resolve_config(
     let mut contract_configs = Vec::with_capacity(config.contracts.len());
     let mut resolved_events = Vec::new();
     let mut resolved_factories = Vec::new();
+    let mut resolved_calls = Vec::new();
     let mut table_names = HashSet::new();
 
     for contract in &config.contracts {
-        let is_factory_child = contract.factory.is_some();
-
-        // Validate: must have either address or factory, not both, not neither
-        if contract.address.is_some() && is_factory_child {
-            return Err(eyre::eyre!(
-                "contract '{}' has both 'address' and 'factory'; use one or the other",
-                contract.name
-            ));
-        }
-        if contract.address.is_none() && !is_factory_child {
-            return Err(eyre::eyre!(
-                "contract '{}' must have either 'address' or 'factory'",
-                contract.name
-            ));
-        }
-
-        // Resolve address: static contract has an address, factory child uses Address::ZERO placeholder
-        let address: Address = if let Some(ref addr_str) = contract.address {
-            addr_str
-                .parse()
-                .wrap_err_with(|| format!("invalid address for contract '{}'", contract.name))?
-        } else {
-            Address::ZERO
-        };
-
-        // Read and parse ABI
-        let abi_path = config_dir.join(&contract.abi);
-        let abi_json = std::fs::read_to_string(&abi_path).wrap_err_with(|| {
-            format!(
-                "failed to read ABI file '{}' for contract '{}'",
-                abi_path.display(),
-                contract.name
-            )
-        })?;
-        let abi: JsonAbi = serde_json::from_str(&abi_json).wrap_err_with(|| {
-            format!(
-                "failed to parse ABI JSON '{}' for contract '{}'",
-                abi_path.display(),
-                contract.name
-            )
-        })?;
-
-        // Resolve factory if present
-        if let Some(ref factory) = contract.factory {
-            resolved_factories.push(resolve_factory(
-                factory,
-                &contract.name,
-                &abi,
-                config_dir,
-            )?);
-        }
-
-        let event_names: Vec<&str> = contract.events.iter().map(|e| e.name.as_str()).collect();
-
-        // Resolve each event
-        for toml_event in &contract.events {
-            resolve_event(
-                toml_event,
-                &contract.name,
-                &abi,
-                is_factory_child,
-                &mut table_names,
-                &mut resolved_events,
-            )?;
-        }
-
-        // Build ContractConfig for the filter/decode pipeline
-        let contract_config = ContractConfig::from_abi(
-            &contract.name,
-            address,
-            &abi,
-            &event_names,
+        let contract_config = resolve_contract(
+            contract,
+            config_dir,
+            &mut table_names,
+            &mut resolved_events,
+            &mut resolved_factories,
+            &mut resolved_calls,
         )?;
         contract_configs.push(contract_config);
     }
@@ -741,6 +851,7 @@ pub fn resolve_config(
         events = resolved_events.len(),
         factories = resolved_factories.len(),
         transfers = resolved_transfers.len(),
+        calls = resolved_calls.len(),
         "resolved TOML config"
     );
 
@@ -749,7 +860,136 @@ pub fn resolve_config(
         resolved_events,
         factories: resolved_factories,
         transfers: resolved_transfers,
+        calls: resolved_calls,
     })
+}
+
+/// Resolve a single contract from TOML into a `ContractConfig` and collect
+/// resolved events, factories, and calls.
+fn resolve_contract(
+    contract: &TomlContract,
+    config_dir: &Path,
+    table_names: &mut HashSet<String>,
+    resolved_events: &mut Vec<ResolvedEvent>,
+    resolved_factories: &mut Vec<ResolvedFactory>,
+    resolved_calls: &mut Vec<ResolvedCall>,
+) -> eyre::Result<ContractConfig> {
+    let is_factory_child = contract.factory.is_some();
+
+    // Validate: must have either address or factory, not both, not neither
+    if contract.address.is_some() && is_factory_child {
+        return Err(eyre::eyre!(
+            "contract '{}' has both 'address' and 'factory'; use one or the other",
+            contract.name
+        ));
+    }
+    if contract.address.is_none() && !is_factory_child {
+        return Err(eyre::eyre!(
+            "contract '{}' must have either 'address' or 'factory'",
+            contract.name
+        ));
+    }
+
+    // Resolve address: static contract has an address, factory child uses Address::ZERO placeholder
+    let address: Address = if let Some(ref addr_str) = contract.address {
+        addr_str
+            .parse()
+            .wrap_err_with(|| format!("invalid address for contract '{}'", contract.name))?
+    } else {
+        Address::ZERO
+    };
+
+    // Read and parse ABI
+    let abi_path = config_dir.join(&contract.abi);
+    let abi_json = std::fs::read_to_string(&abi_path).wrap_err_with(|| {
+        format!(
+            "failed to read ABI file '{}' for contract '{}'",
+            abi_path.display(),
+            contract.name
+        )
+    })?;
+    let abi: JsonAbi = serde_json::from_str(&abi_json).wrap_err_with(|| {
+        format!(
+            "failed to parse ABI JSON '{}' for contract '{}'",
+            abi_path.display(),
+            contract.name
+        )
+    })?;
+
+    // Resolve factory if present
+    if let Some(ref factory) = contract.factory {
+        resolved_factories.push(resolve_factory(
+            factory,
+            &contract.name,
+            &abi,
+            config_dir,
+        )?);
+    }
+
+    let event_names: Vec<&str> = contract.events.iter().map(|e| e.name.as_str()).collect();
+
+    // Resolve each event
+    for toml_event in &contract.events {
+        resolve_event(
+            toml_event,
+            &contract.name,
+            &abi,
+            is_factory_child,
+            table_names,
+            resolved_events,
+        )?;
+    }
+
+    // Build ContractConfig for the filter/decode pipeline
+    let mut contract_config = ContractConfig::from_abi(
+        &contract.name,
+        address,
+        &abi,
+        &event_names,
+    )?;
+
+    // Populate topic filters from resolved events for this contract
+    for re in &resolved_events[resolved_events.len() - contract.events.len()..] {
+        if !re.topic_filters.is_empty() {
+            let selector = contract_config
+                .events
+                .keys()
+                .find(|sel| {
+                    contract_config.events.get(*sel)
+                        .is_some_and(|ev| ev.name == re.event_name)
+                })
+                .copied();
+            if let Some(sel) = selector {
+                contract_config.topic_filters.insert(sel, re.topic_filters.clone());
+            }
+        }
+    }
+
+    // Resolve each function call
+    let function_names: Vec<&str> = contract.calls.iter().map(|c| c.name.as_str()).collect();
+    for toml_call in &contract.calls {
+        resolve_call(
+            toml_call,
+            &contract.name,
+            &abi,
+            is_factory_child,
+            table_names,
+            resolved_calls,
+        )?;
+    }
+
+    // Populate function selectors from ABI
+    for &fn_name in &function_names {
+        if let Some(fns) = abi.functions.get(fn_name) {
+            if let Some(func) = fns.first() {
+                contract_config
+                    .functions
+                    .insert(func.selector(), func.clone());
+            }
+        }
+    }
+
+    Ok(contract_config)
 }
 
 /// Resolve a single TOML event definition into a `ResolvedEvent`.
@@ -798,6 +1038,12 @@ fn resolve_event(
         contract_name,
         &toml_event.name,
     )?;
+    let topic_filters = resolve_topic_filters(
+        toml_event.filter.as_ref(),
+        abi_event,
+        contract_name,
+        &toml_event.name,
+    )?;
 
     let create_table_sql =
         generate_create_table_sql(&toml_event.table, &context_fields, &columns, is_factory_child);
@@ -817,6 +1063,7 @@ fn resolve_event(
         create_indexes_sql,
         rollback_sql,
         is_factory_child,
+        topic_filters,
     });
 
     Ok(())
@@ -888,6 +1135,144 @@ fn resolve_factory(
         child_contract_name: contract_name.to_owned(),
         start_block: factory.start_block,
     })
+}
+
+/// Resolve a single TOML call definition into a `ResolvedCall`.
+///
+/// # Errors
+///
+/// Returns an error if the table name is invalid/duplicate, the function is
+/// not found in the ABI, or column resolution fails.
+fn resolve_call(
+    toml_call: &TomlCall,
+    contract_name: &str,
+    abi: &JsonAbi,
+    is_factory_child: bool,
+    table_names: &mut HashSet<String>,
+    resolved_calls: &mut Vec<ResolvedCall>,
+) -> eyre::Result<()> {
+    validate_identifier(&toml_call.table, "table")?;
+    if !table_names.insert(toml_call.table.clone()) {
+        return Err(eyre::eyre!(
+            "duplicate table name '{}' across events/calls/transfers",
+            toml_call.table
+        ));
+    }
+
+    let abi_functions = abi.functions.get(&toml_call.name).ok_or_else(|| {
+        eyre::eyre!(
+            "function '{}' not found in ABI for contract '{contract_name}'",
+            toml_call.name,
+        )
+    })?;
+    let abi_function = abi_functions.first().ok_or_else(|| {
+        eyre::eyre!(
+            "no variants for function '{}' in contract '{contract_name}'",
+            toml_call.name,
+        )
+    })?;
+
+    let context_fields = resolve_context_fields(
+        toml_call.context.as_deref(),
+        contract_name,
+        &toml_call.name,
+    )?;
+    let columns = resolve_call_columns(
+        toml_call.columns.as_deref(),
+        abi_function,
+        contract_name,
+        &toml_call.name,
+    )?;
+
+    let create_table_sql = generate_call_create_table_sql(
+        &toml_call.table,
+        &context_fields,
+        &columns,
+        is_factory_child,
+    );
+    let create_indexes_sql = generate_indexes_sql(&toml_call.table);
+    let insert_sql = generate_call_insert_sql(
+        &toml_call.table,
+        &context_fields,
+        &columns,
+        is_factory_child,
+    );
+    let rollback_sql = generate_rollback_sql(&toml_call.table);
+
+    resolved_calls.push(ResolvedCall {
+        function_name: toml_call.name.clone(),
+        contract_name: contract_name.to_owned(),
+        table_name: toml_call.table.clone(),
+        context_fields,
+        columns,
+        insert_sql,
+        create_table_sql,
+        create_indexes_sql,
+        rollback_sql,
+        is_factory_child,
+    });
+
+    Ok(())
+}
+
+/// Resolve columns for a function call: either from explicit TOML definitions
+/// or auto-generated from all ABI function input parameters.
+///
+/// # Errors
+///
+/// Returns an error if a column param is not found in the function inputs,
+/// or if a column name fails identifier validation.
+fn resolve_call_columns(
+    toml_columns: Option<&[TomlColumn]>,
+    abi_function: &alloy_json_abi::Function,
+    contract_name: &str,
+    function_name: &str,
+) -> eyre::Result<Vec<ResolvedColumn>> {
+    match toml_columns {
+        Some(cols) => {
+            let mut resolved = Vec::with_capacity(cols.len());
+            for col in cols {
+                let abi_param = abi_function
+                    .inputs
+                    .iter()
+                    .find(|p| p.name == col.param)
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "param '{}' not found in function '{}.{}'",
+                            col.param,
+                            contract_name,
+                            function_name
+                        )
+                    })?;
+
+                let column_name = col.name.clone().unwrap_or_else(|| col.param.clone());
+                validate_identifier(&column_name, "column")?;
+                let pg_type = col
+                    .pg_type
+                    .clone()
+                    .unwrap_or_else(|| default_pg_type(&abi_param.ty).to_string());
+
+                resolved.push(ResolvedColumn {
+                    column_name,
+                    param_name: col.param.clone(),
+                    pg_type,
+                });
+            }
+            Ok(resolved)
+        }
+        None => {
+            let mut resolved = Vec::with_capacity(abi_function.inputs.len());
+            for param in &abi_function.inputs {
+                validate_identifier(&param.name, "column")?;
+                resolved.push(ResolvedColumn {
+                    column_name: param.name.clone(),
+                    param_name: param.name.clone(),
+                    pg_type: default_pg_type(&param.ty).to_string(),
+                });
+            }
+            Ok(resolved)
+        }
+    }
 }
 
 /// Resolve columns for an event: either from explicit TOML definitions or
@@ -985,6 +1370,123 @@ fn resolve_context_fields(
     }
 
     Ok(fields)
+}
+
+/// Resolve topic filters from TOML filter map.
+///
+/// Validates that each key names an indexed parameter in the event ABI,
+/// computes the topic index (1-based among indexed params), and encodes
+/// each value as a left-padded `B256` according to the Solidity type.
+///
+/// # Errors
+///
+/// Returns an error if a param name is not found, is not indexed, or a
+/// value fails to parse.
+fn resolve_topic_filters(
+    filter: Option<&HashMap<String, Vec<String>>>,
+    abi_event: &alloy_json_abi::Event,
+    contract_name: &str,
+    event_name: &str,
+) -> eyre::Result<Vec<TopicFilter>> {
+    let Some(filter) = filter else {
+        return Ok(Vec::new());
+    };
+
+    let mut topic_filters = Vec::with_capacity(filter.len());
+
+    for (param_name, raw_values) in filter {
+        // Find the param in the ABI and verify it's indexed
+        let param = abi_event
+            .inputs
+            .iter()
+            .find(|p| p.name == *param_name)
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "filter param '{param_name}' not found in event \
+                     '{contract_name}.{event_name}'"
+                )
+            })?;
+
+        if !param.indexed {
+            return Err(eyre::eyre!(
+                "filter param '{param_name}' in event '{contract_name}.{event_name}' \
+                 is not indexed (only indexed params can be filtered by topic)"
+            ));
+        }
+
+        // Compute topic index: count indexed params that come before this one, + 1
+        let topic_index = abi_event
+            .inputs
+            .iter()
+            .take_while(|p| p.name != *param_name)
+            .filter(|p| p.indexed)
+            .count()
+            + 1;
+
+        // Encode each value as B256 based on Solidity type
+        let mut values = HashSet::with_capacity(raw_values.len());
+        for raw in raw_values {
+            let b256 = encode_topic_value(raw, &param.ty).wrap_err_with(|| {
+                format!(
+                    "invalid filter value '{raw}' for param '{param_name}' \
+                     (type {}) in event '{contract_name}.{event_name}'",
+                    param.ty
+                )
+            })?;
+            values.insert(b256);
+        }
+
+        topic_filters.push(TopicFilter {
+            topic_index,
+            values,
+        });
+    }
+
+    Ok(topic_filters)
+}
+
+/// Encode a filter value string as a B256 topic value.
+///
+/// Topics are always 32 bytes. Addresses and smaller types are left-padded.
+///
+/// # Errors
+///
+/// Returns an error if the value cannot be parsed as the given Solidity type.
+fn encode_topic_value(value: &str, solidity_type: &str) -> eyre::Result<B256> {
+    match solidity_type {
+        "address" => {
+            let addr: Address = value.parse().wrap_err("invalid address")?;
+            Ok(B256::left_padding_from(addr.as_slice()))
+        }
+        "bool" => match value {
+            "true" | "1" => {
+                let mut bytes = [0u8; 32];
+                bytes[31] = 1;
+                Ok(B256::from(bytes))
+            }
+            "false" | "0" => Ok(B256::ZERO),
+            _ => Err(eyre::eyre!("invalid bool value '{value}'")),
+        },
+        s if s.starts_with("bytes") && s.len() > 5 => {
+            // bytesN (fixed-size): parse as raw 32-byte hex (only bytes32 fully supported)
+            value.parse::<B256>().wrap_err("invalid bytes value")
+        }
+        s if s.starts_with("uint") || s.starts_with("int") => {
+            // Integer types: parse as U256, convert to B256
+            let n: alloy_primitives::U256 = if value.starts_with("0x") || value.starts_with("0X")
+            {
+                value.parse().wrap_err("invalid hex integer")?
+            } else {
+                alloy_primitives::U256::from_str_radix(value, 10)
+                    .map_err(|e| eyre::eyre!("invalid integer: {e}"))?
+            };
+            Ok(n.into())
+        }
+        _ => {
+            // Fallback: try parsing as raw B256 hex
+            value.parse::<B256>().wrap_err("unsupported type for topic filter; provide raw 32-byte hex")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1680,6 +2182,368 @@ to = ["0xdAC17F958D2ee523a2206206994597C13D831ec7"]
             return Err(eyre::eyre!("expected error for duplicate table name"));
         };
         assert!(err.to_string().contains("duplicate table name"));
+        Ok(())
+    }
+
+    // ── Topic filter tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_event_with_filter() -> eyre::Result<()> {
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[contracts.events.filter]
+to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        let filter = config.contracts[0].events[0].filter.as_ref();
+        assert!(filter.is_some());
+        let filter = filter.ok_or_else(|| eyre::eyre!("expected filter"))?;
+        assert_eq!(filter.len(), 1);
+        assert!(filter.contains_key("to"));
+        assert_eq!(filter["to"].len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_topic_filters_valid() -> eyre::Result<()> {
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
+            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi.events.get("Transfer")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
+
+        let mut filter = HashMap::new();
+        filter.insert(
+            "to".to_string(),
+            vec!["0x28C6c06298d514Db089934071355E5743bf21d60".to_string()],
+        );
+
+        let filters = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer")?;
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].topic_index, 2); // 'to' is the second indexed param
+        assert_eq!(filters[0].values.len(), 1);
+
+        // Verify B256 encoding: address left-padded to 32 bytes
+        let expected_addr: Address = "0x28C6c06298d514Db089934071355E5743bf21d60".parse()
+            .map_err(|e| eyre::eyre!("{e}"))?;
+        let expected = B256::left_padding_from(expected_addr.as_slice());
+        assert!(filters[0].values.contains(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_topic_filters_unknown_param_errors() -> eyre::Result<()> {
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
+            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi.events.get("Transfer")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
+
+        let mut filter = HashMap::new();
+        filter.insert("nonexistent".to_string(), vec!["0x00".to_string()]);
+
+        let Err(err) = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer") else {
+            return Err(eyre::eyre!("expected error for unknown param"));
+        };
+        assert!(format!("{err:?}").contains("not found"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_topic_filters_non_indexed_errors() -> eyre::Result<()> {
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
+            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi.events.get("Transfer")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
+
+        // 'value' is NOT indexed in Transfer(address indexed from, address indexed to, uint256 value)
+        let mut filter = HashMap::new();
+        filter.insert(
+            "value".to_string(),
+            vec!["100".to_string()],
+        );
+
+        let Err(err) = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer") else {
+            return Err(eyre::eyre!("expected error for non-indexed param"));
+        };
+        assert!(format!("{err:?}").contains("not indexed"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_topic_filters_multi_value() -> eyre::Result<()> {
+        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
+            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi.events.get("Transfer")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
+
+        let mut filter = HashMap::new();
+        filter.insert(
+            "from".to_string(),
+            vec![
+                "0x28C6c06298d514Db089934071355E5743bf21d60".to_string(),
+                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+            ],
+        );
+
+        let filters = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer")?;
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].topic_index, 1); // 'from' is the first indexed param
+        assert_eq!(filters[0].values.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_topic_value_address() -> eyre::Result<()> {
+        let addr = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let b256 = encode_topic_value(addr, "address")?;
+        // First 12 bytes should be zero (left-padding)
+        assert!(b256.as_slice()[..12].iter().all(|&b| b == 0));
+        // Last 20 bytes should be the address
+        let parsed: Address = addr.parse().map_err(|e| eyre::eyre!("{e}"))?;
+        assert_eq!(&b256.as_slice()[12..], parsed.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn encode_topic_value_uint() -> eyre::Result<()> {
+        let b256 = encode_topic_value("100", "uint256")?;
+        assert_eq!(b256.as_slice()[31], 100);
+        assert!(b256.as_slice()[..31].iter().all(|&b| b == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn encode_topic_value_bool() -> eyre::Result<()> {
+        let t = encode_topic_value("true", "bool")?;
+        assert_eq!(t.as_slice()[31], 1);
+        assert!(t.as_slice()[..31].iter().all(|&b| b == 0));
+
+        let f = encode_topic_value("false", "bool")?;
+        assert_eq!(f, B256::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_with_topic_filters() -> eyre::Result<()> {
+        let dir = setup_test_dir("topic_filter", ERC20_ABI)?;
+
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[contracts.events.filter]
+to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        let resolved = resolve_config(&config, &dir)?;
+
+        // Check resolved event has topic filters
+        assert_eq!(resolved.resolved_events.len(), 1);
+        assert_eq!(resolved.resolved_events[0].topic_filters.len(), 1);
+        assert_eq!(resolved.resolved_events[0].topic_filters[0].topic_index, 2);
+
+        // Check ContractConfig also has topic filters
+        let contract = &resolved.index_config.contracts[0];
+        assert_eq!(contract.topic_filters.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    // ── Call trace tests ──────────────────────────────────────────────
+
+    /// ABI with both Transfer event and transfer function.
+    const ERC20_WITH_FN_ABI: &str = r#"[
+        {"anonymous":false,"inputs":[
+            {"indexed":true,"internalType":"address","name":"from","type":"address"},
+            {"indexed":true,"internalType":"address","name":"to","type":"address"},
+            {"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}
+        ],"name":"Transfer","type":"event"},
+        {"inputs":[
+            {"internalType":"address","name":"to","type":"address"},
+            {"internalType":"uint256","name":"value","type":"uint256"}
+        ],"name":"transfer","outputs":[
+            {"internalType":"bool","name":"","type":"bool"}
+        ],"stateMutability":"nonpayable","type":"function"}
+    ]"#;
+
+    #[test]
+    fn parse_toml_with_calls() -> eyre::Result<()> {
+        let toml_str = r#"
+            [[contracts]]
+            name = "USDC"
+            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            abi = "abis/erc20.json"
+            start_block = 21_000_000
+
+            [[contracts.events]]
+            name = "Transfer"
+            table = "usdc_transfers"
+
+            [[contracts.calls]]
+            name = "transfer"
+            table = "usdc_transfer_calls"
+            context = ["block_timestamp"]
+            columns = [
+              { param = "to",    name = "to_address", type = "text" },
+              { param = "value", name = "value",      type = "numeric" },
+            ]
+        "#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        assert_eq!(config.contracts[0].calls.len(), 1);
+        assert_eq!(config.contracts[0].calls[0].name, "transfer");
+        assert_eq!(config.contracts[0].calls[0].table, "usdc_transfer_calls");
+        Ok(())
+    }
+
+    #[test]
+    fn call_create_table_sql() {
+        let sql = generate_call_create_table_sql(
+            "swap_calls",
+            &[],
+            &[
+                ResolvedColumn {
+                    column_name: "recipient".to_string(),
+                    param_name: "recipient".to_string(),
+                    pg_type: "text".to_string(),
+                },
+            ],
+            false,
+        );
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS swap_calls"));
+        assert!(sql.contains("block_number BIGINT NOT NULL"));
+        assert!(sql.contains("tx_hash BYTEA NOT NULL"));
+        assert!(sql.contains("tx_index INTEGER NOT NULL"));
+        assert!(sql.contains("recipient text NOT NULL"));
+        assert!(sql.contains("UNIQUE (block_number, tx_index)"));
+        // No log_index for calls
+        assert!(!sql.contains("log_index"));
+    }
+
+    #[test]
+    fn call_create_table_factory_child() {
+        let sql = generate_call_create_table_sql(
+            "pool_calls",
+            &[],
+            &[],
+            true,
+        );
+        assert!(sql.contains("contract_address TEXT NOT NULL"));
+        assert!(sql.contains("UNIQUE (contract_address, block_number, tx_index)"));
+    }
+
+    #[test]
+    fn call_insert_sql() {
+        let sql = generate_call_insert_sql(
+            "swap_calls",
+            &[ContextField::BlockTimestamp],
+            &[
+                ResolvedColumn {
+                    column_name: "recipient".to_string(),
+                    param_name: "recipient".to_string(),
+                    pg_type: "text".to_string(),
+                },
+            ],
+            false,
+        );
+        // Standard 3 params + 1 context + 1 user = 5
+        assert!(sql.contains("$1"));
+        assert!(sql.contains("$5"));
+        assert!(sql.contains("block_number, tx_hash, tx_index, block_timestamp, recipient"));
+    }
+
+    #[test]
+    fn call_table_name_collision_with_events() -> eyre::Result<()> {
+        let dir = setup_test_dir("call_collision", ERC20_WITH_FN_ABI)?;
+
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[[contracts.calls]]
+name = "transfer"
+table = "usdc_transfers"
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        let Err(err) = resolve_config(&config, &dir) else {
+            return Err(eyre::eyre!("expected error for duplicate call/event table names"));
+        };
+        assert!(err.to_string().contains("duplicate table name"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_with_calls() -> eyre::Result<()> {
+        let dir = setup_test_dir("call_resolve", ERC20_WITH_FN_ABI)?;
+
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[[contracts.calls]]
+name = "transfer"
+table = "usdc_transfer_calls"
+context = ["block_timestamp", "tx_from"]
+columns = [
+  { param = "to",    name = "to_address", type = "text" },
+  { param = "value", name = "value",      type = "numeric" },
+]
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        let resolved = resolve_config(&config, &dir)?;
+
+        // Check resolved calls
+        assert_eq!(resolved.calls.len(), 1);
+        let call = &resolved.calls[0];
+        assert_eq!(call.function_name, "transfer");
+        assert_eq!(call.contract_name, "USDC");
+        assert_eq!(call.table_name, "usdc_transfer_calls");
+        assert_eq!(call.context_fields.len(), 2);
+        assert_eq!(call.columns.len(), 2);
+        assert_eq!(call.columns[0].column_name, "to_address");
+        assert_eq!(call.columns[1].column_name, "value");
+        assert!(!call.is_factory_child);
+
+        // Check ContractConfig has the function selector
+        let contract = &resolved.index_config.contracts[0];
+        assert_eq!(contract.functions.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

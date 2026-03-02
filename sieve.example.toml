@@ -24,6 +24,23 @@ name = "Approval"
 table = "usdc_approvals"
 # columns omitted → auto-generated from ABI params with default type mapping
 
+# Optional indexed parameter filters — only index approvals for a specific spender
+# [contracts.events.filter]
+# spender = ["0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"]  # Uniswap Universal Router
+
+# ── Function call indexing ──────────────────────────────────────────
+# Uncomment to index top-level function calls by decoding tx.input calldata.
+# Only successful (non-reverted) calls are stored. Internal calls are not captured.
+#
+# [[contracts.calls]]
+# name = "transfer"
+# table = "usdc_transfer_calls"
+# context = ["block_timestamp", "tx_from"]
+# columns = [
+#   { param = "to",    name = "to_address", type = "text" },
+#   { param = "value", name = "value",      type = "numeric" },
+# ]
+
 # ── Native ETH transfer indexing ─────────────────────────────────────
 
 [[transfers]]

@@ -8,7 +8,7 @@
 //! SQL dynamically from resolved event definitions.
 
 use crate::decode::{DecodedEvent, DecodedParam};
-use crate::toml_config::{ContextField, ResolvedEvent, ResolvedTransfer};
+use crate::toml_config::{ContextField, ResolvedCall, ResolvedEvent, ResolvedTransfer};
 use crate::types::BlockNumber;
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, U256};
@@ -517,6 +517,202 @@ impl TransferRegistry {
     }
 }
 
+// ── Function call types ───────────────────────────────────────────────
+
+/// A decoded function call extracted from a transaction.
+pub struct DecodedCall {
+    /// Function name from the ABI.
+    pub function_name: String,
+    /// Contract name.
+    pub contract_name: String,
+    /// Decoded input parameters.
+    pub params: Vec<DecodedParam>,
+    /// Block number containing this call.
+    pub block_number: BlockNumber,
+    /// Transaction hash.
+    pub tx_hash: B256,
+    /// Index of the transaction within the block.
+    pub tx_index: usize,
+    /// Contract address (relevant for factory children).
+    pub contract_address: Address,
+}
+
+/// Handler for a single function call table, driven by TOML config.
+#[derive(Debug)]
+pub struct CallHandler {
+    resolved: ResolvedCall,
+    /// Pre-computed handler name for logging.
+    handler_name: String,
+    /// Whether this handler is for a factory-child contract.
+    is_factory_child: bool,
+}
+
+impl CallHandler {
+    /// Create a new call handler from a resolved call definition.
+    #[must_use]
+    pub fn new(resolved: ResolvedCall) -> Self {
+        let handler_name = format!("{}:{}", resolved.contract_name, resolved.function_name);
+        let is_factory_child = resolved.is_factory_child;
+        Self {
+            resolved,
+            handler_name,
+            is_factory_child,
+        }
+    }
+
+    /// Return `true` if this handler processes calls for the given contract
+    /// and function name.
+    #[must_use]
+    pub fn matches(&self, contract_name: &str, function_name: &str) -> bool {
+        self.resolved.contract_name == contract_name
+            && self.resolved.function_name == function_name
+    }
+
+    /// Store a decoded call into the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the INSERT query fails.
+    pub async fn handle(
+        &self,
+        call: &DecodedCall,
+        context: &EventContext,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        debug!(
+            handler = %self.handler_name,
+            block = call.block_number.as_u64(),
+            table = %self.resolved.table_name,
+            "inserting function call"
+        );
+
+        let mut query = sqlx::query(&self.resolved.insert_sql);
+
+        // Bind standard columns: block_number, tx_hash, tx_index
+        query = query
+            .bind(call.block_number.as_u64() as i64)
+            .bind(call.tx_hash.as_slice())
+            .bind(call.tx_index as i32);
+
+        // Bind contract_address for factory children ($4)
+        if self.is_factory_child {
+            query = query.bind(Address::to_checksum(&call.contract_address, None));
+        }
+
+        // Bind context columns
+        for cf in &self.resolved.context_fields {
+            query = bind_context_field(query, *cf, context);
+        }
+
+        // Bind user-defined columns
+        for col in &self.resolved.columns {
+            let param = call
+                .params
+                .iter()
+                .find(|p| p.name == col.param_name)
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "param '{}' not found in decoded call {}.{}",
+                        col.param_name,
+                        call.contract_name,
+                        call.function_name
+                    )
+                })?;
+
+            query = bind_dyn_value(query, &param.value, &col.pg_type)?;
+        }
+
+        query
+            .execute(&mut **tx)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to insert into '{}' for {}.{}",
+                    self.resolved.table_name, call.contract_name, call.function_name
+                )
+            })?;
+
+        Ok(())
+    }
+
+    /// Roll back this handler's data above `block_number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DELETE query fails.
+    pub async fn rollback(
+        &self,
+        block_number: BlockNumber,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        sqlx::query(&self.resolved.rollback_sql)
+            .bind(block_number.as_u64() as i64)
+            .execute(&mut **tx)
+            .await
+            .wrap_err_with(|| format!("failed to rollback '{}'", self.resolved.table_name))?;
+        Ok(())
+    }
+}
+
+/// Registry of function call handlers.
+#[derive(Debug)]
+pub struct CallRegistry {
+    handlers: Vec<CallHandler>,
+}
+
+impl CallRegistry {
+    /// Create a new registry with the given handlers.
+    #[must_use]
+    pub const fn new(handlers: Vec<CallHandler>) -> Self {
+        Self { handlers }
+    }
+
+    /// Dispatch a decoded call to all matching handlers.
+    ///
+    /// Returns the number of handlers that processed the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any matching handler fails.
+    pub async fn dispatch(
+        &self,
+        call: &DecodedCall,
+        context: &EventContext,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<u64> {
+        let mut count = 0u64;
+        for handler in &self.handlers {
+            if handler.matches(&call.contract_name, &call.function_name) {
+                handler.handle(call, context, tx).await?;
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Roll back all handlers' data above `block_number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any handler's rollback fails.
+    pub async fn rollback_all(
+        &self,
+        block_number: BlockNumber,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        for handler in &self.handlers {
+            handler.rollback(block_number, tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the registry has no handlers.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
+}
+
 // ── USDC Transfer handler (test-only) ─────────────────────────────────
 
 #[cfg(test)]
@@ -734,6 +930,7 @@ mod tests {
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
             is_factory_child: false,
+            topic_filters: vec![],
         };
 
         let handler = ConfigDrivenHandler::new(resolved);

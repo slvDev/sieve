@@ -5,7 +5,7 @@
 //! preflight, then syncs the gap. Sleeps near the tip to avoid busy-looping.
 
 use crate::db::{self, Database};
-use crate::handler::{HandlerRegistry, TransferRegistry};
+use crate::handler::{CallRegistry, HandlerRegistry, TransferRegistry};
 use crate::metrics::SieveMetrics;
 use crate::p2p::{discover_head_p2p, PeerPool};
 use crate::sync::reorg;
@@ -30,6 +30,7 @@ struct FollowContext {
     stop_rx: watch::Receiver<bool>,
     factories: Arc<Vec<ResolvedFactory>>,
     transfer_handlers: Arc<TransferRegistry>,
+    call_handlers: Arc<CallRegistry>,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -56,6 +57,7 @@ pub async fn run_follow_loop(
         stop_rx: ctx.stop_rx,
         factories: ctx.factories,
         transfer_handlers: ctx.transfer_handlers,
+        call_handlers: ctx.call_handlers,
     };
 
     while !is_stopped(&fctx.stop_rx) {
@@ -132,6 +134,7 @@ async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
         &ctx.pool,
         &ctx.handlers,
         &ctx.transfer_handlers,
+        &ctx.call_handlers,
         &ctx.config,
         baseline,
         ctx.start_block.as_u64(),
@@ -162,6 +165,7 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
         stop_rx: ctx.stop_rx.clone(),
         factories: Arc::clone(&ctx.factories),
         transfer_handlers: Arc::clone(&ctx.transfer_handlers),
+        call_handlers: Arc::clone(&ctx.call_handlers),
     };
 
     let outcome = run_sync(
@@ -190,6 +194,7 @@ async fn should_rollback_reorg(
     pool: &PeerPool,
     handlers: &HandlerRegistry,
     transfer_handlers: &TransferRegistry,
+    call_handlers: &CallRegistry,
     config: &crate::config::IndexConfig,
     baseline: u64,
     start_block: u64,
@@ -207,7 +212,7 @@ async fn should_rollback_reorg(
             Ok(true)
         }
         ReorgCheck::ReorgDetected { anchor } => {
-            execute_rollback(db, handlers, transfer_handlers, config, &anchor, baseline).await?;
+            execute_rollback(db, handlers, transfer_handlers, call_handlers, config, &anchor, baseline).await?;
             Ok(true)
         }
     }
@@ -218,6 +223,7 @@ async fn execute_rollback(
     db: &Database,
     handlers: &HandlerRegistry,
     transfer_handlers: &TransferRegistry,
+    call_handlers: &CallRegistry,
     config: &crate::config::IndexConfig,
     anchor: &crate::p2p::NetworkPeer,
     baseline: u64,
@@ -230,6 +236,7 @@ async fn execute_rollback(
     let mut tx = db.begin().await?;
     handlers.rollback_all(ancestor_block, &mut tx).await?;
     transfer_handlers.rollback_all(ancestor_block, &mut tx).await?;
+    call_handlers.rollback_all(ancestor_block, &mut tx).await?;
     db::rollback_factory_children(&mut tx, ancestor_block, config).await?;
     db::rollback_to(&mut tx, ancestor_block).await?;
     tx.commit().await?;

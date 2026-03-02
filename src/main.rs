@@ -62,6 +62,7 @@ async fn main() -> eyre::Result<()> {
     let db = Arc::new(db::Database::connect(&startup.database_url).await?);
     db::create_user_tables(&db, &startup.resolved_events).await?;
     db::create_transfer_tables(&db, &startup.resolved_transfers).await?;
+    db::create_call_tables(&db, &startup.resolved_calls).await?;
 
     let index_config = Arc::new(startup.index_config);
     info!(contracts = index_config.contracts.len(), "loaded index config");
@@ -91,6 +92,7 @@ async fn main() -> eyre::Result<()> {
         let schema = api::build_schema(
             &startup.resolved_events,
             &startup.resolved_transfers,
+            &startup.resolved_calls,
             db.pool().clone(),
         )?;
         let api_stop = stop_rx.clone();
@@ -110,6 +112,14 @@ async fn main() -> eyre::Result<()> {
         .collect();
     let transfer_handlers = Arc::new(handler::TransferRegistry::new(transfer_handlers));
 
+    // Build call handlers from resolved calls
+    let call_handlers: Vec<handler::CallHandler> = startup
+        .resolved_calls
+        .into_iter()
+        .map(handler::CallHandler::new)
+        .collect();
+    let call_handlers = Arc::new(handler::CallRegistry::new(call_handlers));
+
     // P2P
     let session = p2p::connect_mainnet_peers().await?;
     info!(peers = session.pool.len(), "connected to ethereum p2p network");
@@ -123,6 +133,7 @@ async fn main() -> eyre::Result<()> {
         stop_rx,
         factories,
         transfer_handlers,
+        call_handlers,
     };
 
     run_indexer(&cli, startup.start_block, ctx).await
@@ -136,6 +147,7 @@ struct StartupConfig {
     resolved_events: Vec<toml_config::ResolvedEvent>,
     factories: Vec<toml_config::ResolvedFactory>,
     resolved_transfers: Vec<toml_config::ResolvedTransfer>,
+    resolved_calls: Vec<toml_config::ResolvedCall>,
     start_block: BlockNumber,
 }
 
@@ -196,6 +208,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         resolved_events: resolved.resolved_events,
         factories: resolved.factories,
         resolved_transfers: resolved.transfers,
+        resolved_calls: resolved.calls,
         start_block,
     })
 }
@@ -233,6 +246,7 @@ async fn run_indexer(
             events_decoded = outcome.events_decoded,
             events_stored = outcome.events_stored,
             transfers_stored = outcome.transfers_stored,
+            calls_stored = outcome.calls_stored,
             elapsed_ms = outcome.elapsed.as_millis() as u64,
             "sync complete"
         );

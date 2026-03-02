@@ -4,10 +4,14 @@
 //! we parse the ABI, compute event selectors (topic0), and build a fast
 //! address→contract lookup for use during filtering.
 
-use alloy_json_abi::{Event, JsonAbi};
-use alloy_primitives::{Address, B256};
+use crate::toml_config::TopicFilter;
+use alloy_json_abi::{Event, Function, JsonAbi};
+use alloy_primitives::{Address, FixedBytes, B256};
 use std::collections::HashMap;
 use std::sync::RwLock;
+
+/// 4-byte function selector.
+pub type Selector = FixedBytes<4>;
 
 /// Configuration for a single contract to index.
 #[derive(Debug)]
@@ -18,6 +22,11 @@ pub struct ContractConfig {
     pub address: Address,
     /// Events to index, keyed by selector (topic0).
     pub events: HashMap<B256, Event>,
+    /// Indexed parameter filters per event selector (topic0).
+    /// If an event has no filters, it won't have an entry here.
+    pub topic_filters: HashMap<B256, Vec<TopicFilter>>,
+    /// Functions to index, keyed by 4-byte selector.
+    pub functions: HashMap<Selector, Function>,
 }
 
 impl ContractConfig {
@@ -66,6 +75,8 @@ impl ContractConfig {
             name: name.into(),
             address,
             events,
+            topic_filters: HashMap::new(),
+            functions: HashMap::new(),
         })
     }
 }
