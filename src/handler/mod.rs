@@ -476,6 +476,15 @@ impl TransferRegistry {
         self.handlers.iter().map(|h| h.resolved.table_name.as_str())
     }
 
+    /// Return table names of handlers that match this transfer's address filters.
+    pub fn matched_table_names<'a>(&'a self, transfer: &NativeTransfer) -> Vec<&'a str> {
+        self.handlers
+            .iter()
+            .filter(|h| h.matches_filter(transfer))
+            .map(|h| h.resolved.table_name.as_str())
+            .collect()
+    }
+
     /// Dispatch a native transfer to all matching handlers.
     ///
     /// Returns the number of handlers that processed the transfer.
@@ -677,6 +686,15 @@ impl CallRegistry {
         self.handlers
             .iter()
             .map(|h| (h.resolved.table_name.as_str(), h.resolved.function_name.as_str()))
+    }
+
+    /// Return table names of handlers that match this call's contract and function name.
+    pub fn matched_table_names(&self, contract_name: &str, function_name: &str) -> Vec<&str> {
+        self.handlers
+            .iter()
+            .filter(|h| h.matches(contract_name, function_name))
+            .map(|h| h.resolved.table_name.as_str())
+            .collect()
     }
 
     /// Dispatch a decoded call to all matching handlers.

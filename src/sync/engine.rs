@@ -102,6 +102,8 @@ struct ProcessOutcome {
     calls: u64,
     /// Per-table insert counts: `(table_name, event_name, count)`.
     table_counts: Vec<(String, String, u64)>,
+    /// Per-event decoded payloads for streaming (only populated when streams are configured).
+    event_payloads: Vec<crate::stream::EventPayload>,
 }
 
 // Compile-time size assertions for hot types (reth pattern).
@@ -642,6 +644,7 @@ async fn consume_payloads(
         transfer_handlers: &transfer_handlers,
         call_handlers: &call_handlers,
         event_table_map: &event_table_map,
+        has_streams: stream_dispatcher.is_some(),
     };
 
     while let Some(payload) = payload_rx.recv().await {
@@ -672,7 +675,7 @@ async fn consume_payloads(
                     metrics.indexed_block.set(block_num as i64);
                 }
 
-                // Dispatch stream notification
+                // Dispatch stream notifications
                 if let Some(ref dispatcher) = stream_dispatcher {
                     if !outcome.table_counts.is_empty() {
                         let tables = outcome
@@ -690,6 +693,9 @@ async fn consume_payloads(
                             },
                             is_backfill,
                         );
+                    }
+                    if !outcome.event_payloads.is_empty() {
+                        dispatcher.send_events(outcome.event_payloads, is_backfill);
                     }
                 }
             }
@@ -731,6 +737,8 @@ struct ProcessContext<'a> {
     call_handlers: &'a CallRegistry,
     /// Maps `"contract:event"` key → `(table_name, event_name)`.
     event_table_map: &'a HashMap<String, (String, String)>,
+    /// Whether streams are configured (gates event payload collection).
+    has_streams: bool,
 }
 
 /// Compute the sealed hash for a block header.
@@ -755,7 +763,7 @@ async fn commit_block_bookkeeping(
 
 /// An empty `ProcessOutcome` for early returns.
 const fn empty_outcome(matched: u64) -> ProcessOutcome {
-    ProcessOutcome { matched, decoded: 0, stored: 0, transfers: 0, calls: 0, table_counts: vec![] }
+    ProcessOutcome { matched, decoded: 0, stored: 0, transfers: 0, calls: 0, table_counts: vec![], event_payloads: vec![] }
 }
 
 /// Filter, decode, and store events from a single block payload.
@@ -799,6 +807,7 @@ async fn process_block_events(
     let mut tx = ctx.db.begin().await?;
     let mut stored_count = 0u64;
     let mut table_counts: HashMap<String, (String, u64)> = HashMap::new();
+    let mut event_payloads: Vec<crate::stream::EventPayload> = Vec::new();
 
     db::store_block_hash(&mut tx, block_number, block_hash.as_slice()).await?;
 
@@ -810,16 +819,21 @@ async fn process_block_events(
         let dispatched = ctx.handlers.dispatch(event, &event_context, &mut tx).await?;
         if dispatched > 0 {
             track_event_table(ctx.event_table_map, event, dispatched, &mut table_counts);
+            if ctx.has_streams {
+                collect_event_payload(ctx.event_table_map, event, &mut event_payloads);
+            }
         }
         stored_count = stored_count.saturating_add(dispatched);
     }
 
     let transfer_count = store_transfers(
         payload, block_hash, &mut sender_cache, ctx, &mut tx, &mut table_counts,
+        &mut event_payloads,
     ).await?;
 
     let call_count = store_calls(
         payload, block_hash, &mut sender_cache, ctx, &mut tx, &mut table_counts,
+        &mut event_payloads,
     ).await?;
 
     db::update_checkpoint(&mut tx, block_number).await?;
@@ -839,6 +853,7 @@ async fn process_block_events(
         transfers: transfer_count,
         calls: call_count,
         table_counts,
+        event_payloads,
     })
 }
 
@@ -858,7 +873,99 @@ fn track_event_table(
     }
 }
 
-/// Scan and store native transfers, updating table_counts.
+/// Build an [`EventPayload`] from a decoded event and push it to the payloads vec.
+fn collect_event_payload(
+    event_table_map: &HashMap<String, (String, String)>,
+    event: &decode::DecodedEvent,
+    payloads: &mut Vec<crate::stream::EventPayload>,
+) {
+    let key = format!("{}:{}", event.contract_name, event.event_name);
+    let Some((table, event_name)) = event_table_map.get(&key) else {
+        return;
+    };
+
+    let mut data = serde_json::Map::new();
+    for param in event.indexed.iter().chain(event.body.iter()) {
+        data.insert(
+            param.name.clone(),
+            crate::stream::dyn_sol_to_json(&param.value),
+        );
+    }
+
+    payloads.push(crate::stream::EventPayload {
+        table: table.clone(),
+        event: event_name.clone(),
+        contract: Address::to_checksum(&event.contract_address, None),
+        block_number: event.block_number.as_u64(),
+        block_timestamp: event.block_timestamp,
+        tx_hash: format!("{:#x}", event.tx_hash),
+        log_index: Some(event.log_index),
+        tx_index: event.tx_index,
+        data,
+    });
+}
+
+/// Build an [`EventPayload`] from a native transfer.
+fn build_transfer_payload(
+    transfer: &NativeTransfer,
+    context: &EventContext,
+    table_name: &str,
+) -> crate::stream::EventPayload {
+    let mut data = serde_json::Map::new();
+    data.insert(
+        "from_address".to_string(),
+        serde_json::Value::String(Address::to_checksum(&transfer.from_address, None)),
+    );
+    data.insert(
+        "to_address".to_string(),
+        serde_json::Value::String(Address::to_checksum(&transfer.to_address, None)),
+    );
+    data.insert(
+        "value".to_string(),
+        serde_json::Value::String(transfer.value.to_string()),
+    );
+
+    crate::stream::EventPayload {
+        table: table_name.to_string(),
+        event: "transfer".to_string(),
+        contract: "0x0000000000000000000000000000000000000000".to_string(),
+        block_number: transfer.block_number.as_u64(),
+        block_timestamp: context.block_timestamp,
+        tx_hash: format!("{:#x}", transfer.tx_hash),
+        log_index: None,
+        tx_index: transfer.tx_index,
+        data,
+    }
+}
+
+/// Build an [`EventPayload`] from a decoded function call.
+fn build_call_payload(
+    call: &DecodedCall,
+    context: &EventContext,
+    table_name: &str,
+) -> crate::stream::EventPayload {
+    let mut data = serde_json::Map::new();
+    for param in &call.params {
+        data.insert(
+            param.name.clone(),
+            crate::stream::dyn_sol_to_json(&param.value),
+        );
+    }
+
+    crate::stream::EventPayload {
+        table: table_name.to_string(),
+        event: call.function_name.clone(),
+        contract: Address::to_checksum(&call.contract_address, None),
+        block_number: call.block_number.as_u64(),
+        block_timestamp: context.block_timestamp,
+        tx_hash: format!("{:#x}", call.tx_hash),
+        log_index: None,
+        tx_index: call.tx_index,
+        data,
+    }
+}
+
+/// Scan and store native transfers, updating table_counts and event_payloads.
 async fn store_transfers(
     payload: &BlockPayload,
     block_hash: B256,
@@ -866,12 +973,14 @@ async fn store_transfers(
     ctx: &ProcessContext<'_>,
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table_counts: &mut HashMap<String, (String, u64)>,
+    event_payloads: &mut Vec<crate::stream::EventPayload>,
 ) -> eyre::Result<u64> {
     if ctx.transfer_handlers.is_empty() {
         return Ok(0);
     }
     let count = scan_and_store_transfers(
         payload, block_hash, sender_cache, ctx.transfer_handlers, tx,
+        ctx.has_streams, event_payloads,
     ).await?;
     if count > 0 {
         for table_name in ctx.transfer_handlers.table_names() {
@@ -884,7 +993,7 @@ async fn store_transfers(
     Ok(count)
 }
 
-/// Scan and store function calls, updating table_counts.
+/// Scan and store function calls, updating table_counts and event_payloads.
 async fn store_calls(
     payload: &BlockPayload,
     block_hash: B256,
@@ -892,12 +1001,14 @@ async fn store_calls(
     ctx: &ProcessContext<'_>,
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table_counts: &mut HashMap<String, (String, u64)>,
+    event_payloads: &mut Vec<crate::stream::EventPayload>,
 ) -> eyre::Result<u64> {
     if ctx.call_handlers.is_empty() {
         return Ok(0);
     }
     let count = scan_and_store_calls(
         payload, block_hash, sender_cache, ctx.config, ctx.call_handlers, tx,
+        ctx.has_streams, event_payloads,
     ).await?;
     if count > 0 {
         for (table_name, fn_name) in ctx.call_handlers.table_entries() {
@@ -1017,6 +1128,8 @@ async fn scan_and_store_transfers(
     sender_cache: &mut HashMap<usize, Address>,
     transfer_handlers: &TransferRegistry,
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    has_streams: bool,
+    event_payloads: &mut Vec<crate::stream::EventPayload>,
 ) -> eyre::Result<u64> {
     let block_number = BlockNumber::new(payload.header().number);
     let receipts = payload.receipts();
@@ -1069,6 +1182,11 @@ async fn scan_and_store_transfers(
         };
 
         let dispatched = transfer_handlers.dispatch(&transfer, &context, tx).await?;
+        if dispatched > 0 && has_streams {
+            for table_name in transfer_handlers.matched_table_names(&transfer) {
+                event_payloads.push(build_transfer_payload(&transfer, &context, table_name));
+            }
+        }
         count = count.saturating_add(dispatched);
     }
 
@@ -1083,6 +1201,7 @@ async fn scan_and_store_transfers(
 /// the calldata arguments.
 ///
 /// Returns the number of calls stored.
+#[expect(clippy::too_many_arguments, reason = "streaming adds has_streams + event_payloads")]
 async fn scan_and_store_calls(
     payload: &BlockPayload,
     block_hash: B256,
@@ -1090,6 +1209,8 @@ async fn scan_and_store_calls(
     config: &IndexConfig,
     call_handlers: &CallRegistry,
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    has_streams: bool,
+    event_payloads: &mut Vec<crate::stream::EventPayload>,
 ) -> eyre::Result<u64> {
     let block_number = BlockNumber::new(payload.header().number);
     let receipts = payload.receipts();
@@ -1185,6 +1306,14 @@ async fn scan_and_store_calls(
         };
 
         let dispatched = call_handlers.dispatch(&decoded_call, &context, tx).await?;
+        if dispatched > 0 && has_streams {
+            for table_name in call_handlers.matched_table_names(
+                &decoded_call.contract_name,
+                &decoded_call.function_name,
+            ) {
+                event_payloads.push(build_call_payload(&decoded_call, &context, table_name));
+            }
+        }
         count = count.saturating_add(dispatched);
     }
 

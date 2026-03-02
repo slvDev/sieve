@@ -377,10 +377,31 @@ fn build_stream_sinks(
 ) -> Vec<(Box<dyn stream::StreamSink>, bool)> {
     streams
         .iter()
-        .map(|s| {
-            let sink: Box<dyn stream::StreamSink> =
-                Box::new(stream::webhook::WebhookSink::new(s.name.clone(), s.url.clone()));
-            (sink, s.backfill)
+        .filter_map(|s| {
+            let sink: Box<dyn stream::StreamSink> = match s.stream_type.as_str() {
+                "webhook" => {
+                    Box::new(stream::webhook::WebhookSink::new(s.name.clone(), s.url.clone()))
+                }
+                "rabbitmq" => {
+                    let exchange = s.exchange.clone().unwrap_or_default();
+                    let default_routing_key = ["{table}", ".", "{event}"].concat();
+                    let routing_key = s
+                        .routing_key
+                        .clone()
+                        .unwrap_or(default_routing_key);
+                    Box::new(stream::rabbitmq::RabbitMqSink::new(
+                        s.name.clone(),
+                        s.url.clone(),
+                        exchange,
+                        routing_key,
+                    ))
+                }
+                other => {
+                    warn!(stream = %s.name, stream_type = %other, "unknown stream type, skipping");
+                    return None;
+                }
+            };
+            Some((sink, s.backfill))
         })
         .collect()
 }

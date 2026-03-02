@@ -1,12 +1,15 @@
-//! Streaming notifications — post-commit block notifications to external sinks.
+//! Streaming notifications — post-commit block and event notifications to external sinks.
 //!
 //! The [`StreamDispatcher`] runs a background task that receives
-//! [`BlockNotification`]s via a bounded channel and delivers them to all
-//! configured [`StreamSink`] implementations. Delivery is best-effort:
-//! failures are logged but never propagate.
+//! [`BlockNotification`]s and [`EventPayload`]s via a bounded channel and
+//! delivers them to all configured [`StreamSink`] implementations. Delivery
+//! is best-effort: failures are logged but never propagate.
 
+pub mod rabbitmq;
 pub mod webhook;
 
+use alloy_dyn_abi::DynSolValue;
+use alloy_primitives::Address;
 use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -34,20 +37,82 @@ pub struct TableNotification {
     pub count: u64,
 }
 
-/// Trait for notification sinks (webhook, future: Kafka, AMQP, etc.).
+/// Per-event payload for streaming decoded event data to sinks.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventPayload {
+    /// Postgres table name this event is stored in.
+    pub table: String,
+    /// Event/function/transfer name.
+    pub event: String,
+    /// Contract address (checksummed hex).
+    pub contract: String,
+    /// Block number where the event occurred.
+    pub block_number: u64,
+    /// Block timestamp (seconds since epoch).
+    pub block_timestamp: u64,
+    /// Transaction hash (0x-prefixed hex).
+    pub tx_hash: String,
+    /// Log index within the receipt (None for calls/transfers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<usize>,
+    /// Transaction index within the block.
+    pub tx_index: usize,
+    /// Decoded event parameters as key-value pairs.
+    pub data: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Convert a [`DynSolValue`] to a [`serde_json::Value`].
+///
+/// Mirrors the conversion logic in `handler::bind_dyn_value` but targets
+/// JSON instead of PostgreSQL parameters.
+#[must_use]
+pub fn dyn_sol_to_json(value: &DynSolValue) -> serde_json::Value {
+    match value {
+        DynSolValue::Address(addr) => {
+            serde_json::Value::String(Address::to_checksum(addr, None))
+        }
+        DynSolValue::Bool(b) => serde_json::Value::Bool(*b),
+        DynSolValue::Uint(val, _) => serde_json::Value::String(val.to_string()),
+        DynSolValue::Int(val, _) => serde_json::Value::String(val.to_string()),
+        DynSolValue::String(s) => serde_json::Value::String(s.clone()),
+        DynSolValue::Bytes(b) => {
+            serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(b)))
+        }
+        DynSolValue::FixedBytes(word, size) => {
+            let bytes = &word.as_slice()[..(*size)];
+            serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(bytes)))
+        }
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
+
+/// Trait for notification sinks (webhook, RabbitMQ, etc.).
 #[async_trait]
 pub trait StreamSink: Send + Sync {
     /// Human-readable name for logging.
     fn name(&self) -> &str;
 
-    /// Deliver a block notification. Implementations must not propagate errors.
+    /// Deliver a block-level notification. Implementations must not propagate errors.
     async fn notify(&self, notification: &BlockNotification);
+
+    /// Deliver per-event payloads. Default is a no-op (e.g. webhooks ignore this).
+    async fn notify_events(&self, _events: &[EventPayload]) {
+        // Default no-op — sinks that don't care about individual events do nothing.
+    }
 }
 
 /// Message sent through the dispatcher channel.
-struct DispatchMessage {
-    notification: BlockNotification,
-    is_backfill: bool,
+enum DispatchMessage {
+    /// Block-level summary notification (table names + row counts).
+    Block {
+        notification: BlockNotification,
+        is_backfill: bool,
+    },
+    /// Per-event decoded payloads.
+    Events {
+        payloads: Vec<EventPayload>,
+        is_backfill: bool,
+    },
 }
 
 /// A sink entry: the sink itself plus its backfill preference.
@@ -82,13 +147,25 @@ impl StreamDispatcher {
         Self { tx }
     }
 
-    /// Send a notification to the dispatcher. Drops silently if the channel is full.
+    /// Send a block-level notification to the dispatcher.
+    /// Drops silently if the channel is full.
     pub fn send(&self, notification: BlockNotification, is_backfill: bool) {
-        if let Err(e) = self.tx.try_send(DispatchMessage {
+        if let Err(e) = self.tx.try_send(DispatchMessage::Block {
             notification,
             is_backfill,
         }) {
-            warn!(error = %e, "stream dispatcher channel full, dropping notification");
+            warn!(error = %e, "stream dispatcher channel full, dropping block notification");
+        }
+    }
+
+    /// Send per-event payloads to the dispatcher.
+    /// Drops silently if the channel is full.
+    pub fn send_events(&self, payloads: Vec<EventPayload>, is_backfill: bool) {
+        if let Err(e) = self.tx.try_send(DispatchMessage::Events {
+            payloads,
+            is_backfill,
+        }) {
+            warn!(error = %e, "stream dispatcher channel full, dropping event payloads");
         }
     }
 }
@@ -104,21 +181,53 @@ async fn run_delivery(
         .collect();
 
     while let Some(msg) = rx.recv().await {
-        for entry in &entries {
-            // Skip sinks that opted out of backfill notifications
-            if msg.is_backfill && !entry.backfill {
-                debug!(
-                    sink = entry.sink.name(),
-                    block = msg.notification.block_number,
-                    "skipping backfill notification"
-                );
-                continue;
+        match msg {
+            DispatchMessage::Block {
+                notification,
+                is_backfill,
+            } => {
+                deliver_block(&entries, &notification, is_backfill).await;
             }
-            entry.sink.notify(&msg.notification).await;
+            DispatchMessage::Events {
+                payloads,
+                is_backfill,
+            } => {
+                deliver_events(&entries, &payloads, is_backfill).await;
+            }
         }
     }
 
     debug!("stream delivery loop exiting");
+}
+
+/// Deliver a block notification to all eligible sinks.
+async fn deliver_block(entries: &[SinkEntry], notification: &BlockNotification, is_backfill: bool) {
+    for entry in entries {
+        if is_backfill && !entry.backfill {
+            debug!(
+                sink = entry.sink.name(),
+                block = notification.block_number,
+                "skipping backfill block notification"
+            );
+            continue;
+        }
+        entry.sink.notify(notification).await;
+    }
+}
+
+/// Deliver event payloads to all eligible sinks.
+async fn deliver_events(entries: &[SinkEntry], payloads: &[EventPayload], is_backfill: bool) {
+    for entry in entries {
+        if is_backfill && !entry.backfill {
+            debug!(
+                sink = entry.sink.name(),
+                events = payloads.len(),
+                "skipping backfill event payloads"
+            );
+            continue;
+        }
+        entry.sink.notify_events(payloads).await;
+    }
 }
 
 #[cfg(test)]
@@ -127,10 +236,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     struct MockSink {
         name: String,
-        call_count: Arc<AtomicU64>,
+        block_count: Arc<AtomicU64>,
+        event_payloads: Arc<Mutex<Vec<EventPayload>>>,
     }
 
     #[async_trait]
@@ -140,7 +251,12 @@ mod tests {
         }
 
         async fn notify(&self, _notification: &BlockNotification) {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
+            self.block_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn notify_events(&self, events: &[EventPayload]) {
+            let mut payloads = self.event_payloads.lock().await;
+            payloads.extend(events.iter().cloned());
         }
     }
 
@@ -188,12 +304,100 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn event_payload_serializes_to_json() -> eyre::Result<()> {
+        let mut data = serde_json::Map::new();
+        data.insert("from".to_string(), serde_json::Value::String("0xABC".to_string()));
+        data.insert("value".to_string(), serde_json::Value::String("1000000".to_string()));
+
+        let payload = EventPayload {
+            table: "usdc_transfers".to_string(),
+            event: "Transfer".to_string(),
+            contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+            block_number: 22_000_000,
+            block_timestamp: 1_700_000_000,
+            tx_hash: "0xabc123".to_string(),
+            log_index: Some(5),
+            tx_index: 3,
+            data,
+        };
+
+        let json = serde_json::to_string(&payload)?;
+        assert!(json.contains("\"table\":\"usdc_transfers\""));
+        assert!(json.contains("\"event\":\"Transfer\""));
+        assert!(json.contains("\"block_number\":22000000"));
+        assert!(json.contains("\"log_index\":5"));
+        assert!(json.contains("\"from\":\"0xABC\""));
+        Ok(())
+    }
+
+    #[test]
+    fn event_payload_omits_null_log_index() -> eyre::Result<()> {
+        let payload = EventPayload {
+            table: "eth_transfers".to_string(),
+            event: "transfer".to_string(),
+            contract: "0x0000000000000000000000000000000000000000".to_string(),
+            block_number: 1,
+            block_timestamp: 100,
+            tx_hash: "0x00".to_string(),
+            log_index: None,
+            tx_index: 0,
+            data: serde_json::Map::new(),
+        };
+
+        let json = serde_json::to_string(&payload)?;
+        assert!(!json.contains("log_index"));
+        Ok(())
+    }
+
+    #[test]
+    fn dyn_sol_to_json_address() {
+        let addr = alloy_primitives::address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let val = dyn_sol_to_json(&DynSolValue::Address(addr));
+        assert_eq!(val, serde_json::Value::String("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string()));
+    }
+
+    #[test]
+    fn dyn_sol_to_json_uint() {
+        let val = dyn_sol_to_json(&DynSolValue::Uint(
+            alloy_primitives::U256::from(1_000_000u64),
+            256,
+        ));
+        assert_eq!(val, serde_json::Value::String("1000000".to_string()));
+    }
+
+    #[test]
+    fn dyn_sol_to_json_bool() {
+        let val = dyn_sol_to_json(&DynSolValue::Bool(true));
+        assert_eq!(val, serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn dyn_sol_to_json_bytes() {
+        let val = dyn_sol_to_json(&DynSolValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(val, serde_json::Value::String("0xdeadbeef".to_string()));
+    }
+
+    #[test]
+    fn dyn_sol_to_json_string() {
+        let val = dyn_sol_to_json(&DynSolValue::String("hello".to_string()));
+        assert_eq!(val, serde_json::Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn dyn_sol_to_json_fixed_bytes() {
+        let word = alloy_primitives::B256::from_slice(&[0xab; 32]);
+        let val = dyn_sol_to_json(&DynSolValue::FixedBytes(word, 4));
+        assert_eq!(val, serde_json::Value::String("0xabababab".to_string()));
+    }
+
     #[tokio::test]
     async fn dispatcher_delivers_to_sink() {
         let count = Arc::new(AtomicU64::new(0));
         let sink: Box<dyn StreamSink> = Box::new(MockSink {
             name: "test".to_string(),
-            call_count: Arc::clone(&count),
+            block_count: Arc::clone(&count),
+            event_payloads: Arc::new(Mutex::new(vec![])),
         });
 
         let dispatcher = StreamDispatcher::new(vec![(sink, true)], 16);
@@ -220,7 +424,8 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         let sink: Box<dyn StreamSink> = Box::new(MockSink {
             name: "no_backfill".to_string(),
-            call_count: Arc::clone(&count),
+            block_count: Arc::clone(&count),
+            event_payloads: Arc::new(Mutex::new(vec![])),
         });
 
         // backfill=false means skip during backfill
@@ -286,7 +491,8 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         let sink: Box<dyn StreamSink> = Box::new(MockSink {
             name: "drain_test".to_string(),
-            call_count: Arc::clone(&count),
+            block_count: Arc::clone(&count),
+            event_payloads: Arc::new(Mutex::new(vec![])),
         });
 
         let dispatcher = StreamDispatcher::new(vec![(sink, true)], 64);
@@ -306,6 +512,78 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         assert_eq!(count.load(Ordering::Relaxed), 5);
+        drop(dispatcher);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_delivers_events_to_sink() {
+        let event_payloads = Arc::new(Mutex::new(vec![]));
+        let sink: Box<dyn StreamSink> = Box::new(MockSink {
+            name: "event_test".to_string(),
+            block_count: Arc::new(AtomicU64::new(0)),
+            event_payloads: Arc::clone(&event_payloads),
+        });
+
+        let dispatcher = StreamDispatcher::new(vec![(sink, true)], 16);
+
+        let mut data = serde_json::Map::new();
+        data.insert("from".to_string(), serde_json::Value::String("0xABC".to_string()));
+
+        dispatcher.send_events(
+            vec![EventPayload {
+                table: "usdc_transfers".to_string(),
+                event: "Transfer".to_string(),
+                contract: "0xA0b8".to_string(),
+                block_number: 100,
+                block_timestamp: 1000,
+                tx_hash: "0xabc".to_string(),
+                log_index: Some(0),
+                tx_index: 1,
+                data,
+            }],
+            false,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let received = event_payloads.lock().await;
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].table, "usdc_transfers");
+        assert_eq!(received[0].event, "Transfer");
+        drop(dispatcher);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_skips_backfill_events() {
+        let event_payloads = Arc::new(Mutex::new(vec![]));
+        let sink: Box<dyn StreamSink> = Box::new(MockSink {
+            name: "no_backfill_events".to_string(),
+            block_count: Arc::new(AtomicU64::new(0)),
+            event_payloads: Arc::clone(&event_payloads),
+        });
+
+        // backfill=false
+        let dispatcher = StreamDispatcher::new(vec![(sink, false)], 16);
+
+        dispatcher.send_events(
+            vec![EventPayload {
+                table: "test".to_string(),
+                event: "Test".to_string(),
+                contract: "0x00".to_string(),
+                block_number: 1,
+                block_timestamp: 100,
+                tx_hash: "0x00".to_string(),
+                log_index: None,
+                tx_index: 0,
+                data: serde_json::Map::new(),
+            }],
+            true, // backfill
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let received = event_payloads.lock().await;
+        assert!(received.is_empty());
         drop(dispatcher);
     }
 }

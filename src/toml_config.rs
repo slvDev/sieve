@@ -142,14 +142,19 @@ pub struct TomlTransferFilter {
 pub struct TomlStream {
     /// Unique name for this stream.
     pub name: String,
-    /// Stream type (currently only "webhook").
+    /// Stream type ("webhook" or "rabbitmq").
     #[serde(rename = "type")]
     pub stream_type: String,
-    /// Webhook URL (required for type = "webhook").
+    /// URL (webhook endpoint or AMQP connection string).
     pub url: Option<String>,
     /// Whether to send notifications during historical backfill. Defaults to true.
     #[serde(default = "default_true")]
     pub backfill: bool,
+    /// AMQP exchange name (required for type = "rabbitmq").
+    pub exchange: Option<String>,
+    /// Routing key template for RabbitMQ. Supports `{table}` and `{event}` placeholders.
+    /// Defaults to `"{table}.{event}"`.
+    pub routing_key: Option<String>,
 }
 
 const fn default_true() -> bool {
@@ -258,10 +263,16 @@ pub struct ResolvedConfig {
 pub struct ResolvedStream {
     /// Unique name for this stream.
     pub name: String,
-    /// Webhook URL.
+    /// Stream type ("webhook" or "rabbitmq").
+    pub stream_type: String,
+    /// URL (webhook endpoint or AMQP connection string).
     pub url: String,
     /// Whether to send notifications during historical backfill.
     pub backfill: bool,
+    /// AMQP exchange name (only for rabbitmq).
+    pub exchange: Option<String>,
+    /// Routing key template (only for rabbitmq).
+    pub routing_key: Option<String>,
 }
 
 /// A resolved factory contract definition.
@@ -845,27 +856,60 @@ fn resolve_streams(streams: &[TomlStream]) -> eyre::Result<Vec<ResolvedStream>> 
             return Err(eyre::eyre!("duplicate stream name '{}'", s.name));
         }
 
-        if s.stream_type != "webhook" {
-            return Err(eyre::eyre!(
-                "unknown stream type '{}' for stream '{}' (supported: webhook)",
-                s.stream_type,
-                s.name
-            ));
-        }
-
         let url = s.url.as_deref().unwrap_or("").to_string();
-        if url.is_empty() {
-            return Err(eyre::eyre!(
-                "stream '{}' of type 'webhook' requires a 'url'",
-                s.name
-            ));
-        }
 
-        resolved.push(ResolvedStream {
-            name: s.name.clone(),
-            url,
-            backfill: s.backfill,
-        });
+        match s.stream_type.as_str() {
+            "webhook" => {
+                if url.is_empty() {
+                    return Err(eyre::eyre!(
+                        "stream '{}' of type 'webhook' requires a 'url'",
+                        s.name
+                    ));
+                }
+                resolved.push(ResolvedStream {
+                    name: s.name.clone(),
+                    stream_type: "webhook".to_string(),
+                    url,
+                    backfill: s.backfill,
+                    exchange: None,
+                    routing_key: None,
+                });
+            }
+            "rabbitmq" => {
+                if url.is_empty() {
+                    return Err(eyre::eyre!(
+                        "stream '{}' of type 'rabbitmq' requires a 'url'",
+                        s.name
+                    ));
+                }
+                let exchange = s.exchange.as_deref().unwrap_or("").to_string();
+                if exchange.is_empty() {
+                    return Err(eyre::eyre!(
+                        "stream '{}' of type 'rabbitmq' requires an 'exchange'",
+                        s.name
+                    ));
+                }
+                let default_routing_key = ["{table}", ".", "{event}"].concat();
+                let routing_key = s
+                    .routing_key
+                    .clone()
+                    .unwrap_or(default_routing_key);
+                resolved.push(ResolvedStream {
+                    name: s.name.clone(),
+                    stream_type: "rabbitmq".to_string(),
+                    url,
+                    backfill: s.backfill,
+                    exchange: Some(exchange),
+                    routing_key: Some(routing_key),
+                });
+            }
+            other => {
+                return Err(eyre::eyre!(
+                    "unknown stream type '{other}' for stream '{}' (supported: webhook, rabbitmq)",
+                    s.name
+                ));
+            }
+        }
     }
 
     Ok(resolved)
@@ -2705,12 +2749,16 @@ url = "http://localhost:8080/events"
                 stream_type: "webhook".to_string(),
                 url: Some("http://a".to_string()),
                 backfill: true,
+                exchange: None,
+                routing_key: None,
             },
             TomlStream {
                 name: "dup".to_string(),
                 stream_type: "webhook".to_string(),
                 url: Some("http://b".to_string()),
                 backfill: true,
+                exchange: None,
+                routing_key: None,
             },
         ];
         let result = resolve_streams(&streams);
@@ -2725,6 +2773,8 @@ url = "http://localhost:8080/events"
             stream_type: "kafka".to_string(),
             url: Some("http://a".to_string()),
             backfill: true,
+            exchange: None,
+            routing_key: None,
         }];
         let result = resolve_streams(&streams);
         assert!(result.is_err());
@@ -2738,6 +2788,8 @@ url = "http://localhost:8080/events"
             stream_type: "webhook".to_string(),
             url: None,
             backfill: true,
+            exchange: None,
+            routing_key: None,
         }];
         let result = resolve_streams(&streams);
         assert!(result.is_err());
@@ -2751,6 +2803,8 @@ url = "http://localhost:8080/events"
             stream_type: "webhook".to_string(),
             url: Some(String::new()),
             backfill: true,
+            exchange: None,
+            routing_key: None,
         }];
         let result = resolve_streams(&streams);
         assert!(result.is_err());
@@ -2765,20 +2819,90 @@ url = "http://localhost:8080/events"
                 stream_type: "webhook".to_string(),
                 url: Some("http://localhost:8080".to_string()),
                 backfill: true,
+                exchange: None,
+                routing_key: None,
             },
             TomlStream {
                 name: "hook_b".to_string(),
                 stream_type: "webhook".to_string(),
                 url: Some("http://localhost:9090".to_string()),
                 backfill: false,
+                exchange: None,
+                routing_key: None,
             },
         ];
         let resolved = resolve_streams(&streams)?;
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "hook_a");
+        assert_eq!(resolved[0].stream_type, "webhook");
         assert!(resolved[0].backfill);
         assert_eq!(resolved[1].name, "hook_b");
         assert!(!resolved[1].backfill);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_rabbitmq_stream() -> eyre::Result<()> {
+        let rk = ["events.", "{table}"].concat();
+        let streams = vec![TomlStream {
+            name: "mq".to_string(),
+            stream_type: "rabbitmq".to_string(),
+            url: Some("amqp://guest:guest@localhost:5672/%2f".to_string()),
+            backfill: false,
+            exchange: Some("sieve_events".to_string()),
+            routing_key: Some(rk.clone()),
+        }];
+        let resolved = resolve_streams(&streams)?;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].stream_type, "rabbitmq");
+        assert_eq!(resolved[0].exchange.as_deref(), Some("sieve_events"));
+        assert_eq!(resolved[0].routing_key.as_deref(), Some(rk.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_rabbitmq_missing_exchange() {
+        let streams = vec![TomlStream {
+            name: "mq".to_string(),
+            stream_type: "rabbitmq".to_string(),
+            url: Some("amqp://localhost".to_string()),
+            backfill: true,
+            exchange: None,
+            routing_key: None,
+        }];
+        let result = resolve_streams(&streams);
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("requires an 'exchange'"));
+    }
+
+    #[test]
+    fn resolve_rabbitmq_missing_url() {
+        let streams = vec![TomlStream {
+            name: "mq".to_string(),
+            stream_type: "rabbitmq".to_string(),
+            url: None,
+            backfill: true,
+            exchange: Some("ex".to_string()),
+            routing_key: None,
+        }];
+        let result = resolve_streams(&streams);
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("requires a 'url'"));
+    }
+
+    #[test]
+    fn resolve_rabbitmq_default_routing_key() -> eyre::Result<()> {
+        let streams = vec![TomlStream {
+            name: "mq".to_string(),
+            stream_type: "rabbitmq".to_string(),
+            url: Some("amqp://localhost".to_string()),
+            backfill: true,
+            exchange: Some("ex".to_string()),
+            routing_key: None,
+        }];
+        let resolved = resolve_streams(&streams)?;
+        let expected = ["{table}", ".", "{event}"].concat();
+        assert_eq!(resolved[0].routing_key.as_deref(), Some(expected.as_str()));
         Ok(())
     }
 }

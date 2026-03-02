@@ -59,6 +59,9 @@ base64 = "0.22"
 # HTTP client (webhook notifications)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# AMQP client (RabbitMQ streaming)
+lapin = "2.5"
+
 # Misc
 eyre = "0.6"
 parking_lot = "0.12"

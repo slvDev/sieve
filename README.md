@@ -213,6 +213,46 @@ Payload:
 - `backfill = false` skips notifications during historical sync
 - Multiple webhooks supported — each gets every block notification
 
+### RabbitMQ Streaming
+
+Publish each decoded event, function call, or transfer as an individual JSON message to a RabbitMQ exchange. Each message includes the full decoded data, routed by a configurable routing key.
+
+```toml
+[[streams]]
+name = "rabbitmq_events"
+type = "rabbitmq"
+url = "amqp://guest:guest@rabbitmq:5672/%2f"
+exchange = "sieve_events"
+routing_key = "{table}.{event}"   # optional, this is the default
+backfill = false
+```
+
+Message payload (one per event):
+
+```json
+{
+  "table": "usdc_transfers",
+  "event": "Transfer",
+  "contract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  "block_number": 22516100,
+  "block_timestamp": 1700000000,
+  "tx_hash": "0xabc...",
+  "log_index": 5,
+  "tx_index": 42,
+  "data": {
+    "from": "0xDead...beef",
+    "to": "0xCafe...babe",
+    "value": "1000000"
+  }
+}
+```
+
+- Routing key supports `{table}` and `{event}` placeholders (e.g. `usdc_transfers.Transfer`)
+- Exchange is declared as `topic` type, durable
+- Messages are persistent (delivery mode 2) with `application/json` content type
+- Lazy connection — connects on first event, reconnects automatically on failure
+- Webhook and RabbitMQ streams can be used together — both fire after each block commit
+
 ## GraphQL API
 
 Sieve auto-generates a full GraphQL schema from your TOML config. Every table gets:
@@ -319,7 +359,7 @@ Ethereum P2P Network
        └────────────────┴──────────────────┘
                         │
                         ▼
-                  PostgreSQL ──────► Webhooks
+                  PostgreSQL ──────► Webhooks / RabbitMQ
                         │
                         ▼
                   GraphQL API
