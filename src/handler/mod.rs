@@ -471,11 +471,6 @@ impl TransferRegistry {
         Self { handlers }
     }
 
-    /// Iterate over the table names of all registered transfer handlers.
-    pub fn table_names(&self) -> impl Iterator<Item = &str> {
-        self.handlers.iter().map(|h| h.resolved.table_name.as_str())
-    }
-
     /// Return table names of handlers that match this transfer's address filters.
     pub fn matched_table_names<'a>(&'a self, transfer: &NativeTransfer) -> Vec<&'a str> {
         self.handlers
@@ -679,13 +674,6 @@ impl CallRegistry {
     #[must_use]
     pub const fn new(handlers: Vec<CallHandler>) -> Self {
         Self { handlers }
-    }
-
-    /// Iterate over `(table_name, function_name)` for all registered call handlers.
-    pub fn table_entries(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.handlers
-            .iter()
-            .map(|h| (h.resolved.table_name.as_str(), h.resolved.function_name.as_str()))
     }
 
     /// Return table names of handlers that match this call's contract and function name.
@@ -1212,5 +1200,119 @@ mod tests {
             vec![address!("2222222222222222222222222222222222222222")],
         );
         assert!(!handler.matches_filter(&transfer));
+    }
+
+    // ── matched_table_names tests ────────────────────────────────────
+
+    fn make_transfer_handler_named(
+        table_name: &str,
+        filter_from: Vec<Address>,
+        filter_to: Vec<Address>,
+    ) -> TransferHandler {
+        use crate::toml_config::ResolvedTransfer;
+
+        TransferHandler::new(ResolvedTransfer {
+            name: table_name.to_string(),
+            table_name: table_name.to_string(),
+            context_fields: vec![],
+            create_table_sql: String::new(),
+            create_indexes_sql: vec![],
+            insert_sql: String::new(),
+            rollback_sql: String::new(),
+            filter_from,
+            filter_to,
+        })
+    }
+
+    #[test]
+    fn transfer_matched_table_names_returns_only_matching() {
+        let transfer = make_test_transfer();
+
+        // handler_a: matches (from filter matches)
+        let handler_a = make_transfer_handler_named(
+            "binance_outflows",
+            vec![address!("28C6c06298d514Db089934071355E5743bf21d60")],
+            vec![],
+        );
+        // handler_b: does NOT match (from filter doesn't match)
+        let handler_b = make_transfer_handler_named(
+            "other_outflows",
+            vec![address!("1111111111111111111111111111111111111111")],
+            vec![],
+        );
+        // handler_c: matches (no filters = match all)
+        let handler_c = make_transfer_handler_named(
+            "all_transfers",
+            vec![],
+            vec![],
+        );
+
+        let registry = TransferRegistry::new(vec![handler_a, handler_b, handler_c]);
+        let matched = registry.matched_table_names(&transfer);
+
+        assert_eq!(matched.len(), 2);
+        assert!(matched.contains(&"binance_outflows"));
+        assert!(!matched.contains(&"other_outflows"));
+        assert!(matched.contains(&"all_transfers"));
+    }
+
+    // ── CallRegistry matched_table_names tests ───────────────────────
+
+    fn make_call_handler(
+        table_name: &str,
+        contract_name: &str,
+        function_name: &str,
+    ) -> CallHandler {
+        use crate::toml_config::ResolvedCall;
+
+        CallHandler::new(ResolvedCall {
+            function_name: function_name.to_string(),
+            contract_name: contract_name.to_string(),
+            table_name: table_name.to_string(),
+            context_fields: vec![],
+            columns: vec![],
+            insert_sql: String::new(),
+            create_table_sql: String::new(),
+            create_indexes_sql: vec![],
+            rollback_sql: String::new(),
+            is_factory_child: false,
+        })
+    }
+
+    #[test]
+    fn call_matched_table_names_returns_only_matching() {
+        let handler_a = make_call_handler("usdc_transfers", "USDC", "transfer");
+        let handler_b = make_call_handler("usdc_approvals", "USDC", "approve");
+        let handler_c = make_call_handler("dai_transfers", "DAI", "transfer");
+
+        let registry = CallRegistry::new(vec![handler_a, handler_b, handler_c]);
+
+        // Only USDC:transfer matches
+        let matched = registry.matched_table_names("USDC", "transfer");
+        assert_eq!(matched, vec!["usdc_transfers"]);
+
+        // Only USDC:approve matches
+        let matched = registry.matched_table_names("USDC", "approve");
+        assert_eq!(matched, vec!["usdc_approvals"]);
+
+        // No match
+        let matched = registry.matched_table_names("WETH", "deposit");
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn call_matched_table_names_multiple_handlers_same_function() {
+        // Two handlers for same contract+function (different tables)
+        let handler_a = make_call_handler("usdc_transfers_v1", "USDC", "transfer");
+        let handler_b = make_call_handler("usdc_transfers_v2", "USDC", "transfer");
+        let handler_c = make_call_handler("dai_transfers", "DAI", "transfer");
+
+        let registry = CallRegistry::new(vec![handler_a, handler_b, handler_c]);
+        let matched = registry.matched_table_names("USDC", "transfer");
+
+        assert_eq!(matched.len(), 2);
+        assert!(matched.contains(&"usdc_transfers_v1"));
+        assert!(matched.contains(&"usdc_transfers_v2"));
+        assert!(!matched.contains(&"dai_transfers"));
     }
 }

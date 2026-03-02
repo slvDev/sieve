@@ -980,16 +980,8 @@ async fn store_transfers(
     }
     let count = scan_and_store_transfers(
         payload, block_hash, sender_cache, ctx.transfer_handlers, tx,
-        ctx.has_streams, event_payloads,
+        ctx.has_streams, event_payloads, table_counts,
     ).await?;
-    if count > 0 {
-        for table_name in ctx.transfer_handlers.table_names() {
-            let entry = table_counts
-                .entry(table_name.to_string())
-                .or_insert_with(|| ("transfer".to_string(), 0));
-            entry.1 = entry.1.saturating_add(count);
-        }
-    }
     Ok(count)
 }
 
@@ -1008,16 +1000,8 @@ async fn store_calls(
     }
     let count = scan_and_store_calls(
         payload, block_hash, sender_cache, ctx.config, ctx.call_handlers, tx,
-        ctx.has_streams, event_payloads,
+        ctx.has_streams, event_payloads, table_counts,
     ).await?;
-    if count > 0 {
-        for (table_name, fn_name) in ctx.call_handlers.table_entries() {
-            let entry = table_counts
-                .entry(table_name.to_string())
-                .or_insert_with(|| (fn_name.to_string(), 0));
-            entry.1 = entry.1.saturating_add(count);
-        }
-    }
     Ok(count)
 }
 
@@ -1122,6 +1106,7 @@ async fn register_factory_child(
 /// contract-creation, and reverted transactions. Uses the shared sender cache.
 ///
 /// Returns the number of transfers stored.
+#[expect(clippy::too_many_arguments, reason = "per-table counting adds table_counts")]
 async fn scan_and_store_transfers(
     payload: &BlockPayload,
     block_hash: B256,
@@ -1130,6 +1115,7 @@ async fn scan_and_store_transfers(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     has_streams: bool,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
+    table_counts: &mut HashMap<String, (String, u64)>,
 ) -> eyre::Result<u64> {
     let block_number = BlockNumber::new(payload.header().number);
     let receipts = payload.receipts();
@@ -1182,9 +1168,15 @@ async fn scan_and_store_transfers(
         };
 
         let dispatched = transfer_handlers.dispatch(&transfer, &context, tx).await?;
-        if dispatched > 0 && has_streams {
+        if dispatched > 0 {
             for table_name in transfer_handlers.matched_table_names(&transfer) {
-                event_payloads.push(build_transfer_payload(&transfer, &context, table_name));
+                let entry = table_counts
+                    .entry(table_name.to_string())
+                    .or_insert_with(|| ("transfer".to_string(), 0));
+                entry.1 = entry.1.saturating_add(1);
+                if has_streams {
+                    event_payloads.push(build_transfer_payload(&transfer, &context, table_name));
+                }
             }
         }
         count = count.saturating_add(dispatched);
@@ -1201,7 +1193,7 @@ async fn scan_and_store_transfers(
 /// the calldata arguments.
 ///
 /// Returns the number of calls stored.
-#[expect(clippy::too_many_arguments, reason = "streaming adds has_streams + event_payloads")]
+#[expect(clippy::too_many_arguments, reason = "per-table counting adds table_counts")]
 async fn scan_and_store_calls(
     payload: &BlockPayload,
     block_hash: B256,
@@ -1211,6 +1203,7 @@ async fn scan_and_store_calls(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     has_streams: bool,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
+    table_counts: &mut HashMap<String, (String, u64)>,
 ) -> eyre::Result<u64> {
     let block_number = BlockNumber::new(payload.header().number);
     let receipts = payload.receipts();
@@ -1306,12 +1299,18 @@ async fn scan_and_store_calls(
         };
 
         let dispatched = call_handlers.dispatch(&decoded_call, &context, tx).await?;
-        if dispatched > 0 && has_streams {
+        if dispatched > 0 {
             for table_name in call_handlers.matched_table_names(
                 &decoded_call.contract_name,
                 &decoded_call.function_name,
             ) {
-                event_payloads.push(build_call_payload(&decoded_call, &context, table_name));
+                let entry = table_counts
+                    .entry(table_name.to_string())
+                    .or_insert_with(|| (decoded_call.function_name.clone(), 0));
+                entry.1 = entry.1.saturating_add(1);
+                if has_streams {
+                    event_payloads.push(build_call_payload(&decoded_call, &context, table_name));
+                }
             }
         }
         count = count.saturating_add(dispatched);
