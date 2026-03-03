@@ -18,7 +18,7 @@ use crate::sync::scheduler::{
 };
 use crate::sync::{BlockPayload, SyncContext};
 use crate::toml_config::ResolvedFactory;
-use crate::types::BlockNumber;
+use crate::types::{BlockNumber, TxIndex};
 use crate::{decode, filter};
 
 use alloy_consensus::transaction::SignerRecoverable;
@@ -811,7 +811,7 @@ async fn process_block_events(
 
     db::store_block_hash(&mut tx, block_number, block_hash.as_slice()).await?;
 
-    let mut sender_cache: HashMap<usize, Address> = HashMap::new();
+    let mut sender_cache: HashMap<TxIndex, Address> = HashMap::new();
 
     for event in &decoded_events {
         let event_context =
@@ -900,8 +900,8 @@ fn collect_event_payload(
         block_number: event.block_number.as_u64(),
         block_timestamp: event.block_timestamp,
         tx_hash: format!("{:#x}", event.tx_hash),
-        log_index: Some(event.log_index),
-        tx_index: event.tx_index,
+        log_index: Some(event.log_index.as_u32()),
+        tx_index: event.tx_index.as_u32(),
         tx_from: Some(Address::to_checksum(&context.tx_from, None)),
         data,
     });
@@ -935,7 +935,7 @@ fn build_transfer_payload(
         block_timestamp: context.block_timestamp,
         tx_hash: format!("{:#x}", transfer.tx_hash),
         log_index: None,
-        tx_index: transfer.tx_index,
+        tx_index: transfer.tx_index.as_u32(),
         tx_from: Some(Address::to_checksum(&context.tx_from, None)),
         data,
     }
@@ -963,7 +963,7 @@ fn build_call_payload(
         block_timestamp: context.block_timestamp,
         tx_hash: format!("{:#x}", call.tx_hash),
         log_index: None,
-        tx_index: call.tx_index,
+        tx_index: call.tx_index.as_u32(),
         tx_from: Some(Address::to_checksum(&context.tx_from, None)),
         data,
     }
@@ -973,7 +973,7 @@ fn build_call_payload(
 async fn store_transfers(
     payload: &BlockPayload,
     block_hash: B256,
-    sender_cache: &mut HashMap<usize, Address>,
+    sender_cache: &mut HashMap<TxIndex, Address>,
     ctx: &ProcessContext<'_>,
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table_counts: &mut HashMap<String, (String, u64)>,
@@ -993,7 +993,7 @@ async fn store_transfers(
 async fn store_calls(
     payload: &BlockPayload,
     block_hash: B256,
-    sender_cache: &mut HashMap<usize, Address>,
+    sender_cache: &mut HashMap<TxIndex, Address>,
     ctx: &ProcessContext<'_>,
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table_counts: &mut HashMap<String, (String, u64)>,
@@ -1017,12 +1017,12 @@ fn build_event_context(
     payload: &BlockPayload,
     block_hash: B256,
     event: &decode::DecodedEvent,
-    sender_cache: &mut HashMap<usize, Address>,
+    sender_cache: &mut HashMap<TxIndex, Address>,
 ) -> eyre::Result<EventContext> {
     let tx_signed = payload
         .body()
         .transactions
-        .get(event.tx_index)
+        .get(event.tx_index.as_u32() as usize)
         .ok_or_else(|| {
             eyre::eyre!(
                 "tx_index {} out of range for block {}",
@@ -1114,7 +1114,7 @@ async fn register_factory_child(
 async fn scan_and_store_transfers(
     payload: &BlockPayload,
     block_hash: B256,
-    sender_cache: &mut HashMap<usize, Address>,
+    sender_cache: &mut HashMap<TxIndex, Address>,
     transfer_handlers: &TransferRegistry,
     tx: &mut sqlx::Transaction<'_, Postgres>,
     has_streams: bool,
@@ -1125,14 +1125,15 @@ async fn scan_and_store_transfers(
     let receipts = payload.receipts();
     let mut count = 0u64;
 
-    for (tx_index, tx_signed) in payload.body().transactions.iter().enumerate() {
+    for (tx_idx, tx_signed) in payload.body().transactions.iter().enumerate() {
+        let tx_index = TxIndex::from_usize(tx_idx);
         // Skip zero-value transactions (no ETH transfer)
         if tx_signed.value().is_zero() {
             continue;
         }
 
         // Skip reverted transactions (value not actually transferred)
-        if !receipts.get(tx_index).is_some_and(|r| r.success) {
+        if !receipts.get(tx_idx).is_some_and(|r| r.success) {
             continue;
         }
 
@@ -1201,7 +1202,7 @@ async fn scan_and_store_transfers(
 async fn scan_and_store_calls(
     payload: &BlockPayload,
     block_hash: B256,
-    sender_cache: &mut HashMap<usize, Address>,
+    sender_cache: &mut HashMap<TxIndex, Address>,
     config: &IndexConfig,
     call_handlers: &CallRegistry,
     tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -1213,7 +1214,8 @@ async fn scan_and_store_calls(
     let receipts = payload.receipts();
     let mut count = 0u64;
 
-    for (tx_index, tx_signed) in payload.body().transactions.iter().enumerate() {
+    for (tx_idx, tx_signed) in payload.body().transactions.iter().enumerate() {
+        let tx_index = TxIndex::from_usize(tx_idx);
         let input = tx_signed.input();
 
         // Skip transactions with no calldata or too short for a selector
@@ -1241,7 +1243,7 @@ async fn scan_and_store_calls(
         };
 
         // Skip reverted transactions (call had no effect)
-        if !receipts.get(tx_index).is_some_and(|r| r.success) {
+        if !receipts.get(tx_idx).is_some_and(|r| r.success) {
             continue;
         }
 
@@ -1251,7 +1253,7 @@ async fn scan_and_store_calls(
             Err(e) => {
                 warn!(
                     block = block_number.as_u64(),
-                    tx_index,
+                    tx_index = tx_index.as_u32(),
                     function = %function.name,
                     error = %e,
                     "failed to decode function call"
@@ -1341,7 +1343,7 @@ fn decode_matched_logs(
             Err(e) => {
                 warn!(
                     block = filtered_log.block_number.as_u64(),
-                    tx_index = filtered_log.tx_index,
+                    tx_index = filtered_log.tx_index.as_u32(),
                     error = %e,
                     "failed to decode log"
                 );

@@ -9,7 +9,7 @@
 
 use crate::decode::{DecodedEvent, DecodedParam};
 use crate::toml_config::{ContextField, ResolvedCall, ResolvedEvent, ResolvedTransfer};
-use crate::types::BlockNumber;
+use crate::types::{BlockNumber, TxIndex};
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, U256};
 use async_trait::async_trait;
@@ -214,8 +214,8 @@ impl EventHandler for ConfigDrivenHandler {
         query = query
             .bind(event.block_number.as_u64() as i64)
             .bind(event.tx_hash.as_slice())
-            .bind(event.tx_index as i32)
-            .bind(event.log_index as i32);
+            .bind(event.tx_index.as_i32())
+            .bind(event.log_index.as_i32());
 
         // Bind contract_address for factory children ($5)
         if self.is_factory_child {
@@ -358,7 +358,7 @@ pub struct NativeTransfer {
     /// Transaction hash.
     pub tx_hash: B256,
     /// Index of the transaction within the block.
-    pub tx_index: usize,
+    pub tx_index: TxIndex,
     /// Sender address (recovered from signature).
     pub from_address: Address,
     /// Recipient address.
@@ -416,7 +416,7 @@ impl TransferHandler {
         query = query
             .bind(transfer.block_number.as_u64() as i64)
             .bind(transfer.tx_hash.as_slice())
-            .bind(transfer.tx_index as i32)
+            .bind(transfer.tx_index.as_i32())
             .bind(Address::to_checksum(&transfer.from_address, None))
             .bind(Address::to_checksum(&transfer.to_address, None))
             .bind(transfer.value.to_string());
@@ -541,7 +541,7 @@ pub struct DecodedCall {
     /// Transaction hash.
     pub tx_hash: B256,
     /// Index of the transaction within the block.
-    pub tx_index: usize,
+    pub tx_index: TxIndex,
     /// Contract address (relevant for factory children).
     pub contract_address: Address,
 }
@@ -601,7 +601,7 @@ impl CallHandler {
         query = query
             .bind(call.block_number.as_u64() as i64)
             .bind(call.tx_hash.as_slice())
-            .bind(call.tx_index as i32);
+            .bind(call.tx_index.as_i32());
 
         // Bind contract_address for factory children ($4)
         if self.is_factory_child {
@@ -773,8 +773,8 @@ impl EventHandler for UsdcTransferHandler {
         )
         .bind(event.block_number.as_u64() as i64)
         .bind(event.tx_hash.as_slice())
-        .bind(event.tx_index as i32)
-        .bind(event.log_index as i32)
+        .bind(event.tx_index.as_i32())
+        .bind(event.log_index.as_i32())
         .bind(&from)
         .bind(&to)
         .bind(&value)
@@ -846,7 +846,7 @@ mod tests {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{address, B256, I256, U256};
     use crate::decode::{DecodedEvent, DecodedParam};
-    use crate::types::BlockNumber;
+    use crate::types::{BlockNumber, LogIndex, TxIndex};
 
     fn make_test_event() -> DecodedEvent {
         let from = address!("1111111111111111111111111111111111111111");
@@ -875,8 +875,8 @@ mod tests {
             block_number: BlockNumber::new(21_000_042),
             block_timestamp: 1_700_000_000,
             tx_hash: B256::repeat_byte(0xBB),
-            tx_index: 5,
-            log_index: 3,
+            tx_index: TxIndex::new(5),
+            log_index: LogIndex::new(3),
             contract_address: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         }
     }
@@ -1112,7 +1112,7 @@ mod tests {
         NativeTransfer {
             block_number: BlockNumber::new(21_000_042),
             tx_hash: B256::repeat_byte(0xAA),
-            tx_index: 3,
+            tx_index: TxIndex::new(3),
             from_address: address!("28C6c06298d514Db089934071355E5743bf21d60"),
             to_address: address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
             value: U256::from(1_000_000_000_000_000_000u64),

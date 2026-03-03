@@ -54,9 +54,9 @@ pub struct EventPayload {
     pub tx_hash: String,
     /// Log index within the receipt (None for calls/transfers).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_index: Option<usize>,
+    pub log_index: Option<u32>,
     /// Transaction index within the block.
-    pub tx_index: usize,
+    pub tx_index: u32,
     /// Transaction sender (checksummed hex). None for legacy event payloads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_from: Option<String>,
@@ -328,6 +328,7 @@ mod tests {
 
         let json = serde_json::to_string(&payload)?;
         assert!(json.contains("\"table\":\"usdc_transfers\""));
+        assert!(json.contains("\"tx_index\":3"));
         assert!(json.contains("\"event\":\"Transfer\""));
         assert!(json.contains("\"block_number\":22000000"));
         assert!(json.contains("\"log_index\":5"));

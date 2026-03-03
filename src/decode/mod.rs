@@ -7,7 +7,7 @@
 
 use crate::config::ContractConfig;
 use crate::filter::FilteredLog;
-use crate::types::BlockNumber;
+use crate::types::{BlockNumber, LogIndex, TxIndex};
 use alloy_dyn_abi::{DynSolValue, EventExt};
 use alloy_primitives::{Address, B256};
 use std::fmt;
@@ -45,16 +45,16 @@ pub struct DecodedEvent {
     /// Transaction hash that produced the event.
     pub tx_hash: B256,
     /// Transaction index within the block.
-    pub tx_index: usize,
+    pub tx_index: TxIndex,
     /// Log index within the transaction's receipt.
-    pub log_index: usize,
+    pub log_index: LogIndex,
     /// Contract address that emitted this event.
     pub contract_address: Address,
 }
 
 // Compile-time size assertion for hot type (reth pattern).
 #[cfg(target_pointer_width = "64")]
-const _: [(); 184] = [(); core::mem::size_of::<DecodedEvent>()];
+const _: [(); 176] = [(); core::mem::size_of::<DecodedEvent>()];
 
 impl fmt::Display for DecodedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -139,7 +139,7 @@ pub fn decode_log(log: &FilteredLog, contract: &ContractConfig) -> eyre::Result<
 mod tests {
     use super::*;
     use crate::config::usdc_transfer_config;
-    use crate::types::BlockNumber;
+    use crate::types::{BlockNumber, LogIndex, TxIndex};
     use alloy_primitives::{address, Bytes, Log, LogData, U256};
     use eyre::WrapErr;
 
@@ -178,8 +178,8 @@ mod tests {
             block_number: BlockNumber::new(21_000_042),
             block_timestamp: 1_700_000_000,
             tx_hash: B256::repeat_byte(0xBB),
-            tx_index: 0,
-            log_index: 0,
+            tx_index: TxIndex::new(0),
+            log_index: LogIndex::new(0),
         };
 
         let decoded = decode_log(&filtered, contract)?;
@@ -187,8 +187,8 @@ mod tests {
         assert_eq!(decoded.event_name, "Transfer");
         assert_eq!(decoded.contract_name, "USDC");
         assert_eq!(decoded.block_number, BlockNumber::new(21_000_042));
-        assert_eq!(decoded.tx_index, 0);
-        assert_eq!(decoded.log_index, 0);
+        assert_eq!(decoded.tx_index, TxIndex::new(0));
+        assert_eq!(decoded.log_index, LogIndex::new(0));
 
         // Check indexed params: from, to
         assert_eq!(decoded.indexed.len(), 2);

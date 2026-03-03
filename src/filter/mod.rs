@@ -10,7 +10,7 @@
 use crate::config::IndexConfig;
 use crate::sync::BlockPayload;
 use crate::toml_config::ResolvedFactory;
-use crate::types::BlockNumber;
+use crate::types::{BlockNumber, LogIndex, TxIndex};
 use alloy_dyn_abi::{DynSolValue, EventExt};
 use alloy_primitives::{Address, Log, LogData, B256};
 use std::collections::HashMap;
@@ -27,14 +27,14 @@ pub struct FilteredLog {
     /// Transaction hash that produced this log.
     pub tx_hash: B256,
     /// Transaction index within the block.
-    pub tx_index: usize,
+    pub tx_index: TxIndex,
     /// Log index within the transaction's receipt.
-    pub log_index: usize,
+    pub log_index: LogIndex,
 }
 
 // Compile-time size assertion for hot type (reth pattern).
 #[cfg(target_pointer_width = "64")]
-const _: [(); 144] = [(); core::mem::size_of::<FilteredLog>()];
+const _: [(); 136] = [(); core::mem::size_of::<FilteredLog>()];
 
 /// Filter a block's receipts against the index config.
 ///
@@ -69,13 +69,15 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
 
     let mut matched = Vec::new();
 
-    for (tx_index, (receipt, tx_hash)) in payload
+    for (tx_idx, (receipt, tx_hash)) in payload
         .receipts()
         .iter()
         .zip(tx_hashes.iter())
         .enumerate()
     {
-        for (log_index, log) in receipt.logs.iter().enumerate() {
+        let tx_index = TxIndex::from_usize(tx_idx);
+        for (log_idx, log) in receipt.logs.iter().enumerate() {
+            let log_index = LogIndex::from_usize(log_idx);
             let topics = log.data.topics();
 
             // Need at least topic0 (the event selector)
@@ -230,7 +232,7 @@ mod tests {
     use super::*;
     use crate::config::usdc_transfer_config;
     use crate::test_utils::{build_test_transaction, make_log, make_receipt};
-    use crate::types::BlockNumber;
+    use crate::types::{BlockNumber, LogIndex, TxIndex};
     use alloy_primitives::{address, bytes, Bytes, B256};
     use reth_ethereum_primitives::BlockBody;
     use reth_primitives_traits::Header;
@@ -287,8 +289,8 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].block_number, BlockNumber::new(21_000_042));
         assert_eq!(matched[0].log.address, usdc_addr);
-        assert_eq!(matched[0].tx_index, 0);
-        assert_eq!(matched[0].log_index, 0);
+        assert_eq!(matched[0].tx_index, TxIndex::new(0));
+        assert_eq!(matched[0].log_index, LogIndex::new(0));
         Ok(())
     }
 
@@ -388,7 +390,7 @@ mod tests {
 
         let matched = filter_block(&payload, &config);
         assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].log_index, 0); // Only the first log matched
+        assert_eq!(matched[0].log_index, LogIndex::new(0)); // Only the first log matched
         Ok(())
     }
 
@@ -486,7 +488,7 @@ mod tests {
 
         let matched = filter_block(&payload, &config);
         assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].tx_index, 1); // Only the second tx's log matched
+        assert_eq!(matched[0].tx_index, TxIndex::new(1)); // Only the second tx's log matched
         Ok(())
     }
 
