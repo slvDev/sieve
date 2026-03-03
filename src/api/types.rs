@@ -156,9 +156,9 @@ pub fn build_select_clause(columns: &[ColumnMeta]) -> String {
         .map(|col| {
             let name = &col.name;
             match col.pg_type.as_str() {
-                "bytea" => format!("'0x' || encode({name}, 'hex') AS {name}"),
-                "numeric" | "bigint" | "bigserial" => format!("{name}::text AS {name}"),
-                _ => name.clone(),
+                "bytea" => format!("'0x' || encode(\"{name}\", 'hex') AS \"{name}\""),
+                "numeric" | "bigint" | "bigserial" => format!("\"{name}\"::text AS \"{name}\""),
+                _ => format!("\"{name}\""),
             }
         })
         .collect();
@@ -382,9 +382,9 @@ mod tests {
         let clause = build_select_clause(&meta);
         assert_eq!(
             clause,
-            "id::text AS id, block_number::text AS block_number, \
-             '0x' || encode(tx_hash, 'hex') AS tx_hash, \
-             name, amount::text AS amount, active, idx"
+            "\"id\"::text AS \"id\", \"block_number\"::text AS \"block_number\", \
+             '0x' || encode(\"tx_hash\", 'hex') AS \"tx_hash\", \
+             \"name\", \"amount\"::text AS \"amount\", \"active\", \"idx\""
         );
     }
 

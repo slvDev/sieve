@@ -820,7 +820,7 @@ async fn process_block_events(
         if dispatched > 0 {
             track_event_table(ctx.event_table_map, event, dispatched, &mut table_counts);
             if ctx.has_streams {
-                collect_event_payload(ctx.event_table_map, event, &mut event_payloads);
+                collect_event_payload(ctx.event_table_map, event, &event_context, &mut event_payloads);
             }
         }
         stored_count = stored_count.saturating_add(dispatched);
@@ -877,6 +877,7 @@ fn track_event_table(
 fn collect_event_payload(
     event_table_map: &HashMap<String, (String, String)>,
     event: &decode::DecodedEvent,
+    context: &EventContext,
     payloads: &mut Vec<crate::stream::EventPayload>,
 ) {
     let key = format!("{}:{}", event.contract_name, event.event_name);
@@ -901,6 +902,7 @@ fn collect_event_payload(
         tx_hash: format!("{:#x}", event.tx_hash),
         log_index: Some(event.log_index),
         tx_index: event.tx_index,
+        tx_from: Some(Address::to_checksum(&context.tx_from, None)),
         data,
     });
 }
@@ -934,6 +936,7 @@ fn build_transfer_payload(
         tx_hash: format!("{:#x}", transfer.tx_hash),
         log_index: None,
         tx_index: transfer.tx_index,
+        tx_from: Some(Address::to_checksum(&context.tx_from, None)),
         data,
     }
 }
@@ -961,6 +964,7 @@ fn build_call_payload(
         tx_hash: format!("{:#x}", call.tx_hash),
         log_index: None,
         tx_index: call.tx_index,
+        tx_from: Some(Address::to_checksum(&context.tx_from, None)),
         data,
     }
 }

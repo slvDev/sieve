@@ -63,7 +63,7 @@ columns = [
 ]
 ```
 
-Place your ABI JSON files in the `abis/` directory. If columns are omitted, Sieve auto-generates them from the ABI.
+Place your ABI JSON files in the `abis/` directory. If columns are omitted, Sieve auto-generates them from the ABI with automatic snake_case conversion (e.g. `_troveId` → `trove_id`, `amount0Out` → `amount0_out`).
 
 ### 3. Run
 
@@ -131,6 +131,10 @@ columns = [                 # Optional column mapping (auto-generated if omitted
   { param = "to",    name = "receiver", type = "text" },
   { param = "value", name = "amount",   type = "numeric" },
 ]
+# Column names are auto-converted to snake_case from Solidity camelCase.
+# SQL reserved words (from, to, value) and names that collide with
+# built-in columns (id, block_number, tx_hash, etc.) are handled
+# automatically — reserved words are quoted, collisions are prefixed.
 
 # Optional: filter by indexed parameters (only index specific values)
 [contracts.events.filter]
@@ -239,6 +243,7 @@ Message payload (one per event):
   "tx_hash": "0xabc...",
   "log_index": 5,
   "tx_index": 42,
+  "tx_from": "0x1234...5678",
   "data": {
     "from": "0xDead...beef",
     "to": "0xCafe...babe",

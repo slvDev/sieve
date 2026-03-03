@@ -57,6 +57,9 @@ pub struct EventPayload {
     pub log_index: Option<usize>,
     /// Transaction index within the block.
     pub tx_index: usize,
+    /// Transaction sender (checksummed hex). None for legacy event payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_from: Option<String>,
     /// Decoded event parameters as key-value pairs.
     pub data: serde_json::Map<String, serde_json::Value>,
 }
@@ -319,6 +322,7 @@ mod tests {
             tx_hash: "0xabc123".to_string(),
             log_index: Some(5),
             tx_index: 3,
+            tx_from: Some("0xDEAD".to_string()),
             data,
         };
 
@@ -328,6 +332,7 @@ mod tests {
         assert!(json.contains("\"block_number\":22000000"));
         assert!(json.contains("\"log_index\":5"));
         assert!(json.contains("\"from\":\"0xABC\""));
+        assert!(json.contains("\"tx_from\":\"0xDEAD\""));
         Ok(())
     }
 
@@ -342,11 +347,13 @@ mod tests {
             tx_hash: "0x00".to_string(),
             log_index: None,
             tx_index: 0,
+            tx_from: None,
             data: serde_json::Map::new(),
         };
 
         let json = serde_json::to_string(&payload)?;
         assert!(!json.contains("log_index"));
+        assert!(!json.contains("tx_from"));
         Ok(())
     }
 
@@ -539,6 +546,7 @@ mod tests {
                 tx_hash: "0xabc".to_string(),
                 log_index: Some(0),
                 tx_index: 1,
+                tx_from: None,
                 data,
             }],
             false,
@@ -575,6 +583,7 @@ mod tests {
                 tx_hash: "0x00".to_string(),
                 log_index: None,
                 tx_index: 0,
+                tx_from: None,
                 data: serde_json::Map::new(),
             }],
             true, // backfill

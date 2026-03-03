@@ -136,7 +136,7 @@ pub fn build_select(
         }
     }
 
-    let _ = write!(sql, " ORDER BY {order_by} {order_dir}");
+    let _ = write!(sql, " ORDER BY \"{order_by}\" {order_dir}");
 
     let clamped_limit = limit.clamp(1, MAX_LIMIT);
     let clamped_offset = offset.max(0);
@@ -164,49 +164,49 @@ fn build_condition(column: &str, pg_type: &str, op: FilterOp, param_idx: &mut us
     match op {
         FilterOp::Eq => {
             if is_bytea {
-                format!("{column} = decode(${idx}, 'hex')")
+                format!("\"{column}\" = decode(${idx}, 'hex')")
             } else {
-                format!("{column} = ${idx}")
+                format!("\"{column}\" = ${idx}")
             }
         }
         FilterOp::Ne => {
             if is_bytea {
-                format!("{column} != decode(${idx}, 'hex')")
+                format!("\"{column}\" != decode(${idx}, 'hex')")
             } else {
-                format!("{column} != ${idx}")
+                format!("\"{column}\" != ${idx}")
             }
         }
         FilterOp::Gt => {
             if is_numeric {
-                format!("{column} > ${idx}::{pg_type}")
+                format!("\"{column}\" > ${idx}::{pg_type}")
             } else {
-                format!("{column} > ${idx}")
+                format!("\"{column}\" > ${idx}")
             }
         }
         FilterOp::Gte => {
             if is_numeric {
-                format!("{column} >= ${idx}::{pg_type}")
+                format!("\"{column}\" >= ${idx}::{pg_type}")
             } else {
-                format!("{column} >= ${idx}")
+                format!("\"{column}\" >= ${idx}")
             }
         }
         FilterOp::Lt => {
             if is_numeric {
-                format!("{column} < ${idx}::{pg_type}")
+                format!("\"{column}\" < ${idx}::{pg_type}")
             } else {
-                format!("{column} < ${idx}")
+                format!("\"{column}\" < ${idx}")
             }
         }
         FilterOp::Lte => {
             if is_numeric {
-                format!("{column} <= ${idx}::{pg_type}")
+                format!("\"{column}\" <= ${idx}::{pg_type}")
             } else {
-                format!("{column} <= ${idx}")
+                format!("\"{column}\" <= ${idx}")
             }
         }
-        FilterOp::Contains | FilterOp::StartsWith => format!("{column} LIKE ${idx}"),
+        FilterOp::Contains | FilterOp::StartsWith => format!("\"{column}\" LIKE ${idx}"),
         // In/NotIn are handled by build_single_filter_sql, not build_condition
-        FilterOp::In | FilterOp::NotIn => format!("{column} = ${idx}"),
+        FilterOp::In | FilterOp::NotIn => format!("\"{column}\" = ${idx}"),
     }
 }
 
@@ -384,7 +384,7 @@ pub fn build_condition_in(
         })
         .collect();
 
-    format!("{column} {op} ({})", placeholders.join(", "))
+    format!("\"{column}\" {op} ({})", placeholders.join(", "))
 }
 
 /// Parse a GraphQL filter value list into a `SqlParam::List`.
@@ -571,7 +571,7 @@ pub fn build_cursor_condition(
     };
 
     let sql = format!(
-        "({order_col}, id) {cmp} (${val_idx}{cast}, ${id_idx})"
+        "(\"{order_col}\", id) {cmp} (${val_idx}{cast}, ${id_idx})"
     );
 
     let params = vec![
@@ -628,7 +628,7 @@ pub fn build_select_with_cursor(p: &SelectParams<'_>) -> (String, Vec<SqlParam>)
         sql.push_str(&conditions.join(" AND "));
     }
 
-    let _ = write!(sql, " ORDER BY {} {}, id {}", p.order_by, p.order_dir, p.order_dir);
+    let _ = write!(sql, " ORDER BY \"{}\" {}, id {}", p.order_by, p.order_dir, p.order_dir);
 
     let clamped_limit = p.limit.clamp(1, MAX_LIMIT);
 
@@ -740,7 +740,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT id, block_number FROM usdc_transfers ORDER BY id DESC LIMIT $1 OFFSET $2"
+            "SELECT id, block_number FROM usdc_transfers ORDER BY \"id\" DESC LIMIT $1 OFFSET $2"
         );
         assert_eq!(params.len(), 2);
     }
@@ -764,7 +764,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT * FROM usdc_transfers WHERE block_number >= $1::bigint ORDER BY id DESC LIMIT $2 OFFSET $3"
+            "SELECT * FROM usdc_transfers WHERE \"block_number\" >= $1::bigint ORDER BY \"id\" DESC LIMIT $2 OFFSET $3"
         );
         assert_eq!(params.len(), 3);
     }
@@ -778,14 +778,14 @@ mod tests {
             value: SqlParam::Text("abcd1234".into()),
         });
         let (sql, _) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
-        assert!(sql.contains("tx_hash = decode($1, 'hex')"));
+        assert!(sql.contains("\"tx_hash\" = decode($1, 'hex')"));
     }
 
     #[test]
     fn build_select_clamps_limit() {
         let (sql, params) = build_select("t", "*", None, "id", "DESC", 9999, 0);
         // Should clamp to MAX_LIMIT (1000)
-        assert!(sql.contains("LIMIT $1"));
+        assert!(sql.contains("ORDER BY \"id\" DESC LIMIT $1"));
         if let SqlParam::Int64(limit) = &params[0] {
             assert_eq!(*limit, 1000);
         }
@@ -810,7 +810,7 @@ mod tests {
         let (sql, params) = build_select("t", "*", Some(&wc), "id", "ASC", 50, 10);
         assert_eq!(
             sql,
-            "SELECT * FROM t WHERE (block_number >= $1::bigint AND from_address = $2) ORDER BY id ASC LIMIT $3 OFFSET $4"
+            "SELECT * FROM t WHERE (\"block_number\" >= $1::bigint AND \"from_address\" = $2) ORDER BY \"id\" ASC LIMIT $3 OFFSET $4"
         );
         assert_eq!(params.len(), 4);
     }
@@ -857,7 +857,7 @@ mod tests {
         let mut idx = 1;
         let (sql, params) =
             build_cursor_condition("block_number", "bigint", "DESC", &cursor, &mut idx);
-        assert_eq!(sql, "(block_number, id) < ($1::bigint, $2)");
+        assert_eq!(sql, "(\"block_number\", id) < ($1::bigint, $2)");
         assert_eq!(params.len(), 2);
         assert_eq!(idx, 3);
     }
@@ -871,7 +871,7 @@ mod tests {
         let mut idx = 1;
         let (sql, _) = build_cursor_condition("id", "bigserial", "ASC", &cursor, &mut idx);
         // bigserial maps to bigint at runtime (bigserial is a DDL pseudo-type)
-        assert_eq!(sql, "(id, id) > ($1::bigint, $2)");
+        assert_eq!(sql, "(\"id\", id) > ($1::bigint, $2)");
     }
 
     #[test]
@@ -899,8 +899,8 @@ mod tests {
             offset: 0,
             cursor: Some(&cursor),
         });
-        assert!(sql.contains("(block_number, id) < ($1::bigint, $2)"));
-        assert!(sql.contains("ORDER BY block_number DESC, id DESC"));
+        assert!(sql.contains("(\"block_number\", id) < ($1::bigint, $2)"));
+        assert!(sql.contains("ORDER BY \"block_number\" DESC, id DESC"));
         assert!(sql.contains("LIMIT $3"));
         // No OFFSET when cursor is present
         assert!(!sql.contains("OFFSET"));
@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn build_condition_in_numeric() {
         let sql = build_condition_in("block_number", "bigint", false, 3, 1);
-        assert_eq!(sql, "block_number IN ($1::bigint, $2::bigint, $3::bigint)");
+        assert_eq!(sql, "\"block_number\" IN ($1::bigint, $2::bigint, $3::bigint)");
     }
 
     #[test]
@@ -955,7 +955,7 @@ mod tests {
         let sql = build_condition_in("tx_hash", "bytea", true, 2, 1);
         assert_eq!(
             sql,
-            "tx_hash NOT IN (decode($1, 'hex'), decode($2, 'hex'))"
+            "\"tx_hash\" NOT IN (decode($1, 'hex'), decode($2, 'hex'))"
         );
     }
 
@@ -992,7 +992,7 @@ mod tests {
             ]),
         });
         let (sql, params) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
-        assert!(sql.contains("block_number IN ($1::bigint, $2::bigint, $3::bigint)"));
+        assert!(sql.contains("\"block_number\" IN ($1::bigint, $2::bigint, $3::bigint)"));
         assert_eq!(params.len(), 5); // 3 IN params + limit + offset
     }
 
@@ -1073,7 +1073,7 @@ mod tests {
         let sql = build_where_sql(&wc, &mut params, &mut idx);
         assert_eq!(
             sql,
-            "(block_number >= $1::bigint OR block_number <= $2::bigint)"
+            "(\"block_number\" >= $1::bigint OR \"block_number\" <= $2::bigint)"
         );
         assert_eq!(params.len(), 2);
     }
@@ -1107,7 +1107,7 @@ mod tests {
         let sql = build_where_sql(&wc, &mut params, &mut idx);
         assert_eq!(
             sql,
-            "(from_address = $1 AND (block_number >= $2::bigint OR block_number <= $3::bigint))"
+            "(\"from_address\" = $1 AND (\"block_number\" >= $2::bigint OR \"block_number\" <= $3::bigint))"
         );
         assert_eq!(params.len(), 3);
     }
@@ -1126,7 +1126,7 @@ mod tests {
         let wc = WhereClause::And(vec![]);
         let (sql, params) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
         // Empty where clause should not produce WHERE
-        assert_eq!(sql, "SELECT * FROM t ORDER BY id DESC LIMIT $1 OFFSET $2");
+        assert_eq!(sql, "SELECT * FROM t ORDER BY \"id\" DESC LIMIT $1 OFFSET $2");
         assert_eq!(params.len(), 2);
     }
 

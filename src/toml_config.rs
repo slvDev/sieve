@@ -468,6 +468,77 @@ fn validate_identifier(name: &str, kind: &str) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Column names reserved by Sieve's fixed schema. These are always present
+/// in generated DDL and must not collide with user-defined ABI columns.
+const RESERVED_COLUMNS: &[&str] = &[
+    "id",
+    "block_number",
+    "tx_hash",
+    "tx_index",
+    "log_index",
+    "contract_address",
+    "block_timestamp",
+    "block_hash",
+    "tx_from",
+    "tx_to",
+    "tx_value",
+    "tx_gas_price",
+];
+
+/// Convert an ABI parameter name (camelCase, `_prefixed`) to snake_case
+/// for use as a PostgreSQL column name.
+///
+/// Strips leading underscores, inserts `_` at camelCase boundaries,
+/// and lowercases everything. Consecutive uppercase letters are treated
+/// as an acronym (e.g. `_L_ETH` → `l_eth`, not `l__e_t_h`).
+///
+/// If the result collides with a reserved schema column (e.g. `id`,
+/// `block_number`, `tx_hash`), it is prefixed with `param_` to avoid
+/// DDL conflicts.
+#[must_use]
+fn abi_param_to_snake_case(name: &str) -> String {
+    // Strip leading underscores
+    let trimmed = name.trim_start_matches('_');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::with_capacity(trimmed.len() + 4);
+    let chars: Vec<char> = trimmed.chars().collect();
+
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_ascii_uppercase() {
+            // Insert underscore before uppercase if:
+            // - not at the start
+            // - previous char was lowercase or digit, OR
+            // - next char is lowercase (end of acronym run, e.g. "ETHValue" → "eth_value")
+            if i > 0 {
+                let prev_lower_or_digit =
+                    chars[i - 1].is_ascii_lowercase() || chars[i - 1].is_ascii_digit();
+                let next_lower = chars.get(i + 1).is_some_and(char::is_ascii_lowercase);
+                if prev_lower_or_digit || next_lower {
+                    result.push('_');
+                }
+            }
+            result.push(ch.to_ascii_lowercase());
+        } else if ch == '_' {
+            // Collapse multiple underscores: skip if result already ends with '_'
+            if !result.ends_with('_') && !result.is_empty() {
+                result.push('_');
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    // Avoid collision with reserved schema columns
+    if RESERVED_COLUMNS.contains(&result.as_str()) {
+        return format!("param_{result}");
+    }
+
+    result
+}
+
 // ── SQL generators ────────────────────────────────────────────────────
 
 /// Generate `CREATE TABLE IF NOT EXISTS` SQL for an event.
@@ -503,7 +574,7 @@ fn generate_create_table_sql(
     }
 
     for col in columns {
-        let _ = write!(sql, ",\n  {} {} NOT NULL", col.column_name, col.pg_type);
+        let _ = write!(sql, ",\n  \"{}\" {} NOT NULL", col.column_name, col.pg_type);
     }
 
     if is_factory_child {
@@ -561,8 +632,9 @@ fn generate_insert_sql(
     }
 
     for col in columns {
-        col_names.push_str(", ");
+        col_names.push_str(", \"");
         col_names.push_str(&col.column_name);
+        col_names.push('"');
     }
 
     let mut params = String::from("$1, $2, $3, $4");
@@ -692,7 +764,7 @@ fn generate_call_create_table_sql(
     }
 
     for col in columns {
-        let _ = write!(sql, ",\n  {} {} NOT NULL", col.column_name, col.pg_type);
+        let _ = write!(sql, ",\n  \"{}\" {} NOT NULL", col.column_name, col.pg_type);
     }
 
     if is_factory_child {
@@ -730,8 +802,9 @@ fn generate_call_insert_sql(
     }
 
     for col in columns {
-        col_names.push_str(", ");
+        col_names.push_str(", \"");
         col_names.push_str(&col.column_name);
+        col_names.push('"');
     }
 
     let mut params = String::from("$1, $2, $3");
@@ -1358,7 +1431,7 @@ fn resolve_call_columns(
     contract_name: &str,
     function_name: &str,
 ) -> eyre::Result<Vec<ResolvedColumn>> {
-    match toml_columns {
+    let resolved = match toml_columns {
         Some(cols) => {
             let mut resolved = Vec::with_capacity(cols.len());
             for col in cols {
@@ -1375,8 +1448,15 @@ fn resolve_call_columns(
                         )
                     })?;
 
-                let column_name = col.name.clone().unwrap_or_else(|| col.param.clone());
-                validate_identifier(&column_name, "column")?;
+                let column_name = col.name.clone().unwrap_or_else(|| abi_param_to_snake_case(&col.param));
+                if let Some(ref explicit_name) = col.name {
+                    validate_identifier(explicit_name, "column")?;
+                    if RESERVED_COLUMNS.contains(&explicit_name.as_str()) {
+                        return Err(eyre::eyre!(
+                            "column name '{explicit_name}' conflicts with a reserved schema column"
+                        ));
+                    }
+                }
                 let pg_type = col
                     .pg_type
                     .clone()
@@ -1388,21 +1468,47 @@ fn resolve_call_columns(
                     pg_type,
                 });
             }
-            Ok(resolved)
+            resolved
         }
         None => {
             let mut resolved = Vec::with_capacity(abi_function.inputs.len());
             for param in &abi_function.inputs {
-                validate_identifier(&param.name, "column")?;
+                let column_name = abi_param_to_snake_case(&param.name);
                 resolved.push(ResolvedColumn {
-                    column_name: param.name.clone(),
+                    column_name,
                     param_name: param.name.clone(),
                     pg_type: default_pg_type(&param.ty).to_string(),
                 });
             }
-            Ok(resolved)
+            resolved
+        }
+    };
+    let ctx = format!("function '{contract_name}.{function_name}'");
+    check_duplicate_columns(&resolved, &ctx)?;
+    Ok(resolved)
+}
+
+/// Check for duplicate column names after snake_case conversion.
+///
+/// # Errors
+///
+/// Returns an error if two ABI params map to the same column name.
+fn check_duplicate_columns(
+    columns: &[ResolvedColumn],
+    context: &str,
+) -> eyre::Result<()> {
+    let mut seen = HashSet::with_capacity(columns.len());
+    for col in columns {
+        if !seen.insert(col.column_name.as_str()) {
+            return Err(eyre::eyre!(
+                "duplicate column name '{}' (from ABI param '{}') in {context} — \
+                 use explicit column mappings to disambiguate",
+                col.column_name,
+                col.param_name,
+            ));
         }
     }
+    Ok(())
 }
 
 /// Resolve columns for an event: either from explicit TOML definitions or
@@ -1418,7 +1524,7 @@ fn resolve_columns(
     contract_name: &str,
     event_name: &str,
 ) -> eyre::Result<Vec<ResolvedColumn>> {
-    match toml_columns {
+    let resolved = match toml_columns {
         Some(cols) => {
             // Explicit columns
             let mut resolved = Vec::with_capacity(cols.len());
@@ -1437,8 +1543,15 @@ fn resolve_columns(
                         )
                     })?;
 
-                let column_name = col.name.clone().unwrap_or_else(|| col.param.clone());
-                validate_identifier(&column_name, "column")?;
+                let column_name = col.name.clone().unwrap_or_else(|| abi_param_to_snake_case(&col.param));
+                if let Some(ref explicit_name) = col.name {
+                    validate_identifier(explicit_name, "column")?;
+                    if RESERVED_COLUMNS.contains(&explicit_name.as_str()) {
+                        return Err(eyre::eyre!(
+                            "column name '{explicit_name}' conflicts with a reserved schema column"
+                        ));
+                    }
+                }
                 let pg_type = col
                     .pg_type
                     .clone()
@@ -1450,22 +1563,25 @@ fn resolve_columns(
                     pg_type,
                 });
             }
-            Ok(resolved)
+            resolved
         }
         None => {
             // Auto-generate from all ABI params
             let mut resolved = Vec::with_capacity(abi_event.inputs.len());
             for param in &abi_event.inputs {
-                validate_identifier(&param.name, "column")?;
+                let column_name = abi_param_to_snake_case(&param.name);
                 resolved.push(ResolvedColumn {
-                    column_name: param.name.clone(),
+                    column_name,
                     param_name: param.name.clone(),
                     pg_type: default_pg_type(&param.ty).to_string(),
                 });
             }
-            Ok(resolved)
+            resolved
         }
-    }
+    };
+    let ctx = format!("event '{contract_name}.{event_name}'");
+    check_duplicate_columns(&resolved, &ctx)?;
+    Ok(resolved)
 }
 
 /// Resolve context fields from optional TOML string list.
@@ -1770,8 +1886,8 @@ table = "usdc_approvals"
         assert!(sql.contains("id BIGSERIAL PRIMARY KEY"));
         assert!(sql.contains("block_number BIGINT NOT NULL"));
         assert!(sql.contains("tx_hash BYTEA NOT NULL"));
-        assert!(sql.contains("from_address text NOT NULL"));
-        assert!(sql.contains("value numeric NOT NULL"));
+        assert!(sql.contains("\"from_address\" text NOT NULL"));
+        assert!(sql.contains("\"value\" numeric NOT NULL"));
         assert!(sql.contains("UNIQUE (block_number, tx_index, log_index)"));
     }
 
@@ -1788,7 +1904,7 @@ table = "usdc_approvals"
         // Context columns appear between standard and user columns
         assert!(sql.contains("block_timestamp BIGINT NOT NULL"));
         assert!(sql.contains("tx_from TEXT NOT NULL"));
-        assert!(sql.contains("value numeric NOT NULL"));
+        assert!(sql.contains("\"value\" numeric NOT NULL"));
     }
 
     #[test]
@@ -1817,7 +1933,7 @@ table = "usdc_approvals"
 
         let sql = generate_insert_sql("usdc_transfers", &[], &columns, false);
         assert!(sql.contains("INSERT INTO usdc_transfers"));
-        assert!(sql.contains("block_number, tx_hash, tx_index, log_index, from_address, to_address"));
+        assert!(sql.contains("block_number, tx_hash, tx_index, log_index, \"from_address\", \"to_address\""));
         assert!(sql.contains("$1, $2, $3, $4, $5, $6"));
         assert!(sql.contains("ON CONFLICT"));
     }
@@ -1833,7 +1949,7 @@ table = "usdc_approvals"
 
         let sql = generate_insert_sql("t", &ctx, &columns, false);
         // Context columns between standard ($1-$4) and user columns
-        assert!(sql.contains("block_timestamp, tx_from, value"));
+        assert!(sql.contains("block_timestamp, tx_from, \"value\""));
         assert!(sql.contains("$5, $6, $7::numeric"));
     }
 
@@ -2574,7 +2690,7 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         assert!(sql.contains("block_number BIGINT NOT NULL"));
         assert!(sql.contains("tx_hash BYTEA NOT NULL"));
         assert!(sql.contains("tx_index INTEGER NOT NULL"));
-        assert!(sql.contains("recipient text NOT NULL"));
+        assert!(sql.contains("\"recipient\" text NOT NULL"));
         assert!(sql.contains("UNIQUE (block_number, tx_index)"));
         // No log_index for calls
         assert!(!sql.contains("log_index"));
@@ -2609,7 +2725,7 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         // Standard 3 params + 1 context + 1 user = 5
         assert!(sql.contains("$1"));
         assert!(sql.contains("$5"));
-        assert!(sql.contains("block_number, tx_hash, tx_index, block_timestamp, recipient"));
+        assert!(sql.contains("block_number, tx_hash, tx_index, block_timestamp, \"recipient\""));
     }
 
     #[test]
@@ -2903,6 +3019,248 @@ url = "http://localhost:8080/events"
         let resolved = resolve_streams(&streams)?;
         let expected = ["{table}", ".", "{event}"].concat();
         assert_eq!(resolved[0].routing_key.as_deref(), Some(expected.as_str()));
+        Ok(())
+    }
+
+    // ── abi_param_to_snake_case tests ──────────────────────────────────
+
+    #[test]
+    fn snake_case_camel_case() {
+        assert_eq!(abi_param_to_snake_case("_troveId"), "trove_id");
+    }
+
+    #[test]
+    fn snake_case_acronym() {
+        assert_eq!(abi_param_to_snake_case("_L_ETH"), "l_eth");
+    }
+
+    #[test]
+    fn snake_case_long_camel() {
+        assert_eq!(abi_param_to_snake_case("_annualInterestRate"), "annual_interest_rate");
+    }
+
+    #[test]
+    fn snake_case_simple_passthrough() {
+        assert_eq!(abi_param_to_snake_case("from"), "from");
+        assert_eq!(abi_param_to_snake_case("value"), "value");
+    }
+
+    #[test]
+    fn snake_case_token_id() {
+        assert_eq!(abi_param_to_snake_case("tokenId"), "token_id");
+    }
+
+    #[test]
+    fn snake_case_reserved_columns_get_param_prefix() {
+        assert_eq!(abi_param_to_snake_case("id"), "param_id");
+        assert_eq!(abi_param_to_snake_case("_id"), "param_id");
+        assert_eq!(abi_param_to_snake_case("blockNumber"), "param_block_number");
+        assert_eq!(abi_param_to_snake_case("txHash"), "param_tx_hash");
+        assert_eq!(abi_param_to_snake_case("logIndex"), "param_log_index");
+        assert_eq!(abi_param_to_snake_case("txIndex"), "param_tx_index");
+        assert_eq!(abi_param_to_snake_case("contractAddress"), "param_contract_address");
+    }
+
+    #[test]
+    fn snake_case_amount_in() {
+        assert_eq!(abi_param_to_snake_case("amountIn"), "amount_in");
+    }
+
+    #[test]
+    fn snake_case_leading_underscores_stripped() {
+        assert_eq!(abi_param_to_snake_case("___foo"), "foo");
+    }
+
+    // ── id column conflict tests ──────────────────────────────────────
+
+    #[test]
+    fn explicit_column_name_id_rejected() -> eyre::Result<()> {
+        let abi_json: alloy_json_abi::Event = serde_json::from_str(
+            r#"{"anonymous":false,"inputs":[
+                {"indexed":false,"internalType":"uint256","name":"x","type":"uint256"}
+            ],"name":"Foo","type":"event"}"#,
+        )?;
+
+        let cols = vec![TomlColumn { param: "x".to_string(), name: Some("id".to_string()), pg_type: None }];
+        let result = resolve_columns(Some(&cols), &abi_json, "Test", "Foo");
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("conflicts with a reserved schema column"));
+        Ok(())
+    }
+
+    #[test]
+    fn auto_gen_id_param_gets_param_prefix() -> eyre::Result<()> {
+        let abi_json: alloy_json_abi::Event = serde_json::from_str(
+            r#"{"anonymous":false,"inputs":[
+                {"indexed":false,"internalType":"uint256","name":"id","type":"uint256"}
+            ],"name":"Foo","type":"event"}"#,
+        )?;
+
+        let result = resolve_columns(None, &abi_json, "Test", "Foo")?;
+        assert_eq!(result[0].column_name, "param_id");
+        assert_eq!(result[0].param_name, "id");
+        Ok(())
+    }
+
+    // ── Comprehensive snake_case edge cases ────────────────────────────
+
+    #[test]
+    fn snake_case_uniswap_style_numeric_suffixes() {
+        // Uniswap pool params: token0, token1, amount0, amount1
+        assert_eq!(abi_param_to_snake_case("token0"), "token0");
+        assert_eq!(abi_param_to_snake_case("token1"), "token1");
+        assert_eq!(abi_param_to_snake_case("amount0Out"), "amount0_out");
+        assert_eq!(abi_param_to_snake_case("amount1In"), "amount1_in");
+        assert_eq!(abi_param_to_snake_case("sqrtPriceLimitX96"), "sqrt_price_limit_x96");
+        assert_eq!(abi_param_to_snake_case("sqrtPriceX96"), "sqrt_price_x96");
+    }
+
+    #[test]
+    fn snake_case_all_caps_acronyms() {
+        assert_eq!(abi_param_to_snake_case("WETH"), "weth");
+        assert_eq!(abi_param_to_snake_case("ETH"), "eth");
+        assert_eq!(abi_param_to_snake_case("USD"), "usd");
+    }
+
+    #[test]
+    fn snake_case_acronym_mid_word() {
+        // Liquity/DeFi patterns
+        assert_eq!(abi_param_to_snake_case("isETHCollateral"), "is_eth_collateral");
+        assert_eq!(abi_param_to_snake_case("newICR"), "new_icr");
+        assert_eq!(abi_param_to_snake_case("getAPR"), "get_apr");
+        assert_eq!(abi_param_to_snake_case("maxFeePercentage"), "max_fee_percentage");
+    }
+
+    #[test]
+    fn snake_case_liquity_v2_params() {
+        assert_eq!(abi_param_to_snake_case("_batchManager"), "batch_manager");
+        assert_eq!(abi_param_to_snake_case("_boldAmount"), "bold_amount");
+        assert_eq!(abi_param_to_snake_case("_troveId"), "trove_id");
+        assert_eq!(abi_param_to_snake_case("_annualInterestRate"), "annual_interest_rate");
+        assert_eq!(abi_param_to_snake_case("_L_ETH"), "l_eth");
+    }
+
+    #[test]
+    fn snake_case_starting_uppercase() {
+        assert_eq!(abi_param_to_snake_case("Owner"), "owner");
+        assert_eq!(abi_param_to_snake_case("Amount"), "amount");
+        assert_eq!(abi_param_to_snake_case("TokenId"), "token_id");
+    }
+
+    #[test]
+    fn snake_case_single_char() {
+        assert_eq!(abi_param_to_snake_case("x"), "x");
+        assert_eq!(abi_param_to_snake_case("A"), "a");
+        assert_eq!(abi_param_to_snake_case("_x"), "x");
+    }
+
+    #[test]
+    fn snake_case_empty_and_underscores_only() {
+        assert_eq!(abi_param_to_snake_case(""), "");
+        assert_eq!(abi_param_to_snake_case("_"), "");
+        assert_eq!(abi_param_to_snake_case("__"), "");
+        assert_eq!(abi_param_to_snake_case("___"), "");
+    }
+
+    #[test]
+    fn snake_case_double_underscores_collapsed() {
+        assert_eq!(abi_param_to_snake_case("foo__bar"), "foo_bar");
+        assert_eq!(abi_param_to_snake_case("a___b"), "a_b");
+    }
+
+    #[test]
+    fn snake_case_digit_then_uppercase() {
+        // Digit followed by uppercase should insert underscore
+        assert_eq!(abi_param_to_snake_case("amount0In"), "amount0_in");
+        assert_eq!(abi_param_to_snake_case("token0Address"), "token0_address");
+        assert_eq!(abi_param_to_snake_case("slot0Data"), "slot0_data");
+    }
+
+    #[test]
+    fn snake_case_already_snake_case() {
+        assert_eq!(abi_param_to_snake_case("from_address"), "from_address");
+        assert_eq!(abi_param_to_snake_case("max_fee"), "max_fee");
+        assert_eq!(abi_param_to_snake_case("gas_price"), "gas_price");
+    }
+
+    #[test]
+    fn snake_case_context_field_names_get_prefix() {
+        // Context fields: block_timestamp, block_hash, tx_from, tx_to, tx_value, tx_gas_price
+        assert_eq!(abi_param_to_snake_case("block_timestamp"), "param_block_timestamp");
+        assert_eq!(abi_param_to_snake_case("tx_from"), "param_tx_from");
+        assert_eq!(abi_param_to_snake_case("tx_to"), "param_tx_to");
+        assert_eq!(abi_param_to_snake_case("tx_value"), "param_tx_value");
+    }
+
+    // ── Duplicate column detection tests ───────────────────────────────
+
+    #[test]
+    fn duplicate_column_names_after_snake_case_rejected() -> eyre::Result<()> {
+        // Two ABI params that produce the same snake_case column
+        let abi_json: alloy_json_abi::Event = serde_json::from_str(
+            r#"{"anonymous":false,"inputs":[
+                {"indexed":false,"internalType":"uint256","name":"tokenA","type":"uint256"},
+                {"indexed":false,"internalType":"uint256","name":"token_a","type":"uint256"}
+            ],"name":"Foo","type":"event"}"#,
+        )?;
+
+        let result = resolve_columns(None, &abi_json, "Test", "Foo");
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("duplicate column name"));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_column_names_in_calls_rejected() -> eyre::Result<()> {
+        let abi_json: alloy_json_abi::Function = serde_json::from_str(
+            r#"{"inputs":[
+                {"internalType":"uint256","name":"tokenA","type":"uint256"},
+                {"internalType":"uint256","name":"token_a","type":"uint256"}
+            ],"name":"foo","type":"function","outputs":[],"stateMutability":"nonpayable"}"#,
+        )?;
+
+        let result = resolve_call_columns(None, &abi_json, "Test", "foo");
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("duplicate column name"));
+        Ok(())
+    }
+
+    // ── Reserved column names via explicit TOML ────────────────────────
+
+    #[test]
+    fn explicit_reserved_column_names_rejected() -> eyre::Result<()> {
+        let abi_json: alloy_json_abi::Event = serde_json::from_str(
+            r#"{"anonymous":false,"inputs":[
+                {"indexed":false,"internalType":"uint256","name":"x","type":"uint256"}
+            ],"name":"Foo","type":"event"}"#,
+        )?;
+
+        // Test several reserved names
+        for reserved in &["id", "block_number", "tx_hash", "log_index", "tx_index"] {
+            let cols = vec![TomlColumn {
+                param: "x".to_string(),
+                name: Some(reserved.to_string()),
+                pg_type: None,
+            }];
+            let result = resolve_columns(Some(&cols), &abi_json, "Test", "Foo");
+            assert!(result.is_err(), "should reject explicit name '{reserved}'");
+        }
+        Ok(())
+    }
+
+    // ── Auto-gen with reserved collision ────────────────────────────────
+
+    #[test]
+    fn auto_gen_block_number_param_gets_prefix() -> eyre::Result<()> {
+        let abi_json: alloy_json_abi::Event = serde_json::from_str(
+            r#"{"anonymous":false,"inputs":[
+                {"indexed":false,"internalType":"uint256","name":"blockNumber","type":"uint256"}
+            ],"name":"Foo","type":"event"}"#,
+        )?;
+
+        let result = resolve_columns(None, &abi_json, "Test", "Foo")?;
+        assert_eq!(result[0].column_name, "param_block_number");
+        assert_eq!(result[0].param_name, "blockNumber");
         Ok(())
     }
 }
