@@ -306,38 +306,47 @@ Options:
   --fresh                 Drop and recreate all tables before indexing
 ```
 
-## Docker Compose
+## Docker
 
-```yaml
-services:
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_PASSWORD: sieve
-      POSTGRES_DB: sieve
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+### Build and run with Docker Compose
 
-  sieve:
-    build: .
-    ports:
-      - "4000:4000"      # GraphQL API
-      - "30303:30303"     # Ethereum P2P (TCP)
-      - "30303:30303/udp" # Ethereum P2P (UDP)
-    depends_on:
-      - db
-    environment:
-      DATABASE_URL: postgres://postgres:sieve@db:5432/sieve
-    command: ["sieve", "--api-port", "4000"]
-    volumes:
-      - ./sieve.toml:/app/sieve.toml
-      - ./abis:/app/abis
-
-volumes:
-  pgdata:
+```bash
+cp sieve.example.toml sieve.toml   # edit for your contracts
+docker compose up -d
 ```
+
+This starts PostgreSQL and Sieve with the GraphQL API on port 4000. See `docker-compose.yml` for the full configuration.
+
+### Build the image manually
+
+```bash
+docker build -t sieve .
+
+docker run \
+  -v ./sieve.toml:/app/sieve.toml:ro \
+  -v ./abis:/app/abis:ro \
+  -p 4000:4000 -p 30303:30303 -p 30303:30303/udp \
+  sieve --config /app/sieve.toml --database-url postgres://... --api-port 4000
+```
+
+### Why config and ABIs are not baked into the image
+
+The Docker image contains only the Sieve binary. Your `sieve.toml` and `abis/` directory are mounted at runtime as volumes, not copied during build. This is intentional:
+
+- **Config is deployment-specific** — database URLs, start blocks, stream endpoints differ between environments
+- **ABIs change with your contracts** — no need to rebuild the image when adding a new contract
+- **Secrets stay out of images** — database credentials in `sieve.toml` should not be in a Docker layer
+- **One image, many deployments** — the same image works for dev, staging, and production with different mounted configs
+
+### Coolify / managed platforms
+
+Platforms like Coolify don't support local bind mounts. Use `Dockerfile.coolify` which bakes `sieve.toml` and `abis/` into the image:
+
+```bash
+docker build -f Dockerfile.coolify -t sieve .
+```
+
+In Coolify, set the build file to `Dockerfile.coolify` and pass `DATABASE_URL` as an environment variable. The TOML config and ABIs are baked into the image, so you need to rebuild when they change. Keep database credentials in environment variables, not in `sieve.toml` — use the `--database-url` flag or `DATABASE_URL` env var which override the TOML `[database]` section.
 
 > **Note:** Port 30303 (TCP + UDP) must be reachable from the internet for Ethereum P2P peer discovery.
 

@@ -1,0 +1,12 @@
+target/
+shinode/
+.git/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+CLAUDE.md
+DEVPLAN.md
+COMPETITORS.md
+TODO.md
+context.md
