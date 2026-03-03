@@ -44,6 +44,8 @@ pub struct EventPayload {
     pub table: String,
     /// Event/function/transfer name.
     pub event: String,
+    /// Contract name from TOML config (e.g. "USDC", "UniswapV3Pool").
+    pub contract_name: String,
     /// Contract address (checksummed hex).
     pub contract: String,
     /// Block number where the event occurred.
@@ -334,6 +336,7 @@ mod tests {
         let payload = EventPayload {
             table: "usdc_transfers".to_string(),
             event: "Transfer".to_string(),
+            contract_name: "USDC".to_string(),
             contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
             block_number: 22_000_000,
             block_timestamp: 1_700_000_000,
@@ -366,6 +369,7 @@ mod tests {
         let payload = EventPayload {
             table: "eth_transfers".to_string(),
             event: "transfer".to_string(),
+            contract_name: String::new(),
             contract: "0x0000000000000000000000000000000000000000".to_string(),
             block_number: 1,
             block_timestamp: 100,
@@ -571,6 +575,7 @@ mod tests {
             vec![EventPayload {
                 table: "usdc_transfers".to_string(),
                 event: "Transfer".to_string(),
+                contract_name: "USDC".to_string(),
                 contract: "0xA0b8".to_string(),
                 block_number: 100,
                 block_timestamp: 1000,
@@ -614,6 +619,7 @@ mod tests {
             vec![EventPayload {
                 table: "test".to_string(),
                 event: "Test".to_string(),
+                contract_name: "Test".to_string(),
                 contract: "0x00".to_string(),
                 block_number: 1,
                 block_timestamp: 100,

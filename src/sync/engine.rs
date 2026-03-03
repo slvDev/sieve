@@ -903,6 +903,7 @@ fn collect_event_payload(
     payloads.push(crate::stream::EventPayload {
         table: table.clone(),
         event: event_name.clone(),
+        contract_name: event.contract_name.clone(),
         contract: Address::to_checksum(&event.contract_address, None),
         block_number: event.block_number.as_u64(),
         block_timestamp: event.block_timestamp,
@@ -944,6 +945,7 @@ fn build_transfer_payload(
     crate::stream::EventPayload {
         table: table_name.to_string(),
         event: "transfer".to_string(),
+        contract_name: String::new(),
         contract: "0x0000000000000000000000000000000000000000".to_string(),
         block_number: transfer.block_number.as_u64(),
         block_timestamp: context.block_timestamp,
@@ -979,6 +981,7 @@ fn build_call_payload(
     crate::stream::EventPayload {
         table: table_name.to_string(),
         event: call.function_name.clone(),
+        contract_name: call.contract_name.clone(),
         contract: Address::to_checksum(&call.contract_address, None),
         block_number: call.block_number.as_u64(),
         block_timestamp: context.block_timestamp,

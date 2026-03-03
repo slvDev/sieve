@@ -259,6 +259,7 @@ Message payload (one per event):
 {
   "table": "usdc_transfers",
   "event": "Transfer",
+  "contract_name": "USDC",
   "contract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
   "block_number": 22516100,
   "block_timestamp": 1700000000,
@@ -280,6 +281,8 @@ Message payload (one per event):
 }
 ```
 
+- **`data` keys use raw ABI parameter names**, not the column names from your TOML config. If the Solidity ABI defines `_troveId`, the stream sends `_troveId` — even though PostgreSQL stores it as `trove_id`. This is intentional: ABI names are tied to the immutable smart contract, while TOML column names can change. Consumers should write a thin adapter to map field names as needed.
+- `contract_name` is the name from your TOML config (e.g. `"USDC"`). Empty for native transfers.
 - Receipt fields (`tx_value` through `status`) only present when the contract/transfer has `include_receipts = true`
 - Routing key supports `{table}` and `{event}` placeholders (e.g. `usdc_transfers.Transfer`)
 - Exchange is declared as `topic` type, durable
