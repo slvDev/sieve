@@ -113,6 +113,8 @@ name = "MyContract"
 address = "0x..."
 abi = "abis/my_contract.json"
 start_block = 21_000_000
+include_receipts = true     # adds gas_used, nonce, cumulative_gas_used, status columns
+                            # and enriches streaming payloads with receipt metadata
 
 # Index event logs
 [[contracts.events]]
@@ -125,6 +127,8 @@ context = [                 # Optional block/tx metadata columns
   "tx_to",
   "tx_value",
   "tx_gas_price",
+  # These are auto-added by include_receipts = true:
+  # "tx_gas_used", "tx_nonce", "cumulative_gas_used", "tx_status"
 ]
 columns = [                 # Optional column mapping (auto-generated if omitted)
   { param = "from",  name = "sender",   type = "text" },
@@ -140,6 +144,21 @@ columns = [                 # Optional column mapping (auto-generated if omitted
 [contracts.events.filter]
 spender = ["0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"]
 ```
+
+### Receipt Context Fields
+
+Setting `include_receipts = true` on a contract or transfer auto-adds four context fields to all its tables and enriches streaming payloads with transaction metadata:
+
+| Context Field | SQL Type | Description |
+|---|---|---|
+| `tx_gas_used` | `BIGINT` | Per-transaction gas used (computed from cumulative) |
+| `tx_nonce` | `BIGINT` | Transaction nonce |
+| `cumulative_gas_used` | `BIGINT` | Cumulative gas used in block up to this tx |
+| `tx_status` | `BOOLEAN` | Receipt success (always true — Sieve only indexes successful txs) |
+
+When streaming is configured, `include_receipts = true` also adds `tx_value`, `tx_gas_price`, `gas_used`, `nonce`, `cumulative_gas_used`, and `status` to the JSON payload. This lets downstream consumers compute transaction costs (`gas_used × tx_gas_price`) without querying an RPC node.
+
+You can also use receipt context fields individually without the flag, by adding them to the `context` array (e.g. `context = ["tx_gas_used", "tx_nonce"]`).
 
 ### Function Call Indexing
 
@@ -166,6 +185,7 @@ name = "eth_transfers"
 table = "eth_transfers"
 start_block = 21_000_000
 context = ["block_timestamp", "tx_gas_price"]
+include_receipts = true   # adds tx_gas_used, tx_nonce, cumulative_gas_used, tx_status columns
 
 # Optional: filter by sender/receiver
 [transfers.filter]
@@ -244,6 +264,12 @@ Message payload (one per event):
   "log_index": 5,
   "tx_index": 42,
   "tx_from": "0x1234...5678",
+  "tx_value": "1000000000000000000",
+  "tx_gas_price": 30000000000,
+  "gas_used": 65000,
+  "nonce": 42,
+  "cumulative_gas_used": 500000,
+  "status": true,
   "data": {
     "from": "0xDead...beef",
     "to": "0xCafe...babe",
@@ -252,6 +278,7 @@ Message payload (one per event):
 }
 ```
 
+- Receipt fields (`tx_value` through `status`) only present when the contract/transfer has `include_receipts = true`
 - Routing key supports `{table}` and `{event}` placeholders (e.g. `usdc_transfers.Transfer`)
 - Exchange is declared as `topic` type, durable
 - Messages are persistent (delivery mode 2) with `application/json` content type

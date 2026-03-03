@@ -60,6 +60,24 @@ pub struct EventPayload {
     /// Transaction sender (checksummed hex). None for legacy event payloads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_from: Option<String>,
+    /// Transaction value in wei (string for precision). Present when `include_receipts = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_value: Option<String>,
+    /// Effective gas price. Present when `include_receipts = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_gas_price: Option<u64>,
+    /// Per-transaction gas used. Present when `include_receipts = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_used: Option<u64>,
+    /// Transaction nonce. Present when `include_receipts = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
+    /// Cumulative gas used in block. Present when `include_receipts = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cumulative_gas_used: Option<u64>,
+    /// Transaction status (always true — Sieve only indexes successful txs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<bool>,
     /// Decoded event parameters as key-value pairs.
     pub data: serde_json::Map<String, serde_json::Value>,
 }
@@ -323,6 +341,12 @@ mod tests {
             log_index: Some(5),
             tx_index: 3,
             tx_from: Some("0xDEAD".to_string()),
+            tx_value: None,
+            tx_gas_price: None,
+            gas_used: None,
+            nonce: None,
+            cumulative_gas_used: None,
+            status: None,
             data,
         };
 
@@ -349,6 +373,12 @@ mod tests {
             log_index: None,
             tx_index: 0,
             tx_from: None,
+            tx_value: None,
+            tx_gas_price: None,
+            gas_used: None,
+            nonce: None,
+            cumulative_gas_used: None,
+            status: None,
             data: serde_json::Map::new(),
         };
 
@@ -548,6 +578,12 @@ mod tests {
                 log_index: Some(0),
                 tx_index: 1,
                 tx_from: None,
+                tx_value: None,
+                tx_gas_price: None,
+                gas_used: None,
+                nonce: None,
+                cumulative_gas_used: None,
+                status: None,
                 data,
             }],
             false,
@@ -585,6 +621,12 @@ mod tests {
                 log_index: None,
                 tx_index: 0,
                 tx_from: None,
+                tx_value: None,
+                tx_gas_price: None,
+                gas_used: None,
+                nonce: None,
+                cumulative_gas_used: None,
+                status: None,
                 data: serde_json::Map::new(),
             }],
             true, // backfill

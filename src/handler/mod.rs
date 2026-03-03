@@ -37,6 +37,14 @@ pub struct EventContext {
     pub tx_value: U256,
     /// Effective gas price.
     pub tx_gas_price: u128,
+    /// Per-transaction gas used (computed from cumulative gas).
+    pub tx_gas_used: u64,
+    /// Transaction nonce.
+    pub tx_nonce: u64,
+    /// Cumulative gas used in block up to this transaction.
+    pub cumulative_gas_used: u64,
+    /// Receipt success status (always true — Sieve only indexes successful txs).
+    pub tx_status: bool,
 }
 
 /// Trait for user-defined event handlers.
@@ -346,6 +354,10 @@ fn bind_context_field<'q>(
         }
         ContextField::TxValue => query.bind(context.tx_value.to_string()),
         ContextField::TxGasPrice => query.bind(context.tx_gas_price as i64),
+        ContextField::TxGasUsed => query.bind(context.tx_gas_used as i64),
+        ContextField::TxNonce => query.bind(context.tx_nonce as i64),
+        ContextField::CumulativeGasUsed => query.bind(context.cumulative_gas_used as i64),
+        ContextField::TxStatus => query.bind(context.tx_status),
     }
 }
 
@@ -889,6 +901,10 @@ mod tests {
             tx_to: Some(address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")),
             tx_value: U256::ZERO,
             tx_gas_price: 30_000_000_000,
+            tx_gas_used: 21_000,
+            tx_nonce: 0,
+            cumulative_gas_used: 21_000,
+            tx_status: true,
         }
     }
 
@@ -949,6 +965,7 @@ mod tests {
             rollback_sql: String::new(),
             is_factory_child: false,
             topic_filters: vec![],
+            include_receipts: false,
         };
 
         let handler = ConfigDrivenHandler::new(resolved);
@@ -1135,6 +1152,7 @@ mod tests {
             rollback_sql: String::new(),
             filter_from,
             filter_to,
+            include_receipts: false,
         })
     }
 
@@ -1221,6 +1239,7 @@ mod tests {
             rollback_sql: String::new(),
             filter_from,
             filter_to,
+            include_receipts: false,
         })
     }
 
@@ -1276,6 +1295,7 @@ mod tests {
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
             is_factory_child: false,
+            include_receipts: false,
         })
     }
 

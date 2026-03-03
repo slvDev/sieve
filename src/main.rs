@@ -28,7 +28,7 @@ mod test_utils;
 use types::BlockNumber;
 
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -112,6 +112,13 @@ async fn main() -> eyre::Result<()> {
     // Build event_table_map: "contract:event" → (table_name, event_name)
     let event_table_map = build_event_table_map(&startup.resolved_events);
 
+    // Build receipt_tables before transfers/calls are consumed
+    let receipt_tables = Arc::new(build_receipt_tables(
+        &startup.resolved_events,
+        &startup.resolved_transfers,
+        &startup.resolved_calls,
+    ));
+
     // Build transfer handlers from resolved transfers
     let transfer_handlers: Vec<handler::TransferHandler> = startup
         .resolved_transfers
@@ -156,6 +163,7 @@ async fn main() -> eyre::Result<()> {
         stream_dispatcher,
         event_table_map: Arc::new(event_table_map),
         is_backfill,
+        receipt_tables,
     };
 
     run_indexer(&cli, startup.start_block, ctx).await
@@ -367,6 +375,34 @@ fn build_event_table_map(
         map.insert(key, (re.table_name.clone(), re.event_name.clone()));
     }
     map
+}
+
+/// Build the set of table names that have `include_receipts = true`.
+///
+/// Used by the sync engine to decide whether to enrich streaming payloads
+/// with receipt/tx metadata for a given table.
+fn build_receipt_tables(
+    events: &[toml_config::ResolvedEvent],
+    transfers: &[toml_config::ResolvedTransfer],
+    calls: &[toml_config::ResolvedCall],
+) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for e in events {
+        if e.include_receipts {
+            set.insert(e.table_name.clone());
+        }
+    }
+    for t in transfers {
+        if t.include_receipts {
+            set.insert(t.table_name.clone());
+        }
+    }
+    for c in calls {
+        if c.include_receipts {
+            set.insert(c.table_name.clone());
+        }
+    }
+    set
 }
 
 /// Build stream sinks from resolved stream definitions.

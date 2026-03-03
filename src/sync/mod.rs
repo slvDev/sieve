@@ -12,7 +12,7 @@ use crate::stream::StreamDispatcher;
 use crate::toml_config::ResolvedFactory;
 use reth_ethereum_primitives::{BlockBody, Receipt};
 use reth_primitives_traits::Header;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -53,6 +53,8 @@ pub struct SyncContext {
     pub event_table_map: Arc<HashMap<String, (String, String)>>,
     /// Whether this sync run is a historical backfill.
     pub is_backfill: bool,
+    /// Table names that have `include_receipts = true` (for streaming enrichment).
+    pub receipt_tables: Arc<HashSet<String>>,
 }
 
 /// Full payload for a block: header, body, receipts.

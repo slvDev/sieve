@@ -35,6 +35,7 @@ struct FollowContext {
     call_handlers: Arc<CallRegistry>,
     stream_dispatcher: Option<Arc<StreamDispatcher>>,
     event_table_map: Arc<HashMap<String, (String, String)>>,
+    receipt_tables: Arc<std::collections::HashSet<String>>,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -64,6 +65,7 @@ pub async fn run_follow_loop(
         call_handlers: ctx.call_handlers,
         stream_dispatcher: ctx.stream_dispatcher,
         event_table_map: ctx.event_table_map,
+        receipt_tables: ctx.receipt_tables,
     };
 
     while !is_stopped(&fctx.stop_rx) {
@@ -175,6 +177,7 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
         stream_dispatcher: ctx.stream_dispatcher.clone(),
         event_table_map: Arc::clone(&ctx.event_table_map),
         is_backfill: false,
+        receipt_tables: Arc::clone(&ctx.receipt_tables),
     };
 
     let outcome = run_sync(

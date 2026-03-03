@@ -168,6 +168,7 @@ pub async fn run_sync(
         Arc::clone(&ctx.event_table_map),
         ctx.stream_dispatcher.clone(),
         ctx.is_backfill,
+        Arc::clone(&ctx.receipt_tables),
     ));
 
     // Main fetch loop
@@ -631,6 +632,7 @@ async fn consume_payloads(
     event_table_map: Arc<HashMap<String, (String, String)>>,
     stream_dispatcher: Option<Arc<crate::stream::StreamDispatcher>>,
     is_backfill: bool,
+    receipt_tables: Arc<HashSet<String>>,
 ) -> ConsumerStats {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
@@ -645,6 +647,7 @@ async fn consume_payloads(
         call_handlers: &call_handlers,
         event_table_map: &event_table_map,
         has_streams: stream_dispatcher.is_some(),
+        receipt_tables: &receipt_tables,
     };
 
     while let Some(payload) = payload_rx.recv().await {
@@ -739,6 +742,8 @@ struct ProcessContext<'a> {
     event_table_map: &'a HashMap<String, (String, String)>,
     /// Whether streams are configured (gates event payload collection).
     has_streams: bool,
+    /// Table names with `include_receipts = true` (for streaming enrichment).
+    receipt_tables: &'a HashSet<String>,
 }
 
 /// Compute the sealed hash for a block header.
@@ -820,7 +825,7 @@ async fn process_block_events(
         if dispatched > 0 {
             track_event_table(ctx.event_table_map, event, dispatched, &mut table_counts);
             if ctx.has_streams {
-                collect_event_payload(ctx.event_table_map, event, &event_context, &mut event_payloads);
+                collect_event_payload(ctx.event_table_map, event, &event_context, ctx.receipt_tables, &mut event_payloads);
             }
         }
         stored_count = stored_count.saturating_add(dispatched);
@@ -878,6 +883,7 @@ fn collect_event_payload(
     event_table_map: &HashMap<String, (String, String)>,
     event: &decode::DecodedEvent,
     context: &EventContext,
+    receipt_tables: &HashSet<String>,
     payloads: &mut Vec<crate::stream::EventPayload>,
 ) {
     let key = format!("{}:{}", event.contract_name, event.event_name);
@@ -893,6 +899,7 @@ fn collect_event_payload(
         );
     }
 
+    let include = receipt_tables.contains(table);
     payloads.push(crate::stream::EventPayload {
         table: table.clone(),
         event: event_name.clone(),
@@ -903,6 +910,12 @@ fn collect_event_payload(
         log_index: Some(event.log_index.as_u32()),
         tx_index: event.tx_index.as_u32(),
         tx_from: Some(Address::to_checksum(&context.tx_from, None)),
+        tx_value: include.then(|| context.tx_value.to_string()),
+        tx_gas_price: include.then_some(context.tx_gas_price as u64),
+        gas_used: include.then_some(context.tx_gas_used),
+        nonce: include.then_some(context.tx_nonce),
+        cumulative_gas_used: include.then_some(context.cumulative_gas_used),
+        status: include.then_some(context.tx_status),
         data,
     });
 }
@@ -912,6 +925,7 @@ fn build_transfer_payload(
     transfer: &NativeTransfer,
     context: &EventContext,
     table_name: &str,
+    include: bool,
 ) -> crate::stream::EventPayload {
     let mut data = serde_json::Map::new();
     data.insert(
@@ -937,6 +951,12 @@ fn build_transfer_payload(
         log_index: None,
         tx_index: transfer.tx_index.as_u32(),
         tx_from: Some(Address::to_checksum(&context.tx_from, None)),
+        tx_value: include.then(|| context.tx_value.to_string()),
+        tx_gas_price: include.then_some(context.tx_gas_price as u64),
+        gas_used: include.then_some(context.tx_gas_used),
+        nonce: include.then_some(context.tx_nonce),
+        cumulative_gas_used: include.then_some(context.cumulative_gas_used),
+        status: include.then_some(context.tx_status),
         data,
     }
 }
@@ -946,6 +966,7 @@ fn build_call_payload(
     call: &DecodedCall,
     context: &EventContext,
     table_name: &str,
+    include: bool,
 ) -> crate::stream::EventPayload {
     let mut data = serde_json::Map::new();
     for param in &call.params {
@@ -965,6 +986,12 @@ fn build_call_payload(
         log_index: None,
         tx_index: call.tx_index.as_u32(),
         tx_from: Some(Address::to_checksum(&context.tx_from, None)),
+        tx_value: include.then(|| context.tx_value.to_string()),
+        tx_gas_price: include.then_some(context.tx_gas_price as u64),
+        gas_used: include.then_some(context.tx_gas_used),
+        nonce: include.then_some(context.tx_nonce),
+        cumulative_gas_used: include.then_some(context.cumulative_gas_used),
+        status: include.then_some(context.tx_status),
         data,
     }
 }
@@ -984,7 +1011,7 @@ async fn store_transfers(
     }
     let count = scan_and_store_transfers(
         payload, block_hash, sender_cache, ctx.transfer_handlers, tx,
-        ctx.has_streams, event_payloads, table_counts,
+        ctx.has_streams, event_payloads, table_counts, ctx.receipt_tables,
     ).await?;
     Ok(count)
 }
@@ -1004,9 +1031,24 @@ async fn store_calls(
     }
     let count = scan_and_store_calls(
         payload, block_hash, sender_cache, ctx.config, ctx.call_handlers, tx,
-        ctx.has_streams, event_payloads, table_counts,
+        ctx.has_streams, event_payloads, table_counts, ctx.receipt_tables,
     ).await?;
     Ok(count)
+}
+
+/// Compute per-transaction gas used from cumulative gas values.
+///
+/// For the first transaction in a block, `gas_used == cumulative_gas_used`.
+/// For subsequent transactions, `gas_used = cumulative[i] - cumulative[i-1]`.
+fn compute_gas_used(receipts: &[reth_ethereum_primitives::Receipt], tx_idx: usize) -> u64 {
+    let cumulative = receipts.get(tx_idx).map_or(0, |r| r.cumulative_gas_used);
+    if tx_idx == 0 {
+        cumulative
+    } else {
+        cumulative.saturating_sub(
+            receipts.get(tx_idx - 1).map_or(0, |r| r.cumulative_gas_used),
+        )
+    }
 }
 
 /// Build an [`EventContext`] from a block payload for a given decoded event.
@@ -1046,6 +1088,10 @@ fn build_event_context(
         TxKind::Create => None,
     };
 
+    let tx_idx_usize = event.tx_index.as_u32() as usize;
+    let cumulative = payload.receipts().get(tx_idx_usize).map_or(0, |r| r.cumulative_gas_used);
+    let gas_used = compute_gas_used(payload.receipts(), tx_idx_usize);
+
     Ok(EventContext {
         block_timestamp: payload.header().timestamp,
         block_hash,
@@ -1053,6 +1099,10 @@ fn build_event_context(
         tx_to,
         tx_value: tx_signed.value(),
         tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
+        tx_gas_used: gas_used,
+        tx_nonce: tx_signed.nonce(),
+        cumulative_gas_used: cumulative,
+        tx_status: true,
     })
 }
 
@@ -1120,6 +1170,7 @@ async fn scan_and_store_transfers(
     has_streams: bool,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
     table_counts: &mut HashMap<String, (String, u64)>,
+    receipt_tables: &HashSet<String>,
 ) -> eyre::Result<u64> {
     let block_number = BlockNumber::new(payload.header().number);
     let receipts = payload.receipts();
@@ -1170,6 +1221,10 @@ async fn scan_and_store_transfers(
             tx_to: Some(to_address),
             tx_value: tx_signed.value(),
             tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
+            tx_gas_used: compute_gas_used(receipts, tx_idx),
+            tx_nonce: tx_signed.nonce(),
+            cumulative_gas_used: receipts.get(tx_idx).map_or(0, |r| r.cumulative_gas_used),
+            tx_status: true,
         };
 
         let dispatched = transfer_handlers.dispatch(&transfer, &context, tx).await?;
@@ -1180,7 +1235,8 @@ async fn scan_and_store_transfers(
                     .or_insert_with(|| ("transfer".to_string(), 0));
                 entry.1 = entry.1.saturating_add(1);
                 if has_streams {
-                    event_payloads.push(build_transfer_payload(&transfer, &context, table_name));
+                    let include = receipt_tables.contains(table_name);
+                    event_payloads.push(build_transfer_payload(&transfer, &context, table_name, include));
                 }
             }
         }
@@ -1209,6 +1265,7 @@ async fn scan_and_store_calls(
     has_streams: bool,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
     table_counts: &mut HashMap<String, (String, u64)>,
+    receipt_tables: &HashSet<String>,
 ) -> eyre::Result<u64> {
     let block_number = BlockNumber::new(payload.header().number);
     let receipts = payload.receipts();
@@ -1302,6 +1359,10 @@ async fn scan_and_store_calls(
             tx_to: Some(to_address),
             tx_value: tx_signed.value(),
             tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
+            tx_gas_used: compute_gas_used(receipts, tx_idx),
+            tx_nonce: tx_signed.nonce(),
+            cumulative_gas_used: receipts.get(tx_idx).map_or(0, |r| r.cumulative_gas_used),
+            tx_status: true,
         };
 
         let dispatched = call_handlers.dispatch(&decoded_call, &context, tx).await?;
@@ -1315,7 +1376,8 @@ async fn scan_and_store_calls(
                     .or_insert_with(|| (decoded_call.function_name.clone(), 0));
                 entry.1 = entry.1.saturating_add(1);
                 if has_streams {
-                    event_payloads.push(build_call_payload(&decoded_call, &context, table_name));
+                    let include = receipt_tables.contains(table_name);
+                    event_payloads.push(build_call_payload(&decoded_call, &context, table_name, include));
                 }
             }
         }
@@ -1351,4 +1413,52 @@ fn decode_matched_logs(
         }
     }
     decoded_events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_receipt(cumulative: u64) -> reth_ethereum_primitives::Receipt {
+        reth_ethereum_primitives::Receipt {
+            cumulative_gas_used: cumulative,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compute_gas_used_first_tx() {
+        let receipts = vec![make_receipt(21_000)];
+        assert_eq!(compute_gas_used(&receipts, 0), 21_000);
+    }
+
+    #[test]
+    fn compute_gas_used_second_tx() {
+        let receipts = vec![make_receipt(21_000), make_receipt(63_000)];
+        assert_eq!(compute_gas_used(&receipts, 1), 42_000);
+    }
+
+    #[test]
+    fn compute_gas_used_third_tx() {
+        let receipts = vec![
+            make_receipt(50_000),
+            make_receipt(120_000),
+            make_receipt(200_000),
+        ];
+        assert_eq!(compute_gas_used(&receipts, 0), 50_000);
+        assert_eq!(compute_gas_used(&receipts, 1), 70_000);
+        assert_eq!(compute_gas_used(&receipts, 2), 80_000);
+    }
+
+    #[test]
+    fn compute_gas_used_out_of_bounds() {
+        let receipts = vec![make_receipt(21_000)];
+        assert_eq!(compute_gas_used(&receipts, 5), 0);
+    }
+
+    #[test]
+    fn compute_gas_used_empty_receipts() {
+        let receipts: Vec<reth_ethereum_primitives::Receipt> = vec![];
+        assert_eq!(compute_gas_used(&receipts, 0), 0);
+    }
 }

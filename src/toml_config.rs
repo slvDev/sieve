@@ -54,6 +54,11 @@ pub struct TomlContract {
     pub calls: Vec<TomlCall>,
     /// Optional factory config for dynamically-created contracts.
     pub factory: Option<TomlFactory>,
+    /// When true, auto-adds receipt context fields (tx_gas_used, tx_nonce,
+    /// cumulative_gas_used, tx_status) to all events and calls, and enriches
+    /// streaming payloads with receipt/tx metadata.
+    #[serde(default)]
+    pub include_receipts: bool,
 }
 
 /// Factory section for a contract definition.
@@ -126,6 +131,10 @@ pub struct TomlTransfer {
     pub context: Option<Vec<String>>,
     /// Optional address filters for from/to.
     pub filter: Option<TomlTransferFilter>,
+    /// When true, auto-adds receipt context fields (tx_gas_used, tx_nonce,
+    /// cumulative_gas_used, tx_status) and enriches streaming payloads.
+    #[serde(default)]
+    pub include_receipts: bool,
 }
 
 /// Address filter for native ETH transfers.
@@ -179,7 +188,23 @@ pub enum ContextField {
     TxValue,
     /// Effective gas price.
     TxGasPrice,
+    /// Per-transaction gas used (computed from cumulative gas).
+    TxGasUsed,
+    /// Transaction nonce.
+    TxNonce,
+    /// Cumulative gas used in block up to this transaction.
+    CumulativeGasUsed,
+    /// Receipt success status (always true — Sieve only indexes successful txs).
+    TxStatus,
 }
+
+/// Receipt-related context fields auto-added by `include_receipts = true`.
+const RECEIPT_CONTEXT_FIELDS: [ContextField; 4] = [
+    ContextField::TxGasUsed,
+    ContextField::TxNonce,
+    ContextField::CumulativeGasUsed,
+    ContextField::TxStatus,
+];
 
 impl ContextField {
     /// Parse a context field name from TOML config.
@@ -195,9 +220,14 @@ impl ContextField {
             "tx_to" => Ok(Self::TxTo),
             "tx_value" => Ok(Self::TxValue),
             "tx_gas_price" => Ok(Self::TxGasPrice),
+            "tx_gas_used" => Ok(Self::TxGasUsed),
+            "tx_nonce" => Ok(Self::TxNonce),
+            "cumulative_gas_used" => Ok(Self::CumulativeGasUsed),
+            "tx_status" => Ok(Self::TxStatus),
             _ => Err(eyre::eyre!(
                 "unknown context field '{name}'. Valid fields: \
-                 block_timestamp, block_hash, tx_from, tx_to, tx_value, tx_gas_price"
+                 block_timestamp, block_hash, tx_from, tx_to, tx_value, tx_gas_price, \
+                 tx_gas_used, tx_nonce, cumulative_gas_used, tx_status"
             )),
         }
     }
@@ -212,6 +242,10 @@ impl ContextField {
             Self::TxTo => "tx_to",
             Self::TxValue => "tx_value",
             Self::TxGasPrice => "tx_gas_price",
+            Self::TxGasUsed => "tx_gas_used",
+            Self::TxNonce => "tx_nonce",
+            Self::CumulativeGasUsed => "cumulative_gas_used",
+            Self::TxStatus => "tx_status",
         }
     }
 
@@ -219,11 +253,13 @@ impl ContextField {
     #[must_use]
     pub const fn pg_type(self) -> &'static str {
         match self {
-            Self::BlockTimestamp | Self::TxGasPrice => "BIGINT NOT NULL",
+            Self::BlockTimestamp | Self::TxGasPrice | Self::TxGasUsed | Self::TxNonce
+            | Self::CumulativeGasUsed => "BIGINT NOT NULL",
             Self::BlockHash => "BYTEA NOT NULL",
             Self::TxFrom => "TEXT NOT NULL",
             Self::TxTo => "TEXT",
             Self::TxValue => "NUMERIC NOT NULL",
+            Self::TxStatus => "BOOLEAN NOT NULL",
         }
     }
 }
@@ -313,6 +349,8 @@ pub struct ResolvedTransfer {
     pub filter_from: Vec<Address>,
     /// Filter: only include transfers to these addresses.
     pub filter_to: Vec<Address>,
+    /// Whether receipt context fields were included (for streaming enrichment).
+    pub include_receipts: bool,
 }
 
 /// A fully resolved function call definition with pre-built SQL.
@@ -338,6 +376,8 @@ pub struct ResolvedCall {
     pub rollback_sql: String,
     /// Whether this call belongs to a factory-child contract.
     pub is_factory_child: bool,
+    /// Whether receipt context fields were included (for streaming enrichment).
+    pub include_receipts: bool,
 }
 
 /// A filter on a single indexed event parameter (topic).
@@ -378,6 +418,8 @@ pub struct ResolvedEvent {
     pub is_factory_child: bool,
     /// Indexed parameter filters for pre-decode filtering.
     pub topic_filters: Vec<TopicFilter>,
+    /// Whether receipt context fields were included (for streaming enrichment).
+    pub include_receipts: bool,
 }
 
 // ── Type mapping ──────────────────────────────────────────────────────
@@ -483,6 +525,10 @@ const RESERVED_COLUMNS: &[&str] = &[
     "tx_to",
     "tx_value",
     "tx_gas_price",
+    "tx_gas_used",
+    "tx_nonce",
+    "cumulative_gas_used",
+    "tx_status",
 ];
 
 /// Convert an ABI parameter name (camelCase, `_prefixed`) to snake_case
@@ -856,7 +902,7 @@ fn resolve_transfer(
     }
 
     let context_fields =
-        resolve_context_fields(t.context.as_deref(), &t.name, "transfer")?;
+        resolve_context_fields(t.context.as_deref(), &t.name, "transfer", t.include_receipts)?;
 
     let filter_from = parse_address_list(
         t.filter.as_ref().and_then(|f| f.from.as_deref()),
@@ -884,6 +930,7 @@ fn resolve_transfer(
         rollback_sql,
         filter_from,
         filter_to,
+        include_receipts: t.include_receipts,
     })
 }
 
@@ -1138,6 +1185,7 @@ fn resolve_contract(
             &contract.name,
             &abi,
             is_factory_child,
+            contract.include_receipts,
             table_names,
             resolved_events,
         )?;
@@ -1176,6 +1224,7 @@ fn resolve_contract(
             &contract.name,
             &abi,
             is_factory_child,
+            contract.include_receipts,
             table_names,
             resolved_calls,
         )?;
@@ -1206,6 +1255,7 @@ fn resolve_event(
     contract_name: &str,
     abi: &JsonAbi,
     is_factory_child: bool,
+    include_receipts: bool,
     table_names: &mut HashSet<String>,
     resolved_events: &mut Vec<ResolvedEvent>,
 ) -> eyre::Result<()> {
@@ -1234,6 +1284,7 @@ fn resolve_event(
         toml_event.context.as_deref(),
         contract_name,
         &toml_event.name,
+        include_receipts,
     )?;
     let columns = resolve_columns(
         toml_event.columns.as_deref(),
@@ -1267,6 +1318,7 @@ fn resolve_event(
         rollback_sql,
         is_factory_child,
         topic_filters,
+        include_receipts,
     });
 
     Ok(())
@@ -1351,6 +1403,7 @@ fn resolve_call(
     contract_name: &str,
     abi: &JsonAbi,
     is_factory_child: bool,
+    include_receipts: bool,
     table_names: &mut HashSet<String>,
     resolved_calls: &mut Vec<ResolvedCall>,
 ) -> eyre::Result<()> {
@@ -1379,6 +1432,7 @@ fn resolve_call(
         toml_call.context.as_deref(),
         contract_name,
         &toml_call.name,
+        include_receipts,
     )?;
     let columns = resolve_call_columns(
         toml_call.columns.as_deref(),
@@ -1413,6 +1467,7 @@ fn resolve_call(
         create_indexes_sql,
         rollback_sql,
         is_factory_child,
+        include_receipts,
     });
 
     Ok(())
@@ -1586,6 +1641,10 @@ fn resolve_columns(
 
 /// Resolve context fields from optional TOML string list.
 ///
+/// When `include_receipts` is true, automatically appends the four receipt
+/// context fields (`tx_gas_used`, `tx_nonce`, `cumulative_gas_used`,
+/// `tx_status`) if not already present.
+///
 /// # Errors
 ///
 /// Returns an error if any context field name is unrecognized or duplicated.
@@ -1593,26 +1652,34 @@ fn resolve_context_fields(
     names: Option<&[String]>,
     contract_name: &str,
     event_name: &str,
+    include_receipts: bool,
 ) -> eyre::Result<Vec<ContextField>> {
-    let Some(names) = names else {
-        return Ok(Vec::new());
-    };
-
-    let mut fields = Vec::with_capacity(names.len());
+    let mut fields = Vec::new();
     let mut seen = HashSet::new();
 
-    for name in names {
-        let field = ContextField::from_name(name).wrap_err_with(|| {
-            format!("in event '{contract_name}.{event_name}'")
-        })?;
+    if let Some(names) = names {
+        fields.reserve(names.len());
+        for name in names {
+            let field = ContextField::from_name(name).wrap_err_with(|| {
+                format!("in event '{contract_name}.{event_name}'")
+            })?;
 
-        if !seen.insert(name.as_str()) {
-            return Err(eyre::eyre!(
-                "duplicate context field '{name}' in event '{contract_name}.{event_name}'"
-            ));
+            if !seen.insert(name.as_str()) {
+                return Err(eyre::eyre!(
+                    "duplicate context field '{name}' in event '{contract_name}.{event_name}'"
+                ));
+            }
+
+            fields.push(field);
         }
+    }
 
-        fields.push(field);
+    if include_receipts {
+        for rcf in &RECEIPT_CONTEXT_FIELDS {
+            if !fields.contains(rcf) {
+                fields.push(*rcf);
+            }
+        }
     }
 
     Ok(fields)
@@ -2175,7 +2242,7 @@ context = ["block_timestamp", "tx_from"]
             "tx_value".to_string(),
             "tx_gas_price".to_string(),
         ];
-        let fields = resolve_context_fields(Some(&names), "Test", "Foo")?;
+        let fields = resolve_context_fields(Some(&names), "Test", "Foo", false)?;
         assert_eq!(fields.len(), 6);
         assert_eq!(fields[0], ContextField::BlockTimestamp);
         assert_eq!(fields[5], ContextField::TxGasPrice);
@@ -2185,7 +2252,7 @@ context = ["block_timestamp", "tx_from"]
     #[test]
     fn resolve_context_fields_unknown_errors() -> eyre::Result<()> {
         let names = vec!["nonexistent".to_string()];
-        let Err(err) = resolve_context_fields(Some(&names), "Test", "Foo") else {
+        let Err(err) = resolve_context_fields(Some(&names), "Test", "Foo", false) else {
             return Err(eyre::eyre!("expected error for unknown context field"));
         };
         let msg = format!("{err:?}");
@@ -2196,7 +2263,7 @@ context = ["block_timestamp", "tx_from"]
     #[test]
     fn resolve_context_fields_duplicate_errors() -> eyre::Result<()> {
         let names = vec!["block_timestamp".to_string(), "block_timestamp".to_string()];
-        let Err(err) = resolve_context_fields(Some(&names), "Test", "Foo") else {
+        let Err(err) = resolve_context_fields(Some(&names), "Test", "Foo", false) else {
             return Err(eyre::eyre!("expected error for duplicate context field"));
         };
         assert!(err.to_string().contains("duplicate context field"));
@@ -2205,8 +2272,44 @@ context = ["block_timestamp", "tx_from"]
 
     #[test]
     fn resolve_context_fields_none_is_empty() -> eyre::Result<()> {
-        let fields = resolve_context_fields(None, "Test", "Foo")?;
+        let fields = resolve_context_fields(None, "Test", "Foo", false)?;
         assert!(fields.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_context_fields_include_receipts_appends_four_fields() -> eyre::Result<()> {
+        let names = vec!["block_timestamp".to_string()];
+        let fields = resolve_context_fields(Some(&names), "Test", "Foo", true)?;
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[0], ContextField::BlockTimestamp);
+        assert_eq!(fields[1], ContextField::TxGasUsed);
+        assert_eq!(fields[2], ContextField::TxNonce);
+        assert_eq!(fields[3], ContextField::CumulativeGasUsed);
+        assert_eq!(fields[4], ContextField::TxStatus);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_context_fields_include_receipts_no_duplicates() -> eyre::Result<()> {
+        let names = vec!["tx_gas_used".to_string(), "block_timestamp".to_string()];
+        let fields = resolve_context_fields(Some(&names), "Test", "Foo", true)?;
+        // tx_gas_used already present, should not be duplicated
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[0], ContextField::TxGasUsed);
+        assert_eq!(fields[1], ContextField::BlockTimestamp);
+        assert_eq!(fields[2], ContextField::TxNonce);
+        assert_eq!(fields[3], ContextField::CumulativeGasUsed);
+        assert_eq!(fields[4], ContextField::TxStatus);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_context_fields_include_receipts_none_context() -> eyre::Result<()> {
+        let fields = resolve_context_fields(None, "Test", "Foo", true)?;
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], ContextField::TxGasUsed);
+        assert_eq!(fields[3], ContextField::TxStatus);
         Ok(())
     }
 
@@ -2434,6 +2537,7 @@ to = ["0xdAC17F958D2ee523a2206206994597C13D831ec7"]
             start_block: None,
             context: None,
             filter: None,
+            include_receipts: false,
         };
         let Err(err) = resolve_transfer(&t, &mut table_names) else {
             return Err(eyre::eyre!("expected error for duplicate table name"));

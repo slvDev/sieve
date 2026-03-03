@@ -615,6 +615,7 @@ mod tests {
             rollback_sql: String::new(),
             is_factory_child: false,
             topic_filters: vec![],
+            include_receipts: false,
         }
     }
 

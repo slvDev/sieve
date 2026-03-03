@@ -134,10 +134,12 @@ pub fn build_call_columns_meta(call: &ResolvedCall) -> Vec<ColumnMeta> {
 /// Base PG type for a context field (without NOT NULL suffix).
 const fn context_field_base_type(cf: ContextField) -> &'static str {
     match cf {
-        ContextField::BlockTimestamp | ContextField::TxGasPrice => "bigint",
+        ContextField::BlockTimestamp | ContextField::TxGasPrice | ContextField::TxGasUsed
+        | ContextField::TxNonce | ContextField::CumulativeGasUsed => "bigint",
         ContextField::BlockHash => "bytea",
         ContextField::TxFrom | ContextField::TxTo => "text",
         ContextField::TxValue => "numeric",
+        ContextField::TxStatus => "boolean",
     }
 }
 
@@ -346,6 +348,7 @@ mod tests {
             rollback_sql: String::new(),
             is_factory_child: false,
             topic_filters: vec![],
+            include_receipts: false,
         }
     }
 
@@ -460,6 +463,7 @@ mod tests {
             rollback_sql: String::new(),
             filter_from: vec![],
             filter_to: vec![],
+            include_receipts: false,
         }
     }
 
@@ -500,6 +504,7 @@ mod tests {
             create_indexes_sql: vec![],
             rollback_sql: String::new(),
             is_factory_child: false,
+            include_receipts: false,
         }
     }
 
