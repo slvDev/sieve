@@ -365,6 +365,31 @@ pub async fn drop_all_tables(
     Ok(())
 }
 
+/// DDL for the `_sieve_checkpoints` table.
+pub const CHECKPOINTS_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _sieve_checkpoints (
+    id SMALLINT PRIMARY KEY DEFAULT 1,
+    block_number BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)";
+
+/// DDL for the `_sieve_block_hashes` table.
+pub const BLOCK_HASHES_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _sieve_block_hashes (
+    block_number BIGINT PRIMARY KEY,
+    block_hash BYTEA NOT NULL
+)";
+
+/// DDL for the `_sieve_factory_children` table.
+pub const FACTORY_CHILDREN_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _sieve_factory_children (
+    id BIGSERIAL PRIMARY KEY,
+    factory_name TEXT NOT NULL,
+    child_address BYTEA NOT NULL,
+    block_number BIGINT NOT NULL,
+    UNIQUE (child_address)
+)";
+
 /// Create sieve-internal tables at runtime.
 ///
 /// Uses `CREATE TABLE IF NOT EXISTS` so it is safe to call on every startup.
@@ -374,40 +399,24 @@ pub async fn drop_all_tables(
 ///
 /// Returns an error if any DDL statement fails.
 pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
-    sqlx::raw_sql(
-        "CREATE TABLE IF NOT EXISTS _sieve_checkpoints (
-            id SMALLINT PRIMARY KEY DEFAULT 1,
-            block_number BIGINT NOT NULL DEFAULT 0,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        INSERT INTO _sieve_checkpoints (id, block_number) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;",
-    )
-    .execute(db.pool())
-    .await
-    .wrap_err("failed to create _sieve_checkpoints")?;
+    let checkpoints_sql = format!(
+        "{CHECKPOINTS_DDL};\n\
+         INSERT INTO _sieve_checkpoints (id, block_number) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;"
+    );
+    sqlx::raw_sql(&checkpoints_sql)
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to create _sieve_checkpoints")?;
 
-    sqlx::raw_sql(
-        "CREATE TABLE IF NOT EXISTS _sieve_block_hashes (
-            block_number BIGINT PRIMARY KEY,
-            block_hash BYTEA NOT NULL
-        );",
-    )
-    .execute(db.pool())
-    .await
-    .wrap_err("failed to create _sieve_block_hashes")?;
+    sqlx::raw_sql(&format!("{BLOCK_HASHES_DDL};"))
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to create _sieve_block_hashes")?;
 
-    sqlx::raw_sql(
-        "CREATE TABLE IF NOT EXISTS _sieve_factory_children (
-            id BIGSERIAL PRIMARY KEY,
-            factory_name TEXT NOT NULL,
-            child_address BYTEA NOT NULL,
-            block_number BIGINT NOT NULL,
-            UNIQUE (child_address)
-        );",
-    )
-    .execute(db.pool())
-    .await
-    .wrap_err("failed to create _sieve_factory_children")?;
+    sqlx::raw_sql(&format!("{FACTORY_CHILDREN_DDL};"))
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to create _sieve_factory_children")?;
 
     info!("internal tables ready");
     Ok(())

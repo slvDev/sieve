@@ -14,6 +14,7 @@ mod cli;
 mod config;
 mod db;
 mod decode;
+mod etherscan;
 mod filter;
 mod handler;
 mod metrics;
@@ -44,7 +45,36 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     let cli = cli::Cli::parse();
-    let startup = load_toml_config(&cli)?;
+
+    // Route subcommands
+    if let Some(ref command) = cli.command {
+        return match command {
+            cli::Command::Init => cmd_init(&cli),
+            cli::Command::Schema => cmd_schema(&cli),
+            cli::Command::Reset => cmd_reset(&cli).await,
+            cli::Command::AddContract {
+                address,
+                name,
+                start_block,
+                etherscan_api_key,
+            } => {
+                cmd_add_contract(&cli, address, name.as_deref(), *start_block, etherscan_api_key.as_deref())
+                    .await
+            }
+            cli::Command::Inspect => cmd_inspect(&cli),
+        };
+    }
+
+    run_default(&cli).await
+}
+
+/// Run the default indexer path (no subcommand).
+///
+/// # Errors
+///
+/// Returns an error on config, database, P2P, or sync failures.
+async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
+    let startup = load_toml_config(cli)?;
 
     // Validate --end-block if provided
     if let Some(end_block) = cli.end_block {
@@ -67,7 +97,7 @@ async fn main() -> eyre::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(shutdown_handler(stop_tx));
 
-    let db = Arc::new(setup_database(&cli, &startup).await?);
+    let db = Arc::new(setup_database(cli, &startup).await?);
 
     let index_config = Arc::new(startup.index_config);
     info!(contracts = index_config.contracts.len(), "loaded index config");
@@ -166,7 +196,7 @@ async fn main() -> eyre::Result<()> {
         receipt_tables,
     };
 
-    run_indexer(&cli, startup.start_block, ctx).await
+    run_indexer(cli, startup.start_block, ctx).await
 }
 
 /// Resolved startup parameters from TOML config + CLI.
@@ -182,49 +212,74 @@ struct StartupConfig {
     start_block: BlockNumber,
 }
 
+/// Parsed + resolved config (no DB URL needed).
+struct ResolvedStartup {
+    sieve_config: toml_config::SieveConfig,
+    resolved: toml_config::ResolvedConfig,
+}
+
+/// Load and resolve TOML config without requiring a database URL.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read, parsed, or resolved.
+fn load_resolved_config(cli: &cli::Cli) -> eyre::Result<ResolvedStartup> {
+    let config_path = Path::new(&cli.config);
+    let sieve_config = toml_config::load_config(config_path)?;
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let resolved = toml_config::resolve_config(&sieve_config, config_dir)?;
+    Ok(ResolvedStartup {
+        sieve_config,
+        resolved,
+    })
+}
+
+/// Resolve database URL: CLI > env > TOML. Error if none provided.
+///
+/// # Errors
+///
+/// Returns an error if no database URL is available from any source.
+fn resolve_database_url(
+    cli: &cli::Cli,
+    config: &toml_config::SieveConfig,
+) -> eyre::Result<String> {
+    cli.database_url
+        .clone()
+        .or_else(|| config.database.as_ref().and_then(|d| d.url.clone()))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "no database URL provided. Use --database-url, DATABASE_URL env var, or [database].url in config"
+            )
+        })
+}
+
 /// Load TOML config, resolve ABI files, and compute startup parameters.
 ///
 /// # Errors
 ///
 /// Returns an error if the config file cannot be read, parsed, or resolved.
 fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
-    let config_path = Path::new(&cli.config);
-    let sieve_config = toml_config::load_config(config_path)?;
-    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-
-    // Resolve database URL: CLI > env > TOML
-    let database_url = cli
-        .database_url
-        .clone()
-        .or_else(|| {
-            sieve_config
-                .database
-                .as_ref()
-                .and_then(|d| d.url.clone())
-        })
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "no database URL provided. Use --database-url, DATABASE_URL env var, or [database].url in config"
-            )
-        })?;
-
-    let resolved = toml_config::resolve_config(&sieve_config, config_dir)?;
+    let startup = load_resolved_config(cli)?;
+    let database_url = resolve_database_url(cli, &startup.sieve_config)?;
 
     // Compute effective start_block: CLI override or minimum across contracts, factories, and transfers
     let start_block = BlockNumber::new(cli.start_block.unwrap_or_else(|| {
-        let contract_min = sieve_config
+        let contract_min = startup
+            .sieve_config
             .contracts
             .iter()
             .filter_map(|c| c.start_block)
             .min()
             .unwrap_or(u64::MAX);
-        let factory_min = resolved
+        let factory_min = startup
+            .resolved
             .factories
             .iter()
             .map(|f| f.start_block)
             .min()
             .unwrap_or(u64::MAX);
-        let transfer_min = sieve_config
+        let transfer_min = startup
+            .sieve_config
             .transfers
             .iter()
             .filter_map(|t| t.start_block)
@@ -235,14 +290,421 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 
     Ok(StartupConfig {
         database_url,
-        index_config: resolved.index_config,
-        resolved_events: resolved.resolved_events,
-        factories: resolved.factories,
-        resolved_transfers: resolved.transfers,
-        resolved_calls: resolved.calls,
-        resolved_streams: resolved.streams,
+        index_config: startup.resolved.index_config,
+        resolved_events: startup.resolved.resolved_events,
+        factories: startup.resolved.factories,
+        resolved_transfers: startup.resolved.transfers,
+        resolved_calls: startup.resolved.calls,
+        resolved_streams: startup.resolved.streams,
         start_block,
     })
+}
+
+// ── Subcommand handlers ──────────────────────────────────────────────
+
+/// Scaffold a new Sieve project.
+///
+/// # Errors
+///
+/// Returns an error if the config file already exists or file I/O fails.
+#[expect(clippy::print_stdout, reason = "CLI output for init command")]
+fn cmd_init(cli: &cli::Cli) -> eyre::Result<()> {
+    let config_path = Path::new(&cli.config);
+    if config_path.exists() {
+        return Err(eyre::eyre!("{} already exists", cli.config));
+    }
+
+    std::fs::create_dir_all("abis")
+        .map_err(|e| eyre::eyre!("failed to create abis/ directory: {e}"))?;
+
+    let template = r#"[database]
+url = "postgres://postgres:sieve@localhost:5432/sieve"
+
+# [[contracts]]
+# name = "MyContract"
+# address = "0x..."
+# abi = "abis/my_contract.json"
+# start_block = 21_000_000
+#
+# [[contracts.events]]
+# name = "Transfer"
+# table = "my_transfers"
+# context = ["block_timestamp", "tx_from"]
+"#;
+
+    std::fs::write(config_path, template)
+        .map_err(|e| eyre::eyre!("failed to write {}: {e}", cli.config))?;
+
+    println!("created {} and abis/", cli.config);
+    Ok(())
+}
+
+/// Print the SQL DDL that Sieve would generate from the config.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or resolved.
+#[expect(clippy::print_stdout, reason = "CLI output for schema command")]
+fn cmd_schema(cli: &cli::Cli) -> eyre::Result<()> {
+    let startup = load_resolved_config(cli)?;
+
+    println!("-- Internal tables\n");
+    println!("{};", db::CHECKPOINTS_DDL);
+    println!();
+    println!("{};", db::BLOCK_HASHES_DDL);
+    println!();
+    println!("{};", db::FACTORY_CHILDREN_DDL);
+
+    for event in &startup.resolved.resolved_events {
+        println!(
+            "\n-- Table: {} ({} / {})\n",
+            event.table_name, event.contract_name, event.event_name
+        );
+        println!("{}", event.create_table_sql);
+        for idx in &event.create_indexes_sql {
+            println!("{idx}");
+        }
+    }
+
+    for transfer in &startup.resolved.transfers {
+        println!("\n-- Table: {} (transfer)\n", transfer.table_name);
+        println!("{}", transfer.create_table_sql);
+        for idx in &transfer.create_indexes_sql {
+            println!("{idx}");
+        }
+    }
+
+    for call in &startup.resolved.calls {
+        println!(
+            "\n-- Table: {} ({} / {})\n",
+            call.table_name, call.contract_name, call.function_name
+        );
+        println!("{}", call.create_table_sql);
+        for idx in &call.create_indexes_sql {
+            println!("{idx}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Drop all tables and recreate them.
+///
+/// # Errors
+///
+/// Returns an error if the database connection or DDL fails.
+async fn cmd_reset(cli: &cli::Cli) -> eyre::Result<()> {
+    let startup = load_resolved_config(cli)?;
+    let database_url = resolve_database_url(cli, &startup.sieve_config)?;
+
+    let db = db::Database::connect(&database_url).await?;
+    db::drop_all_tables(
+        &db,
+        &startup.resolved.resolved_events,
+        &startup.resolved.transfers,
+        &startup.resolved.calls,
+    )
+    .await?;
+    db::create_internal_tables(&db).await?;
+    db::create_user_tables(&db, &startup.resolved.resolved_events).await?;
+    db::create_transfer_tables(&db, &startup.resolved.transfers).await?;
+    db::create_call_tables(&db, &startup.resolved.calls).await?;
+
+    info!("reset complete — all tables dropped and recreated");
+    Ok(())
+}
+
+/// Fetch a contract ABI from Etherscan and append it to the config.
+///
+/// # Errors
+///
+/// Returns an error if the address is invalid, the API key is missing,
+/// the Etherscan request fails, or the config file cannot be written.
+#[expect(clippy::print_stdout, reason = "CLI output for add-contract command")]
+async fn cmd_add_contract(
+    cli: &cli::Cli,
+    address: &str,
+    name_override: Option<&str>,
+    start_block: Option<u64>,
+    api_key: Option<&str>,
+) -> eyre::Result<()> {
+    use std::io::Write as _;
+
+    let parsed: alloy_primitives::Address = address
+        .parse()
+        .map_err(|_| eyre::eyre!("invalid address: {address}"))?;
+    let checksummed = alloy_primitives::Address::to_checksum(&parsed, None);
+
+    let api_key = api_key.ok_or_else(|| {
+        eyre::eyre!(
+            "Etherscan API key required. Use --etherscan-api-key or set ETHERSCAN_API_KEY env var"
+        )
+    })?;
+
+    let config_path = Path::new(&cli.config);
+    if !config_path.exists() {
+        return Err(eyre::eyre!(
+            "{} not found — run `sieve init` first",
+            cli.config
+        ));
+    }
+
+    let info = etherscan::fetch_contract_info(&checksummed, api_key).await?;
+
+    let contract_name = name_override.map_or_else(
+        || {
+            if info.name.is_empty() {
+                checksummed.chars().take(10).collect()
+            } else {
+                info.name.clone()
+            }
+        },
+        String::from,
+    );
+
+    let snake_name = toml_config::camel_to_snake_case(&contract_name);
+    let abi_path = format!("abis/{snake_name}.json");
+
+    save_abi_file(&info.abi_json, Path::new(&abi_path))?;
+
+    let abi: alloy_json_abi::JsonAbi = serde_json::from_str(&info.abi_json)
+        .map_err(|e| eyre::eyre!("failed to parse ABI JSON: {e}"))?;
+
+    let mut seen = HashSet::new();
+    let events: Vec<(String, String)> = abi
+        .events()
+        .filter(|ev| seen.insert(ev.name.clone()))
+        .map(|ev| {
+            let event_snake = toml_config::camel_to_snake_case(&ev.name);
+            let table = format!("{snake_name}_{event_snake}");
+            (ev.name.clone(), table)
+        })
+        .collect();
+
+    let toml_block = generate_contract_toml(
+        &contract_name,
+        &checksummed,
+        &abi_path,
+        start_block,
+        &events,
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(config_path)
+        .map_err(|e| eyre::eyre!("failed to open {}: {e}", cli.config))?;
+    file.write_all(toml_block.as_bytes())
+        .map_err(|e| eyre::eyre!("failed to write to {}: {e}", cli.config))?;
+
+    println!("added {contract_name} ({} events) to {}", events.len(), cli.config);
+    println!("  abi: {abi_path}");
+    if info.is_proxy {
+        println!("  note: proxy detected — using implementation ABI");
+    }
+    Ok(())
+}
+
+/// Save pretty-printed ABI JSON to a file, creating parent directories.
+fn save_abi_file(abi_json: &str, path: &Path) -> eyre::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| eyre::eyre!("failed to create {}: {e}", parent.display()))?;
+    }
+    // Pretty-print the ABI JSON
+    let parsed: serde_json::Value = serde_json::from_str(abi_json)
+        .map_err(|e| eyre::eyre!("failed to parse ABI JSON for formatting: {e}"))?;
+    let pretty = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| eyre::eyre!("failed to format ABI JSON: {e}"))?;
+    std::fs::write(path, pretty)
+        .map_err(|e| eyre::eyre!("failed to write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Generate a TOML `[[contracts]]` block with event definitions.
+#[must_use]
+fn generate_contract_toml(
+    name: &str,
+    address: &str,
+    abi_path: &str,
+    start_block: Option<u64>,
+    events: &[(String, String)],
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(256);
+    out.push_str("\n[[contracts]]\n");
+    let _ = writeln!(out, "name = \"{name}\"");
+    let _ = writeln!(out, "address = \"{address}\"");
+    let _ = writeln!(out, "abi = \"{abi_path}\"");
+    match start_block {
+        Some(block) => {
+            let _ = writeln!(out, "start_block = {block}");
+        }
+        None => {
+            let _ = writeln!(out, "# start_block = 0");
+        }
+    }
+
+    for (event_name, table_name) in events {
+        out.push('\n');
+        out.push_str("[[contracts.events]]\n");
+        let _ = writeln!(out, "name = \"{event_name}\"");
+        let _ = writeln!(out, "table = \"{table_name}\"");
+    }
+
+    out
+}
+
+/// Dry-run: show tables, columns, and filters from the config.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or resolved.
+#[expect(clippy::print_stdout, reason = "CLI output for inspect command")]
+fn cmd_inspect(cli: &cli::Cli) -> eyre::Result<()> {
+    let startup = load_resolved_config(cli)?;
+    let resolved = &startup.resolved;
+
+    // Group events by contract_name
+    let mut events_by_contract: HashMap<&str, Vec<&toml_config::ResolvedEvent>> = HashMap::new();
+    for re in &resolved.resolved_events {
+        events_by_contract
+            .entry(&re.contract_name)
+            .or_default()
+            .push(re);
+    }
+
+    // Group calls by contract_name
+    let mut calls_by_contract: HashMap<&str, Vec<&toml_config::ResolvedCall>> = HashMap::new();
+    for rc in &resolved.calls {
+        calls_by_contract
+            .entry(&rc.contract_name)
+            .or_default()
+            .push(rc);
+    }
+
+    // Contracts from TOML (for address/abi/start_block metadata)
+    let contracts = &startup.sieve_config.contracts;
+
+    println!("Contracts: {}", contracts.len());
+    for contract in contracts {
+        let addr = contract.address.as_deref().unwrap_or("(factory-child)");
+        println!("\n  {} ({addr})", contract.name);
+        println!("    abi: {}", contract.abi);
+        if let Some(sb) = contract.start_block {
+            println!("    start_block: {sb}");
+        }
+
+        if let Some(events) = events_by_contract.get(contract.name.as_str()) {
+            println!("\n    Events:");
+            for ev in events {
+                print_event_detail(ev);
+            }
+        }
+
+        if let Some(calls) = calls_by_contract.get(contract.name.as_str()) {
+            println!("\n    Calls:");
+            for call in calls {
+                print_call_detail(call);
+            }
+        }
+    }
+
+    // Transfers
+    if resolved.transfers.is_empty() {
+        println!("\nTransfers: (none)");
+    } else {
+        println!("\nTransfers: {}", resolved.transfers.len());
+        for t in &resolved.transfers {
+            print_transfer_detail(t);
+        }
+    }
+
+    // Streams
+    if resolved.streams.is_empty() {
+        println!("\nStreams: (none)");
+    } else {
+        println!("\nStreams: {}", resolved.streams.len());
+        for s in &resolved.streams {
+            println!("  {} ({})", s.name, s.stream_type);
+            println!("    url: {}", s.url);
+            println!("    backfill: {}", s.backfill);
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a single event's columns, context fields, and topic filters.
+#[expect(clippy::print_stdout, reason = "CLI output helper")]
+fn print_event_detail(event: &toml_config::ResolvedEvent) {
+    println!("      {} -> {}", event.event_name, event.table_name);
+    if !event.columns.is_empty() {
+        let cols: Vec<String> = event
+            .columns
+            .iter()
+            .map(|c| format!("{} ({})", c.column_name, c.pg_type))
+            .collect();
+        println!("        columns: {}", cols.join(", "));
+    }
+    if !event.context_fields.is_empty() {
+        let ctx: Vec<&str> = event.context_fields.iter().map(|f| f.pg_column_name()).collect();
+        println!("        context: {}", ctx.join(", "));
+    }
+    if !event.topic_filters.is_empty() {
+        println!(
+            "        topic_filters: {} filter(s)",
+            event.topic_filters.len()
+        );
+    }
+}
+
+/// Print a single call's columns and context fields.
+#[expect(clippy::print_stdout, reason = "CLI output helper")]
+fn print_call_detail(call: &toml_config::ResolvedCall) {
+    println!("      {} -> {}", call.function_name, call.table_name);
+    if !call.columns.is_empty() {
+        let cols: Vec<String> = call
+            .columns
+            .iter()
+            .map(|c| format!("{} ({})", c.column_name, c.pg_type))
+            .collect();
+        println!("        columns: {}", cols.join(", "));
+    }
+    if !call.context_fields.is_empty() {
+        let ctx: Vec<&str> = call.context_fields.iter().map(|f| f.pg_column_name()).collect();
+        println!("        context: {}", ctx.join(", "));
+    }
+}
+
+/// Print a single transfer's context fields and address filters.
+#[expect(clippy::print_stdout, reason = "CLI output helper")]
+fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
+    println!("  {} -> {}", transfer.name, transfer.table_name);
+    if !transfer.context_fields.is_empty() {
+        let ctx: Vec<&str> = transfer
+            .context_fields
+            .iter()
+            .map(|f| f.pg_column_name())
+            .collect();
+        println!("    context: {}", ctx.join(", "));
+    }
+    if !transfer.filter_from.is_empty() {
+        let addrs: Vec<String> = transfer
+            .filter_from
+            .iter()
+            .map(|a| alloy_primitives::Address::to_checksum(a, None))
+            .collect();
+        println!("    filter_from: {}", addrs.join(", "));
+    }
+    if !transfer.filter_to.is_empty() {
+        let addrs: Vec<String> = transfer
+            .filter_to
+            .iter()
+            .map(|a| alloy_primitives::Address::to_checksum(a, None))
+            .collect();
+        println!("    filter_to: {}", addrs.join(", "));
+    }
 }
 
 /// Run the indexer in either historical or follow mode.
@@ -440,4 +902,42 @@ fn build_stream_sinks(
             Some((sink, s.backfill))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_contract_toml_basic() {
+        let events = vec![
+            ("Transfer".to_owned(), "usdc_transfer".to_owned()),
+            ("Approval".to_owned(), "usdc_approval".to_owned()),
+        ];
+        let toml = generate_contract_toml("USDC", "0xA0b8", "abis/usdc.json", None, &events);
+        assert!(toml.contains("name = \"USDC\""));
+        assert!(toml.contains("address = \"0xA0b8\""));
+        assert!(toml.contains("abi = \"abis/usdc.json\""));
+        assert!(toml.contains("# start_block = 0"));
+        assert!(toml.contains("name = \"Transfer\""));
+        assert!(toml.contains("table = \"usdc_transfer\""));
+        assert!(toml.contains("name = \"Approval\""));
+        assert!(toml.contains("table = \"usdc_approval\""));
+    }
+
+    #[test]
+    fn generate_contract_toml_with_start_block() {
+        let events = vec![("Transfer".to_owned(), "usdc_transfer".to_owned())];
+        let toml =
+            generate_contract_toml("USDC", "0xA0b8", "abis/usdc.json", Some(21_000_000), &events);
+        assert!(toml.contains("start_block = 21000000"));
+        assert!(!toml.contains("# start_block"));
+    }
+
+    #[test]
+    fn generate_contract_toml_no_events() {
+        let toml = generate_contract_toml("Empty", "0x1234", "abis/empty.json", None, &[]);
+        assert!(toml.contains("name = \"Empty\""));
+        assert!(!toml.contains("[[contracts.events]]"));
+    }
 }

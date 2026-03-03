@@ -36,11 +36,13 @@ cargo build --release
 
 ### 2. Create your config
 
-Copy the example and edit it for your contracts:
-
 ```bash
-cp sieve.example.toml sieve.toml
+sieve init                        # creates sieve.toml and abis/
+sieve add-contract 0xA0b8... \    # fetch ABI from Etherscan, add to config
+  --etherscan-api-key $KEY
 ```
+
+Or copy the example and edit manually:
 
 ```toml
 [database]
@@ -322,7 +324,12 @@ Sieve auto-generates a full GraphQL schema from your TOML config. Every table ge
 ## CLI Reference
 
 ```
-sieve [OPTIONS]
+sieve [OPTIONS]                Run the indexer
+sieve init                     Scaffold a new project (sieve.toml + abis/)
+sieve schema                   Print generated SQL DDL
+sieve reset                    Drop and recreate all tables
+sieve inspect                  Dry-run: show tables, columns, and filters
+sieve add-contract <ADDRESS>   Fetch ABI from Etherscan and add to config
 
 Options:
   --config <PATH>         Path to TOML config file [default: sieve.toml]
@@ -331,6 +338,25 @@ Options:
   --database-url <URL>    PostgreSQL URL (or set DATABASE_URL env var)
   --api-port <PORT>       Enable GraphQL API on this port
   --fresh                 Drop and recreate all tables before indexing
+```
+
+### `sieve add-contract`
+
+Fetches a verified contract ABI from Etherscan, saves it to `abis/`, and appends a `[[contracts]]` block with all events to your config. Auto-detects proxy contracts.
+
+```bash
+sieve add-contract 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
+  --etherscan-api-key $ETHERSCAN_API_KEY \
+  --name USDC \
+  --start-block 21000000
+```
+
+### `sieve inspect`
+
+Validates your config without a database connection. Shows what tables, columns, context fields, and filters would be created.
+
+```bash
+sieve inspect --config sieve.toml
 ```
 
 ## Docker

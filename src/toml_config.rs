@@ -531,18 +531,13 @@ const RESERVED_COLUMNS: &[&str] = &[
     "tx_status",
 ];
 
-/// Convert an ABI parameter name (camelCase, `_prefixed`) to snake_case
-/// for use as a PostgreSQL column name.
+/// Convert a CamelCase or `_prefixed` identifier to snake_case.
 ///
 /// Strips leading underscores, inserts `_` at camelCase boundaries,
 /// and lowercases everything. Consecutive uppercase letters are treated
 /// as an acronym (e.g. `_L_ETH` → `l_eth`, not `l__e_t_h`).
-///
-/// If the result collides with a reserved schema column (e.g. `id`,
-/// `block_number`, `tx_hash`), it is prefixed with `param_` to avoid
-/// DDL conflicts.
 #[must_use]
-fn abi_param_to_snake_case(name: &str) -> String {
+pub fn camel_to_snake_case(name: &str) -> String {
     // Strip leading underscores
     let trimmed = name.trim_start_matches('_');
     if trimmed.is_empty() {
@@ -577,11 +572,20 @@ fn abi_param_to_snake_case(name: &str) -> String {
         }
     }
 
-    // Avoid collision with reserved schema columns
+    result
+}
+
+/// Convert an ABI parameter name to a snake_case PostgreSQL column name.
+///
+/// Uses [`camel_to_snake_case`] and then prefixes with `param_` if the
+/// result collides with a reserved schema column (e.g. `id`,
+/// `block_number`, `tx_hash`).
+#[must_use]
+fn abi_param_to_snake_case(name: &str) -> String {
+    let result = camel_to_snake_case(name);
     if RESERVED_COLUMNS.contains(&result.as_str()) {
         return format!("param_{result}");
     }
-
     result
 }
 
@@ -3294,6 +3298,16 @@ url = "http://localhost:8080/events"
         assert_eq!(abi_param_to_snake_case("tx_from"), "param_tx_from");
         assert_eq!(abi_param_to_snake_case("tx_to"), "param_tx_to");
         assert_eq!(abi_param_to_snake_case("tx_value"), "param_tx_value");
+    }
+
+    #[test]
+    fn camel_to_snake_case_no_reserved_prefix() {
+        // camel_to_snake_case should NOT add param_ prefix for reserved columns
+        assert_eq!(camel_to_snake_case("id"), "id");
+        assert_eq!(camel_to_snake_case("block_number"), "block_number");
+        assert_eq!(camel_to_snake_case("tx_hash"), "tx_hash");
+        // But abi_param_to_snake_case still does
+        assert_eq!(abi_param_to_snake_case("id"), "param_id");
     }
 
     // ── Duplicate column detection tests ───────────────────────────────
