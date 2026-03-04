@@ -60,6 +60,8 @@ pub enum Command {
     },
     /// Dry-run: show tables, columns, and filters from the config.
     Inspect,
+    /// Connect to P2P network and report peer count (no DB or config needed).
+    Peers,
 }
 
 #[cfg(test)]

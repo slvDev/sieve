@@ -62,6 +62,7 @@ async fn main() -> eyre::Result<()> {
                     .await
             }
             cli::Command::Inspect => cmd_inspect(&cli),
+            cli::Command::Peers => cmd_peers().await,
         };
     }
 
@@ -705,6 +706,37 @@ fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
             .collect();
         println!("    filter_to: {}", addrs.join(", "));
     }
+}
+
+/// Connect to P2P network and report peer count until interrupted.
+///
+/// # Errors
+///
+/// Returns an error if the P2P network fails to start.
+#[expect(clippy::print_stdout, reason = "CLI output for peers command")]
+async fn cmd_peers() -> eyre::Result<()> {
+    println!("Connecting to Ethereum P2P network...");
+    let session = p2p::connect_mainnet_peers().await?;
+    println!(
+        "Startup complete: {} peers connected",
+        session.pool.len()
+    );
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let count = session.pool.len();
+                let best = session.pool.best_peer_head().unwrap_or(0);
+                println!("peers={count} best_head={best}");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("Shutting down.");
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run the indexer in either historical or follow mode.

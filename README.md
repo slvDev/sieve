@@ -333,6 +333,7 @@ sieve schema                   Print generated SQL DDL
 sieve reset                    Drop and recreate all tables
 sieve inspect                  Dry-run: show tables, columns, and filters
 sieve add-contract <ADDRESS>   Fetch ABI from Etherscan and add to config
+sieve peers                    Test P2P connectivity (no DB or config needed)
 
 Options:
   --config <PATH>         Path to TOML config file [default: sieve.toml]
@@ -360,6 +361,17 @@ Validates your config without a database connection. Shows what tables, columns,
 
 ```bash
 sieve inspect --config sieve.toml
+```
+
+### `sieve peers`
+
+Tests P2P connectivity without requiring a database or config file. Connects to the Ethereum network and reports peer count and best known head every 5 seconds. Useful for diagnosing networking issues in Docker or NAT environments.
+
+```bash
+sieve peers
+# peers=5 best_head=22525078
+# peers=8 best_head=22525090
+# ^C Shutting down.
 ```
 
 ## Docker

@@ -315,6 +315,8 @@ fn spawn_peer_watcher(
                         head_number: 0,
                     });
 
+                    info!(peers = pool.len(), "peer connected");
+
                     let pool_for_probe = Arc::clone(&pool);
                     let semaphore = Arc::clone(&head_probe_semaphore);
                     tokio::spawn(async move {
@@ -337,12 +339,13 @@ fn spawn_peer_watcher(
                 }
                 NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
                     p2p_stats.sessions_closed.fetch_add(1, Ordering::Relaxed);
+                    pool.remove_peer(peer_id);
                     debug!(
                         peer_id = %format!("{:#}", peer_id),
                         reason = ?reason,
-                        "peer session closed"
+                        peers = pool.len(),
+                        "peer disconnected"
                     );
-                    pool.remove_peer(peer_id);
                 }
                 NetworkEvent::Peer(PeerEvent::PeerRemoved(peer_id)) => {
                     pool.remove_peer(peer_id);
