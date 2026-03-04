@@ -129,11 +129,22 @@ async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
         return Ok(EpochAction::Wait);
     };
 
-    ctx.metrics.chain_head.set(observed_head as i64);
+    // If the gap fills most of the 1024-block probe window, the true head
+    // is likely further. Use peer-reported heads to size the full gap so
+    // run_sync processes it in one fast batch instead of many small epochs.
+    let effective_head = if observed_head >= baseline + 1000 {
+        ctx.pool
+            .best_peer_head()
+            .map_or(observed_head, |peer_head| observed_head.max(peer_head))
+    } else {
+        observed_head
+    };
+
+    ctx.metrics.chain_head.set(effective_head as i64);
 
     let next_block = baseline + 1;
-    if next_block > observed_head {
-        debug!(next_block, observed_head, "at tip, waiting");
+    if next_block > effective_head {
+        debug!(next_block, effective_head, "at tip, waiting");
         return Ok(EpochAction::Wait);
     }
 
@@ -155,7 +166,7 @@ async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
 
     Ok(EpochAction::Sync {
         next_block,
-        head: observed_head,
+        head: effective_head,
     })
 }
 

@@ -136,6 +136,19 @@ impl PeerPool {
             peer.head_number = head_number;
         }
     }
+
+    /// Return the highest known head block number across all peers.
+    ///
+    /// Ignores peers whose head has not been probed yet (`head_number == 0`).
+    #[must_use]
+    pub fn best_peer_head(&self) -> Option<u64> {
+        self.peers
+            .read()
+            .iter()
+            .map(|p| p.head_number)
+            .filter(|&h| h > 0)
+            .max()
+    }
 }
 
 // ── Fetch types ─────────────────────────────────────────────────────
