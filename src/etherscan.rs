@@ -22,10 +22,7 @@ pub struct ContractInfo {
 ///
 /// Returns an error if the HTTP request fails, the contract is not verified,
 /// or the response cannot be parsed.
-pub async fn fetch_contract_info(
-    address: &str,
-    api_key: &str,
-) -> eyre::Result<ContractInfo> {
+pub async fn fetch_contract_info(address: &str, api_key: &str) -> eyre::Result<ContractInfo> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -80,9 +77,7 @@ async fn fetch_source_code(
 ///
 /// Returns an error if the response status is not "1", the ABI indicates
 /// the contract is not verified, or required fields are missing.
-fn parse_source_code_response(
-    resp: &serde_json::Value,
-) -> eyre::Result<(String, String, String)> {
+fn parse_source_code_response(resp: &serde_json::Value) -> eyre::Result<(String, String, String)> {
     let status = resp["status"].as_str().unwrap_or("0");
     if status != "1" {
         let message = resp["message"].as_str().unwrap_or("unknown error");
@@ -99,24 +94,23 @@ fn parse_source_code_response(
         .ok_or_else(|| eyre::eyre!("etherscan response missing ABI field"))?;
 
     if abi_json == "Contract source code not verified" {
-        return Err(eyre::eyre!("contract source code not verified on Etherscan"));
+        return Err(eyre::eyre!(
+            "contract source code not verified on Etherscan"
+        ));
     }
 
-    let name = result["ContractName"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
+    let name = result["ContractName"].as_str().unwrap_or("").to_owned();
 
-    let implementation = result["Implementation"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
+    let implementation = result["Implementation"].as_str().unwrap_or("").to_owned();
 
     Ok((name, abi_json.to_owned(), implementation))
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
 
@@ -157,10 +151,7 @@ mod tests {
 
         let (name, _abi, implementation) = parse_source_code_response(&json)?;
         assert_eq!(name, "FiatTokenProxy");
-        assert_eq!(
-            implementation,
-            "0x43506849D7C04F9138D1A2050bbF3A0c054402dd"
-        );
+        assert_eq!(implementation, "0x43506849D7C04F9138D1A2050bbF3A0c054402dd");
         Ok(())
     }
 

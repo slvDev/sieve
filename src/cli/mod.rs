@@ -65,7 +65,10 @@ pub enum Command {
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
 
@@ -85,7 +88,10 @@ mod tests {
         assert_eq!(cli.config, "custom.toml");
         assert_eq!(cli.start_block, Some(21_000_000));
         assert_eq!(cli.end_block, Some(21_000_100));
-        assert_eq!(cli.database_url.as_deref(), Some("postgres://localhost/sieve"));
+        assert_eq!(
+            cli.database_url.as_deref(),
+            Some("postgres://localhost/sieve")
+        );
         Ok(())
     }
 
@@ -191,7 +197,13 @@ mod tests {
             "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
         ])?;
         assert!(matches!(cli.command, Some(Command::AddContract { .. })));
-        if let Some(Command::AddContract { address, name, start_block, etherscan_api_key }) = cli.command {
+        if let Some(Command::AddContract {
+            address,
+            name,
+            start_block,
+            etherscan_api_key,
+        }) = cli.command
+        {
             assert_eq!(address, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
             assert!(name.is_none());
             assert!(start_block.is_none());
@@ -213,7 +225,13 @@ mod tests {
             "--etherscan-api-key",
             "MYKEY123",
         ])?;
-        if let Some(Command::AddContract { address, name, start_block, etherscan_api_key }) = cli.command {
+        if let Some(Command::AddContract {
+            address,
+            name,
+            start_block,
+            etherscan_api_key,
+        }) = cli.command
+        {
             assert_eq!(address, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
             assert_eq!(name.as_deref(), Some("USDC"));
             assert_eq!(start_block, Some(21_000_000));

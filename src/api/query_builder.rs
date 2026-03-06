@@ -233,7 +233,9 @@ pub fn parse_filter_value(
         }
         "integer" => {
             let s = value_as_string(value)?;
-            let n: i32 = s.parse().map_err(|_| eyre::eyre!("invalid integer: '{s}'"))?;
+            let n: i32 = s
+                .parse()
+                .map_err(|_| eyre::eyre!("invalid integer: '{s}'"))?;
             Ok(SqlParam::Int32(n))
         }
         "bytea" => {
@@ -457,7 +459,10 @@ pub fn parse_where_clause(
     }
 
     if conditions.len() == 1 {
-        Ok(conditions.into_iter().next().unwrap_or_else(|| WhereClause::And(Vec::new())))
+        Ok(conditions
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| WhereClause::And(Vec::new())))
     } else {
         Ok(WhereClause::And(conditions))
     }
@@ -523,8 +528,7 @@ pub fn decode_cursor(cursor: &str) -> eyre::Result<Cursor> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(cursor)
         .map_err(|e| eyre::eyre!("invalid cursor encoding: {e}"))?;
-    let s = String::from_utf8(bytes)
-        .map_err(|e| eyre::eyre!("cursor is not valid UTF-8: {e}"))?;
+    let s = String::from_utf8(bytes).map_err(|e| eyre::eyre!("cursor is not valid UTF-8: {e}"))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&s).map_err(|e| eyre::eyre!("invalid cursor JSON: {e}"))?;
 
@@ -564,15 +568,17 @@ pub fn build_cursor_condition(
     let is_numeric = matches!(order_pg_type, "bigint" | "numeric" | "bigserial");
     let cast = if is_numeric {
         // bigserial is a DDL pseudo-type; runtime cast type is bigint
-        let cast_type = if order_pg_type == "bigserial" { "bigint" } else { order_pg_type };
+        let cast_type = if order_pg_type == "bigserial" {
+            "bigint"
+        } else {
+            order_pg_type
+        };
         format!("::{cast_type}")
     } else {
         String::new()
     };
 
-    let sql = format!(
-        "(\"{order_col}\", id) {cmp} (${val_idx}{cast}, ${id_idx})"
-    );
+    let sql = format!("(\"{order_col}\", id) {cmp} (${val_idx}{cast}, ${id_idx})");
 
     let params = vec![
         SqlParam::Text(cursor.sort_value.clone()),
@@ -628,7 +634,11 @@ pub fn build_select_with_cursor(p: &SelectParams<'_>) -> (String, Vec<SqlParam>)
         sql.push_str(&conditions.join(" AND "));
     }
 
-    let _ = write!(sql, " ORDER BY \"{}\" {}, id {}", p.order_by, p.order_dir, p.order_dir);
+    let _ = write!(
+        sql,
+        " ORDER BY \"{}\" {}, id {}",
+        p.order_by, p.order_dir, p.order_dir
+    );
 
     let clamped_limit = p.limit.clamp(1, MAX_LIMIT);
 
@@ -688,7 +698,10 @@ pub fn bind_params<'q>(
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
     use crate::test_utils::test_columns;
@@ -753,15 +766,7 @@ mod tests {
             op: FilterOp::Gte,
             value: SqlParam::Text("21000000".into()),
         });
-        let (sql, params) = build_select(
-            "usdc_transfers",
-            "*",
-            Some(&wc),
-            "id",
-            "DESC",
-            100,
-            0,
-        );
+        let (sql, params) = build_select("usdc_transfers", "*", Some(&wc), "id", "DESC", 100, 0);
         assert_eq!(
             sql,
             "SELECT * FROM usdc_transfers WHERE \"block_number\" >= $1::bigint ORDER BY \"id\" DESC LIMIT $2 OFFSET $3"
@@ -947,7 +952,10 @@ mod tests {
     #[test]
     fn build_condition_in_numeric() {
         let sql = build_condition_in("block_number", "bigint", false, 3, 1);
-        assert_eq!(sql, "\"block_number\" IN ($1::bigint, $2::bigint, $3::bigint)");
+        assert_eq!(
+            sql,
+            "\"block_number\" IN ($1::bigint, $2::bigint, $3::bigint)"
+        );
     }
 
     #[test]
@@ -1126,7 +1134,10 @@ mod tests {
         let wc = WhereClause::And(vec![]);
         let (sql, params) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
         // Empty where clause should not produce WHERE
-        assert_eq!(sql, "SELECT * FROM t ORDER BY \"id\" DESC LIMIT $1 OFFSET $2");
+        assert_eq!(
+            sql,
+            "SELECT * FROM t ORDER BY \"id\" DESC LIMIT $1 OFFSET $2"
+        );
         assert_eq!(params.len(), 2);
     }
 

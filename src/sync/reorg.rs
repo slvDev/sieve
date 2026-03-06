@@ -42,7 +42,10 @@ pub async fn preflight_reorg(
     last_indexed: u64,
 ) -> Result<ReorgCheck> {
     let Some(stored_hash) = db.get_block_hash(BlockNumber::new(last_indexed)).await? else {
-        debug!(block = last_indexed, "no stored hash — skipping reorg check");
+        debug!(
+            block = last_indexed,
+            "no stored hash — skipping reorg check"
+        );
         return Ok(ReorgCheck::NoReorg);
     };
 
@@ -155,7 +158,11 @@ pub async fn find_common_ancestor(
 
         if let (Some(s), Some(n)) = (stored, network) {
             if s == *n {
-                info!(common_ancestor = block, depth = last_indexed - block, "found common ancestor");
+                info!(
+                    common_ancestor = block,
+                    depth = last_indexed - block,
+                    "found common ancestor"
+                );
                 return Ok(block);
             }
         }

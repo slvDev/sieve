@@ -11,9 +11,8 @@ use crate::api::query_builder::{
     validate_order_column, Cursor, SelectParams, WhereClause, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use crate::api::types::{
-    build_call_columns_meta, build_columns_meta, build_select_clause,
-    build_transfer_columns_meta, operators_for_type, pg_to_graphql_type, row_to_json,
-    to_pascal_case, ColumnMeta,
+    build_call_columns_meta, build_columns_meta, build_select_clause, build_transfer_columns_meta,
+    operators_for_type, pg_to_graphql_type, row_to_json, to_pascal_case, ColumnMeta,
 };
 use crate::toml_config::{ResolvedCall, ResolvedEvent, ResolvedTransfer};
 
@@ -56,8 +55,8 @@ pub fn build_schema(
     builder = builder.register(build_page_info_type());
 
     // Build Query root
-    let mut query = Object::new("Query")
-        .description("Auto-generated query API for indexed Ethereum events");
+    let mut query =
+        Object::new("Query").description("Auto-generated query API for indexed Ethereum events");
 
     // Add _meta field
     query = add_meta_field(query);
@@ -166,7 +165,9 @@ pub fn build_schema(
     builder = builder.register(query);
     builder = builder.data(pool);
 
-    builder.finish().map_err(|e| eyre::eyre!("GraphQL schema build failed: {e}"))
+    builder
+        .finish()
+        .map_err(|e| eyre::eyre!("GraphQL schema build failed: {e}"))
 }
 
 // ── Output Object type ───────────────────────────────────────────────
@@ -188,14 +189,13 @@ fn build_output_object(type_name: &str, columns: &[ColumnMeta]) -> Object {
 
                 match row.get(&name) {
                     Some(serde_json::Value::Null) | None => Ok(None),
-                    Some(serde_json::Value::String(s)) => {
-                        Ok(Some(FieldValue::value(s.clone())))
-                    }
-                    Some(serde_json::Value::Bool(b)) => {
-                        Ok(Some(FieldValue::value(*b)))
-                    }
+                    Some(serde_json::Value::String(s)) => Ok(Some(FieldValue::value(s.clone()))),
+                    Some(serde_json::Value::Bool(b)) => Ok(Some(FieldValue::value(*b))),
                     Some(serde_json::Value::Number(n)) => {
-                        #[expect(clippy::cast_possible_truncation, reason = "integer columns are i32")]
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "integer columns are i32"
+                        )]
                         let val = n.as_i64().map_or_else(
                             || FieldValue::value(n.to_string()),
                             |i| FieldValue::value(i as i32),
@@ -274,7 +274,10 @@ fn build_page_info_type() -> Object {
             |ctx| {
                 FieldFuture::new(async move {
                     let info = ctx.parent_value.try_downcast_ref::<PageInfoData>()?;
-                    Ok(info.end_cursor.as_ref().map(|c| FieldValue::value(c.clone())))
+                    Ok(info
+                        .end_cursor
+                        .as_ref()
+                        .map(|c| FieldValue::value(c.clone())))
                 })
             },
         ))
@@ -351,9 +354,7 @@ fn build_query_field(
         move |ctx| {
             let pool = pool.clone();
             let meta = Arc::clone(&meta);
-            FieldFuture::new(async move {
-                resolve_connection(ctx, &pool, &meta).await
-            })
+            FieldFuture::new(async move { resolve_connection(ctx, &pool, &meta).await })
         },
     )
     .argument(InputValue::new("where", TypeRef::named(filter_type_name)))
@@ -362,12 +363,10 @@ fn build_query_field(
         TypeRef::named(order_by_type_name),
     ))
     .argument(
-        InputValue::new("orderDirection", TypeRef::named("OrderDirection"))
-            .default_value("DESC"),
+        InputValue::new("orderDirection", TypeRef::named("OrderDirection")).default_value("DESC"),
     )
     .argument(
-        InputValue::new("first", TypeRef::named(TypeRef::INT))
-            .default_value(DEFAULT_LIMIT as i32),
+        InputValue::new("first", TypeRef::named(TypeRef::INT)).default_value(DEFAULT_LIMIT as i32),
     )
     .argument(InputValue::new("skip", TypeRef::named(TypeRef::INT)).default_value(0i32))
     .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING)))
@@ -417,8 +416,7 @@ async fn resolve_connection(
         &rows[..]
     };
 
-    let mut nodes: Vec<HashMap<String, serde_json::Value>> =
-        Vec::with_capacity(result_rows.len());
+    let mut nodes: Vec<HashMap<String, serde_json::Value>> = Vec::with_capacity(result_rows.len());
     for row in result_rows {
         let map = row_to_json(row, &meta.columns)
             .map_err(|e| async_graphql::Error::new(format!("row extraction failed: {e:#}")))?;
@@ -485,7 +483,11 @@ fn parse_query_args(
         .ok()
         .and_then(|v| {
             let name = v.enum_name().ok()?;
-            if name == "ASC" { Some("ASC") } else { Some("DESC") }
+            if name == "ASC" {
+                Some("ASC")
+            } else {
+                Some("DESC")
+            }
         })
         .unwrap_or("DESC");
 
@@ -538,13 +540,11 @@ fn compute_end_cursor(
     let last_row = rows.last()?;
     let last_map = row_to_json(last_row, &meta.columns).ok()?;
 
-    let sort_value = last_map
-        .get(order_by)
-        .and_then(|v| match v {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })?;
+    let sort_value = last_map.get(order_by).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })?;
 
     let id = last_map.get("id").and_then(|v| match v {
         serde_json::Value::String(s) => s.parse::<i64>().ok(),
@@ -559,14 +559,18 @@ fn compute_end_cursor(
 
 fn build_meta_type() -> Object {
     let obj = Object::new("_Meta");
-    obj.field(Field::new("block", TypeRef::named_nn(TypeRef::STRING), |ctx| {
-        let block_str = ctx
-            .parent_value
-            .try_downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default();
-        FieldFuture::new(async move { Ok(Some(FieldValue::value(block_str))) })
-    }))
+    obj.field(Field::new(
+        "block",
+        TypeRef::named_nn(TypeRef::STRING),
+        |ctx| {
+            let block_str = ctx
+                .parent_value
+                .try_downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            FieldFuture::new(async move { Ok(Some(FieldValue::value(block_str))) })
+        },
+    ))
 }
 
 fn add_meta_field(query: Object) -> Object {
@@ -574,12 +578,13 @@ fn add_meta_field(query: Object) -> Object {
         FieldFuture::new(async move {
             let pool = ctx.data::<PgPool>()?;
 
-            let row: (i64,) = sqlx::query_as(
-                "SELECT block_number FROM _sieve_checkpoints WHERE id = 1",
-            )
-            .fetch_one(pool)
-            .await
-            .map_err(|e| async_graphql::Error::new(format!("checkpoint query failed: {e}")))?;
+            let row: (i64,) =
+                sqlx::query_as("SELECT block_number FROM _sieve_checkpoints WHERE id = 1")
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| {
+                        async_graphql::Error::new(format!("checkpoint query failed: {e}"))
+                    })?;
 
             Ok(Some(FieldValue::owned_any(row.0.to_string())))
         })

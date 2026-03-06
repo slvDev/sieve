@@ -62,7 +62,10 @@ impl RabbitMqSink {
     }
 
     /// Resolve the routing key by substituting `{table}` and `{event}` placeholders.
-    #[expect(clippy::literal_string_with_formatting_args, reason = "template placeholders, not format args")]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "template placeholders, not format args"
+    )]
     #[must_use]
     fn resolve_routing_key(&self, table: &str, event: &str) -> String {
         self.routing_key_template

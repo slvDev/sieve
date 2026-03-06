@@ -107,7 +107,10 @@ impl PeerPool {
     /// Add a peer if not already present.
     fn add_peer(&self, peer: NetworkPeer) {
         let mut peers = self.peers.write();
-        if peers.iter().any(|existing| existing.peer_id == peer.peer_id) {
+        if peers
+            .iter()
+            .any(|existing| existing.peer_id == peer.peer_id)
+        {
             return;
         }
         peers.push(peer);
@@ -155,7 +158,10 @@ impl PeerPool {
 
 /// Timing and request counts per fetch stage.
 #[derive(Debug, Clone, Copy, Default)]
-#[expect(dead_code, reason = "stats populated during fetch for future metrics/logging")]
+#[expect(
+    dead_code,
+    reason = "stats populated during fetch for future metrics/logging"
+)]
 pub struct FetchStageStats {
     pub headers_ms: u64,
     pub bodies_ms: u64,
@@ -234,11 +240,7 @@ pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
     let p2p_stats = Arc::new(P2pStats::new());
 
     spawn_peer_discovery_watcher(handle.clone(), Arc::clone(&p2p_stats));
-    spawn_peer_watcher(
-        handle.clone(),
-        Arc::clone(&pool),
-        Arc::clone(&p2p_stats),
-    );
+    spawn_peer_watcher(handle.clone(), Arc::clone(&pool), Arc::clone(&p2p_stats));
 
     let warmup_started = Instant::now();
     let _connected =
@@ -569,10 +571,7 @@ async fn request_bodies(
     Ok(bodies.0)
 }
 
-async fn request_receipts_legacy(
-    peer: &NetworkPeer,
-    hashes: &[B256],
-) -> Result<Vec<Vec<Receipt>>> {
+async fn request_receipts_legacy(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
     let request = GetReceipts(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages

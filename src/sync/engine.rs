@@ -4,8 +4,8 @@
 //! and JoinSet task tracking.
 
 use crate::config::IndexConfig;
-use crate::db::{self, Database};
 use crate::config::Selector;
+use crate::db::{self, Database};
 use crate::decode::DecodedParam;
 use crate::handler::{
     CallRegistry, DecodedCall, EventContext, HandlerRegistry, NativeTransfer, TransferRegistry,
@@ -24,12 +24,12 @@ use crate::{decode, filter};
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::Transaction;
 use alloy_dyn_abi::JsonAbiExt;
-use alloy_primitives::{Address, B256, TxKind};
+use alloy_primitives::{Address, TxKind, B256};
 use eyre::WrapErr;
-use sqlx::Postgres;
 use prometheus_client::metrics::gauge::Gauge;
 use reth_network_api::PeerId;
 use reth_primitives_traits::SealedHeader;
+use sqlx::Postgres;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -128,7 +128,12 @@ pub async fn run_sync(
     let started = Instant::now();
     let total_blocks = end_block.as_u64().saturating_sub(start_block.as_u64()) + 1;
 
-    info!(start_block = start_block.as_u64(), end_block = end_block.as_u64(), total_blocks, "starting sync");
+    info!(
+        start_block = start_block.as_u64(),
+        end_block = end_block.as_u64(),
+        total_blocks,
+        "starting sync"
+    );
 
     // Setup scheduler
     let sched_config = SchedulerConfig::default();
@@ -149,11 +154,8 @@ pub async fn run_sync(
     let (feeder_shutdown_tx, feeder_shutdown_rx) = watch::channel(false);
 
     // Spawn peer feeder
-    let feeder_handle = spawn_peer_feeder(
-        Arc::clone(&ctx.pool),
-        ready_tx.clone(),
-        feeder_shutdown_rx,
-    );
+    let feeder_handle =
+        spawn_peer_feeder(Arc::clone(&ctx.pool), ready_tx.clone(), feeder_shutdown_rx);
 
     // Spawn payload consumer
     let consumer_handle = tokio::spawn(consume_payloads(
@@ -191,9 +193,7 @@ pub async fn run_sync(
     let _ = feeder_handle.await;
     drop(payload_tx);
 
-    let stats = consumer_handle
-        .await
-        .wrap_err("consumer task failed")?;
+    let stats = consumer_handle.await.wrap_err("consumer task failed")?;
 
     let elapsed = started.elapsed();
     Ok(SyncOutcome {
@@ -558,11 +558,7 @@ async fn pick_best_ready_peer_index(
     best_idx
 }
 
-fn recycle_peer(
-    ready_tx: &mpsc::UnboundedSender<NetworkPeer>,
-    peer: NetworkPeer,
-    delay_ms: u64,
-) {
+fn recycle_peer(ready_tx: &mpsc::UnboundedSender<NetworkPeer>, peer: NetworkPeer, delay_ms: u64) {
     let tx = ready_tx.clone();
     tokio::spawn(async move {
         sleep(Duration::from_millis(delay_ms)).await;
@@ -618,7 +614,10 @@ async fn check_progress(
     *last_check = Instant::now();
 }
 
-#[expect(clippy::too_many_arguments, reason = "grouping these into a struct would add complexity without benefit")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouping these into a struct would add complexity without benefit"
+)]
 #[instrument(skip_all)]
 async fn consume_payloads(
     mut payload_rx: mpsc::Receiver<BlockPayload>,
@@ -684,8 +683,10 @@ async fn consume_payloads(
                         let tables = outcome
                             .table_counts
                             .into_iter()
-                            .map(|(name, event, count)| {
-                                crate::stream::TableNotification { name, event, count }
+                            .map(|(name, event, count)| crate::stream::TableNotification {
+                                name,
+                                event,
+                                count,
                             })
                             .collect();
                         dispatcher.send(
@@ -768,7 +769,15 @@ async fn commit_block_bookkeeping(
 
 /// An empty `ProcessOutcome` for early returns.
 const fn empty_outcome(matched: u64) -> ProcessOutcome {
-    ProcessOutcome { matched, decoded: 0, stored: 0, transfers: 0, calls: 0, table_counts: vec![], event_payloads: vec![] }
+    ProcessOutcome {
+        matched,
+        decoded: 0,
+        stored: 0,
+        transfers: 0,
+        calls: 0,
+        table_counts: vec![],
+        event_payloads: vec![],
+    }
 }
 
 /// Filter, decode, and store events from a single block payload.
@@ -819,27 +828,47 @@ async fn process_block_events(
     let mut sender_cache: HashMap<TxIndex, Address> = HashMap::new();
 
     for event in &decoded_events {
-        let event_context =
-            build_event_context(payload, block_hash, event, &mut sender_cache)?;
-        let dispatched = ctx.handlers.dispatch(event, &event_context, &mut tx).await?;
+        let event_context = build_event_context(payload, block_hash, event, &mut sender_cache)?;
+        let dispatched = ctx
+            .handlers
+            .dispatch(event, &event_context, &mut tx)
+            .await?;
         if dispatched > 0 {
             track_event_table(ctx.event_table_map, event, dispatched, &mut table_counts);
             if ctx.has_streams {
-                collect_event_payload(ctx.event_table_map, event, &event_context, ctx.receipt_tables, &mut event_payloads);
+                collect_event_payload(
+                    ctx.event_table_map,
+                    event,
+                    &event_context,
+                    ctx.receipt_tables,
+                    &mut event_payloads,
+                );
             }
         }
         stored_count = stored_count.saturating_add(dispatched);
     }
 
     let transfer_count = store_transfers(
-        payload, block_hash, &mut sender_cache, ctx, &mut tx, &mut table_counts,
+        payload,
+        block_hash,
+        &mut sender_cache,
+        ctx,
+        &mut tx,
+        &mut table_counts,
         &mut event_payloads,
-    ).await?;
+    )
+    .await?;
 
     let call_count = store_calls(
-        payload, block_hash, &mut sender_cache, ctx, &mut tx, &mut table_counts,
+        payload,
+        block_hash,
+        &mut sender_cache,
+        ctx,
+        &mut tx,
+        &mut table_counts,
         &mut event_payloads,
-    ).await?;
+    )
+    .await?;
 
     db::update_checkpoint(&mut tx, block_number).await?;
     tx.commit()
@@ -1013,9 +1042,17 @@ async fn store_transfers(
         return Ok(0);
     }
     let count = scan_and_store_transfers(
-        payload, block_hash, sender_cache, ctx.transfer_handlers, tx,
-        ctx.has_streams, event_payloads, table_counts, ctx.receipt_tables,
-    ).await?;
+        payload,
+        block_hash,
+        sender_cache,
+        ctx.transfer_handlers,
+        tx,
+        ctx.has_streams,
+        event_payloads,
+        table_counts,
+        ctx.receipt_tables,
+    )
+    .await?;
     Ok(count)
 }
 
@@ -1033,9 +1070,18 @@ async fn store_calls(
         return Ok(0);
     }
     let count = scan_and_store_calls(
-        payload, block_hash, sender_cache, ctx.config, ctx.call_handlers, tx,
-        ctx.has_streams, event_payloads, table_counts, ctx.receipt_tables,
-    ).await?;
+        payload,
+        block_hash,
+        sender_cache,
+        ctx.config,
+        ctx.call_handlers,
+        tx,
+        ctx.has_streams,
+        event_payloads,
+        table_counts,
+        ctx.receipt_tables,
+    )
+    .await?;
     Ok(count)
 }
 
@@ -1049,7 +1095,9 @@ fn compute_gas_used(receipts: &[reth_ethereum_primitives::Receipt], tx_idx: usiz
         cumulative
     } else {
         cumulative.saturating_sub(
-            receipts.get(tx_idx - 1).map_or(0, |r| r.cumulative_gas_used),
+            receipts
+                .get(tx_idx - 1)
+                .map_or(0, |r| r.cumulative_gas_used),
         )
     }
 }
@@ -1092,7 +1140,10 @@ fn build_event_context(
     };
 
     let tx_idx_usize = event.tx_index.as_u32() as usize;
-    let cumulative = payload.receipts().get(tx_idx_usize).map_or(0, |r| r.cumulative_gas_used);
+    let cumulative = payload
+        .receipts()
+        .get(tx_idx_usize)
+        .map_or(0, |r| r.cumulative_gas_used);
     let gas_used = compute_gas_used(payload.receipts(), tx_idx_usize);
 
     Ok(EventContext {
@@ -1163,7 +1214,10 @@ async fn register_factory_child(
 /// contract-creation, and reverted transactions. Uses the shared sender cache.
 ///
 /// Returns the number of transfers stored.
-#[expect(clippy::too_many_arguments, reason = "per-table counting adds table_counts")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-table counting adds table_counts"
+)]
 async fn scan_and_store_transfers(
     payload: &BlockPayload,
     block_hash: B256,
@@ -1239,7 +1293,9 @@ async fn scan_and_store_transfers(
                 entry.1 = entry.1.saturating_add(1);
                 if has_streams {
                     let include = receipt_tables.contains(table_name);
-                    event_payloads.push(build_transfer_payload(&transfer, &context, table_name, include));
+                    event_payloads.push(build_transfer_payload(
+                        &transfer, &context, table_name, include,
+                    ));
                 }
             }
         }
@@ -1257,7 +1313,10 @@ async fn scan_and_store_transfers(
 /// the calldata arguments.
 ///
 /// Returns the number of calls stored.
-#[expect(clippy::too_many_arguments, reason = "per-table counting adds table_counts")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-table counting adds table_counts"
+)]
 async fn scan_and_store_calls(
     payload: &BlockPayload,
     block_hash: B256,
@@ -1370,17 +1429,21 @@ async fn scan_and_store_calls(
 
         let dispatched = call_handlers.dispatch(&decoded_call, &context, tx).await?;
         if dispatched > 0 {
-            for table_name in call_handlers.matched_table_names(
-                &decoded_call.contract_name,
-                &decoded_call.function_name,
-            ) {
+            for table_name in call_handlers
+                .matched_table_names(&decoded_call.contract_name, &decoded_call.function_name)
+            {
                 let entry = table_counts
                     .entry(table_name.to_string())
                     .or_insert_with(|| (decoded_call.function_name.clone(), 0));
                 entry.1 = entry.1.saturating_add(1);
                 if has_streams {
                     let include = receipt_tables.contains(table_name);
-                    event_payloads.push(build_call_payload(&decoded_call, &context, table_name, include));
+                    event_payloads.push(build_call_payload(
+                        &decoded_call,
+                        &context,
+                        table_name,
+                        include,
+                    ));
                 }
             }
         }

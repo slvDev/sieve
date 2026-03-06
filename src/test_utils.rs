@@ -46,12 +46,40 @@ pub fn build_test_transaction() -> reth_ethereum_primitives::TransactionSigned {
 /// Standard test columns for query builder tests.
 pub fn test_columns() -> Vec<ColumnMeta> {
     vec![
-        ColumnMeta { name: "id".into(), pg_type: "bigserial".into(), nullable: false },
-        ColumnMeta { name: "block_number".into(), pg_type: "bigint".into(), nullable: false },
-        ColumnMeta { name: "tx_hash".into(), pg_type: "bytea".into(), nullable: false },
-        ColumnMeta { name: "tx_index".into(), pg_type: "integer".into(), nullable: false },
-        ColumnMeta { name: "from_address".into(), pg_type: "text".into(), nullable: false },
-        ColumnMeta { name: "value".into(), pg_type: "numeric".into(), nullable: false },
-        ColumnMeta { name: "active".into(), pg_type: "boolean".into(), nullable: false },
+        ColumnMeta {
+            name: "id".into(),
+            pg_type: "bigserial".into(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "block_number".into(),
+            pg_type: "bigint".into(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_hash".into(),
+            pg_type: "bytea".into(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_index".into(),
+            pg_type: "integer".into(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "from_address".into(),
+            pg_type: "text".into(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "value".into(),
+            pg_type: "numeric".into(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "active".into(),
+            pg_type: "boolean".into(),
+            nullable: false,
+        },
     ]
 }

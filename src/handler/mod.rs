@@ -237,8 +237,8 @@ impl EventHandler for ConfigDrivenHandler {
 
         // Bind user-defined columns
         for col in &self.resolved.columns {
-            let param = find_param(&event.indexed, &event.body, &col.param_name)
-                .ok_or_else(|| {
+            let param =
+                find_param(&event.indexed, &event.body, &col.param_name).ok_or_else(|| {
                     eyre::eyre!(
                         "param '{}' not found in decoded event {}.{}",
                         col.param_name,
@@ -250,15 +250,12 @@ impl EventHandler for ConfigDrivenHandler {
             query = bind_dyn_value(query, &param.value, &col.pg_type)?;
         }
 
-        query
-            .execute(&mut **tx)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to insert into '{}' for {}.{}",
-                    self.resolved.table_name, event.contract_name, event.event_name
-                )
-            })?;
+        query.execute(&mut **tx).await.wrap_err_with(|| {
+            format!(
+                "failed to insert into '{}' for {}.{}",
+                self.resolved.table_name, event.contract_name, event.event_name
+            )
+        })?;
 
         Ok(())
     }
@@ -286,10 +283,7 @@ fn find_param<'a>(
     body: &'a [DecodedParam],
     name: &str,
 ) -> Option<&'a DecodedParam> {
-    indexed
-        .iter()
-        .chain(body.iter())
-        .find(|p| p.name == name)
+    indexed.iter().chain(body.iter()).find(|p| p.name == name)
 }
 
 /// Bind a [`DynSolValue`] to a sqlx query based on the target Postgres type.
@@ -349,9 +343,7 @@ fn bind_context_field<'q>(
         ContextField::BlockTimestamp => query.bind(context.block_timestamp as i64),
         ContextField::BlockHash => query.bind(context.block_hash.as_slice().to_vec()),
         ContextField::TxFrom => query.bind(Address::to_checksum(&context.tx_from, None)),
-        ContextField::TxTo => {
-            query.bind(context.tx_to.map(|a| Address::to_checksum(&a, None)))
-        }
+        ContextField::TxTo => query.bind(context.tx_to.map(|a| Address::to_checksum(&a, None))),
         ContextField::TxValue => query.bind(context.tx_value.to_string()),
         ContextField::TxGasPrice => query.bind(context.tx_gas_price as i64),
         ContextField::TxGasUsed => query.bind(context.tx_gas_used as i64),
@@ -438,15 +430,12 @@ impl TransferHandler {
             query = bind_context_field(query, *cf, context);
         }
 
-        query
-            .execute(&mut **tx)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to insert native transfer into '{}'",
-                    self.resolved.table_name
-                )
-            })?;
+        query.execute(&mut **tx).await.wrap_err_with(|| {
+            format!(
+                "failed to insert native transfer into '{}'",
+                self.resolved.table_name
+            )
+        })?;
 
         Ok(())
     }
@@ -585,8 +574,7 @@ impl CallHandler {
     /// and function name.
     #[must_use]
     pub fn matches(&self, contract_name: &str, function_name: &str) -> bool {
-        self.resolved.contract_name == contract_name
-            && self.resolved.function_name == function_name
+        self.resolved.contract_name == contract_name && self.resolved.function_name == function_name
     }
 
     /// Store a decoded call into the database.
@@ -643,15 +631,12 @@ impl CallHandler {
             query = bind_dyn_value(query, &param.value, &col.pg_type)?;
         }
 
-        query
-            .execute(&mut **tx)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to insert into '{}' for {}.{}",
-                    self.resolved.table_name, call.contract_name, call.function_name
-                )
-            })?;
+        query.execute(&mut **tx).await.wrap_err_with(|| {
+            format!(
+                "failed to insert into '{}' for {}.{}",
+                self.resolved.table_name, call.contract_name, call.function_name
+            )
+        })?;
 
         Ok(())
     }
@@ -751,7 +736,10 @@ pub struct UsdcTransferHandler;
 #[cfg(test)]
 #[async_trait]
 impl EventHandler for UsdcTransferHandler {
-    #[expect(clippy::unnecessary_literal_bound, reason = "trait requires &str, not &'static str")]
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "trait requires &str, not &'static str"
+    )]
     fn name(&self) -> &str {
         "UsdcTransferHandler"
     }
@@ -814,10 +802,7 @@ impl EventHandler for UsdcTransferHandler {
 // ── DynSolValue helpers (test-only) ───────────────────────────────────
 
 #[cfg(test)]
-fn extract_address(
-    params: &[DecodedParam],
-    name: &str,
-) -> eyre::Result<String> {
+fn extract_address(params: &[DecodedParam], name: &str) -> eyre::Result<String> {
     for param in params {
         if param.name == name {
             if let DynSolValue::Address(addr) = &param.value {
@@ -833,10 +818,7 @@ fn extract_address(
 }
 
 #[cfg(test)]
-fn extract_uint(
-    params: &[DecodedParam],
-    name: &str,
-) -> eyre::Result<String> {
+fn extract_uint(params: &[DecodedParam], name: &str) -> eyre::Result<String> {
     for param in params {
         if param.name == name {
             if let DynSolValue::Uint(val, _bits) = &param.value {
@@ -852,13 +834,16 @@ fn extract_uint(
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
-    use alloy_dyn_abi::DynSolValue;
-    use alloy_primitives::{address, B256, I256, U256};
     use crate::decode::{DecodedEvent, DecodedParam};
     use crate::types::{BlockNumber, LogIndex, TxIndex};
+    use alloy_dyn_abi::DynSolValue;
+    use alloy_primitives::{address, B256, I256, U256};
 
     fn make_test_event() -> DecodedEvent {
         let from = address!("1111111111111111111111111111111111111111");
@@ -1035,8 +1020,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL"]
     async fn usdc_handler_inserts_row() -> eyre::Result<()> {
-        let url = std::env::var("DATABASE_URL")
-            .wrap_err("DATABASE_URL not set")?;
+        let url = std::env::var("DATABASE_URL").wrap_err("DATABASE_URL not set")?;
         let db = crate::db::Database::connect(&url).await?;
 
         let event = make_test_event();
@@ -1045,9 +1029,7 @@ mod tests {
 
         let mut tx = db.begin().await?;
         handler.handle(&event, &context, &mut tx).await?;
-        tx.commit()
-            .await
-            .wrap_err("commit failed")?;
+        tx.commit().await.wrap_err("commit failed")?;
 
         // Verify the row was inserted
         let count: (i64,) = sqlx::query_as(
@@ -1075,8 +1057,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL"]
     async fn usdc_handler_is_idempotent() -> eyre::Result<()> {
-        let url = std::env::var("DATABASE_URL")
-            .wrap_err("DATABASE_URL not set")?;
+        let url = std::env::var("DATABASE_URL").wrap_err("DATABASE_URL not set")?;
         let db = crate::db::Database::connect(&url).await?;
 
         // Clean up any leftover data from previous test runs
@@ -1260,11 +1241,7 @@ mod tests {
             vec![],
         );
         // handler_c: matches (no filters = match all)
-        let handler_c = make_transfer_handler_named(
-            "all_transfers",
-            vec![],
-            vec![],
-        );
+        let handler_c = make_transfer_handler_named("all_transfers", vec![], vec![]);
 
         let registry = TransferRegistry::new(vec![handler_a, handler_b, handler_c]);
         let matched = registry.matched_table_names(&transfer);

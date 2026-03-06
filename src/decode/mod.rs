@@ -70,7 +70,10 @@ impl fmt::Display for DecodedEvent {
         write!(
             f,
             ") block={} ts={} tx={} log={}",
-            self.block_number.as_u64(), self.block_timestamp, self.tx_index, self.log_index
+            self.block_number.as_u64(),
+            self.block_timestamp,
+            self.tx_index,
+            self.log_index
         )
     }
 }
@@ -135,7 +138,10 @@ pub fn decode_log(log: &FilteredLog, contract: &ContractConfig) -> eyre::Result<
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
     use crate::config::usdc_transfer_config;

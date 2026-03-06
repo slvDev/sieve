@@ -15,7 +15,10 @@ use tracing::instrument;
 pub struct FetchIngestOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
-    #[expect(dead_code, reason = "populated during fetch for future metrics/logging")]
+    #[expect(
+        dead_code,
+        reason = "populated during fetch for future metrics/logging"
+    )]
     pub fetch_stats: crate::p2p::FetchStageStats,
 }
 

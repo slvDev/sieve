@@ -253,7 +253,10 @@ impl ContextField {
     #[must_use]
     pub const fn pg_type(self) -> &'static str {
         match self {
-            Self::BlockTimestamp | Self::TxGasPrice | Self::TxGasUsed | Self::TxNonce
+            Self::BlockTimestamp
+            | Self::TxGasPrice
+            | Self::TxGasUsed
+            | Self::TxNonce
             | Self::CumulativeGasUsed => "BIGINT NOT NULL",
             Self::BlockHash => "BYTEA NOT NULL",
             Self::TxFrom => "TEXT NOT NULL",
@@ -433,9 +436,7 @@ fn default_pg_type(solidity_type: &str) -> &'static str {
         "address" | "string" => "text",
 
         // Small uints/ints → bigint
-        "uint8" | "uint16" | "uint32" | "uint64" | "int8" | "int16" | "int32" | "int64" => {
-            "bigint"
-        }
+        "uint8" | "uint16" | "uint32" | "uint64" | "int8" | "int16" | "int32" | "int64" => "bigint",
 
         // Large uints/ints → numeric
         "uint128" | "uint256" | "uint96" | "uint112" | "uint160" | "uint192" | "uint224"
@@ -447,16 +448,13 @@ fn default_pg_type(solidity_type: &str) -> &'static str {
         // uint/int variants we didn't explicitly list (e.g. uint40, uint48, etc.)
         s if s.starts_with("uint") || s.starts_with("int") => {
             let prefix_len = if s.starts_with("uint") { 4 } else { 3 };
-            s[prefix_len..]
-                .parse::<u32>()
-                .ok()
-                .map_or("text", |bits| {
-                    if bits <= 64 {
-                        "bigint"
-                    } else {
-                        "numeric"
-                    }
-                })
+            s[prefix_len..].parse::<u32>().ok().map_or("text", |bits| {
+                if bits <= 64 {
+                    "bigint"
+                } else {
+                    "numeric"
+                }
+            })
         }
 
         // Fallback
@@ -468,13 +466,70 @@ fn default_pg_type(solidity_type: &str) -> &'static str {
 
 /// PostgreSQL reserved words that cannot be used as unquoted identifiers.
 const SQL_RESERVED: &[&str] = &[
-    "all", "alter", "and", "as", "between", "by", "case", "check", "column", "constraint",
-    "create", "cross", "default", "delete", "distinct", "drop", "else", "end", "except", "exists",
-    "false", "fetch", "for", "foreign", "from", "grant", "group", "having", "in", "index", "inner",
-    "insert", "intersect", "into", "is", "join", "left", "like", "limit", "not", "null", "offset",
-    "on", "or", "order", "outer", "primary", "references", "returning", "right", "select", "set",
-    "table", "then", "true", "union", "unique", "update", "using", "values", "view", "when",
-    "where", "with",
+    "all",
+    "alter",
+    "and",
+    "as",
+    "between",
+    "by",
+    "case",
+    "check",
+    "column",
+    "constraint",
+    "create",
+    "cross",
+    "default",
+    "delete",
+    "distinct",
+    "drop",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "from",
+    "grant",
+    "group",
+    "having",
+    "in",
+    "index",
+    "inner",
+    "insert",
+    "intersect",
+    "into",
+    "is",
+    "join",
+    "left",
+    "like",
+    "limit",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "outer",
+    "primary",
+    "references",
+    "returning",
+    "right",
+    "select",
+    "set",
+    "table",
+    "then",
+    "true",
+    "union",
+    "unique",
+    "update",
+    "using",
+    "values",
+    "view",
+    "when",
+    "where",
+    "with",
 ];
 
 /// Validate that a SQL identifier (table or column name) is safe.
@@ -496,7 +551,10 @@ fn validate_identifier(name: &str, kind: &str) -> eyre::Result<()> {
             "{kind} name '{name}' must start with a lowercase letter or underscore"
         ));
     }
-    if !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
         return Err(eyre::eyre!(
             "{kind} name '{name}' contains invalid characters (only a-z, 0-9, _ allowed)"
         ));
@@ -728,10 +786,7 @@ fn generate_rollback_sql(table: &str) -> String {
 /// `to_address`, `value`. Context columns inserted between `value` and the
 /// UNIQUE constraint. No `log_index` column (one transfer per transaction).
 #[must_use]
-fn generate_transfer_create_table_sql(
-    table: &str,
-    context_fields: &[ContextField],
-) -> String {
+fn generate_transfer_create_table_sql(table: &str, context_fields: &[ContextField]) -> String {
     use std::fmt::Write;
 
     let mut sql = format!(
@@ -758,10 +813,7 @@ fn generate_transfer_create_table_sql(
 /// Fixed params: `$1=block_number, $2=tx_hash, $3=tx_index, $4=from_address,
 /// $5=to_address, $6=value::numeric`. Context columns follow.
 #[must_use]
-fn generate_transfer_insert_sql(
-    table: &str,
-    context_fields: &[ContextField],
-) -> String {
+fn generate_transfer_insert_sql(table: &str, context_fields: &[ContextField]) -> String {
     let mut col_names =
         String::from("block_number, tx_hash, tx_index, from_address, to_address, value");
     let mut params = String::from("$1, $2, $3, $4, $5, $6::numeric");
@@ -905,8 +957,12 @@ fn resolve_transfer(
         ));
     }
 
-    let context_fields =
-        resolve_context_fields(t.context.as_deref(), &t.name, "transfer", t.include_receipts)?;
+    let context_fields = resolve_context_fields(
+        t.context.as_deref(),
+        &t.name,
+        "transfer",
+        t.include_receipts,
+    )?;
 
     let filter_from = parse_address_list(
         t.filter.as_ref().and_then(|f| f.from.as_deref()),
@@ -1014,10 +1070,7 @@ fn resolve_streams(streams: &[TomlStream]) -> eyre::Result<Vec<ResolvedStream>> 
                     ));
                 }
                 let default_routing_key = ["{table}", ".", "{event}"].concat();
-                let routing_key = s
-                    .routing_key
-                    .clone()
-                    .unwrap_or(default_routing_key);
+                let routing_key = s.routing_key.clone().unwrap_or(default_routing_key);
                 resolved.push(ResolvedStream {
                     name: s.name.clone(),
                     stream_type: "rabbitmq".to_string(),
@@ -1050,8 +1103,7 @@ pub fn load_config(config_path: &Path) -> eyre::Result<SieveConfig> {
     let content = std::fs::read_to_string(config_path)
         .wrap_err_with(|| format!("failed to read config file: {}", config_path.display()))?;
 
-    let config: SieveConfig =
-        toml::from_str(&content).wrap_err("failed to parse TOML config")?;
+    let config: SieveConfig = toml::from_str(&content).wrap_err("failed to parse TOML config")?;
 
     Ok(config)
 }
@@ -1065,10 +1117,7 @@ pub fn load_config(config_path: &Path) -> eyre::Result<SieveConfig> {
 ///
 /// Returns an error if ABI files cannot be read, events are not found in ABIs,
 /// column params don't exist, addresses are invalid, or table names collide.
-pub fn resolve_config(
-    config: &SieveConfig,
-    config_dir: &Path,
-) -> eyre::Result<ResolvedConfig> {
+pub fn resolve_config(config: &SieveConfig, config_dir: &Path) -> eyre::Result<ResolvedConfig> {
     let mut contract_configs = Vec::with_capacity(config.contracts.len());
     let mut resolved_events = Vec::new();
     let mut resolved_factories = Vec::new();
@@ -1172,12 +1221,7 @@ fn resolve_contract(
 
     // Resolve factory if present
     if let Some(ref factory) = contract.factory {
-        resolved_factories.push(resolve_factory(
-            factory,
-            &contract.name,
-            &abi,
-            config_dir,
-        )?);
+        resolved_factories.push(resolve_factory(factory, &contract.name, &abi, config_dir)?);
     }
 
     let event_names: Vec<&str> = contract.events.iter().map(|e| e.name.as_str()).collect();
@@ -1196,12 +1240,8 @@ fn resolve_contract(
     }
 
     // Build ContractConfig for the filter/decode pipeline
-    let mut contract_config = ContractConfig::from_abi(
-        &contract.name,
-        address,
-        &abi,
-        &event_names,
-    )?;
+    let mut contract_config =
+        ContractConfig::from_abi(&contract.name, address, &abi, &event_names)?;
 
     // Populate topic filters from resolved events for this contract
     for re in &resolved_events[resolved_events.len() - contract.events.len()..] {
@@ -1210,12 +1250,16 @@ fn resolve_contract(
                 .events
                 .keys()
                 .find(|sel| {
-                    contract_config.events.get(*sel)
+                    contract_config
+                        .events
+                        .get(*sel)
                         .is_some_and(|ev| ev.name == re.event_name)
                 })
                 .copied();
             if let Some(sel) = selector {
-                contract_config.topic_filters.insert(sel, re.topic_filters.clone());
+                contract_config
+                    .topic_filters
+                    .insert(sel, re.topic_filters.clone());
             }
         }
     }
@@ -1303,11 +1347,19 @@ fn resolve_event(
         &toml_event.name,
     )?;
 
-    let create_table_sql =
-        generate_create_table_sql(&toml_event.table, &context_fields, &columns, is_factory_child);
+    let create_table_sql = generate_create_table_sql(
+        &toml_event.table,
+        &context_fields,
+        &columns,
+        is_factory_child,
+    );
     let create_indexes_sql = generate_indexes_sql(&toml_event.table);
-    let insert_sql =
-        generate_insert_sql(&toml_event.table, &context_fields, &columns, is_factory_child);
+    let insert_sql = generate_insert_sql(
+        &toml_event.table,
+        &context_fields,
+        &columns,
+        is_factory_child,
+    );
     let rollback_sql = generate_rollback_sql(&toml_event.table);
 
     resolved_events.push(ResolvedEvent {
@@ -1377,7 +1429,10 @@ fn resolve_factory(
         )
     })?;
 
-    let param_exists = creation_event.inputs.iter().any(|p| p.name == factory.param);
+    let param_exists = creation_event
+        .inputs
+        .iter()
+        .any(|p| p.name == factory.param);
     if !param_exists {
         return Err(eyre::eyre!(
             "factory param '{}' not found in event '{}' for contract '{contract_name}'",
@@ -1507,7 +1562,10 @@ fn resolve_call_columns(
                         )
                     })?;
 
-                let column_name = col.name.clone().unwrap_or_else(|| abi_param_to_snake_case(&col.param));
+                let column_name = col
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| abi_param_to_snake_case(&col.param));
                 if let Some(ref explicit_name) = col.name {
                     validate_identifier(explicit_name, "column")?;
                     if RESERVED_COLUMNS.contains(&explicit_name.as_str()) {
@@ -1552,10 +1610,7 @@ fn resolve_call_columns(
 /// # Errors
 ///
 /// Returns an error if two ABI params map to the same column name.
-fn check_duplicate_columns(
-    columns: &[ResolvedColumn],
-    context: &str,
-) -> eyre::Result<()> {
+fn check_duplicate_columns(columns: &[ResolvedColumn], context: &str) -> eyre::Result<()> {
     let mut seen = HashSet::with_capacity(columns.len());
     for col in columns {
         if !seen.insert(col.column_name.as_str()) {
@@ -1602,7 +1657,10 @@ fn resolve_columns(
                         )
                     })?;
 
-                let column_name = col.name.clone().unwrap_or_else(|| abi_param_to_snake_case(&col.param));
+                let column_name = col
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| abi_param_to_snake_case(&col.param));
                 if let Some(ref explicit_name) = col.name {
                     validate_identifier(explicit_name, "column")?;
                     if RESERVED_COLUMNS.contains(&explicit_name.as_str()) {
@@ -1664,9 +1722,8 @@ fn resolve_context_fields(
     if let Some(names) = names {
         fields.reserve(names.len());
         for name in names {
-            let field = ContextField::from_name(name).wrap_err_with(|| {
-                format!("in event '{contract_name}.{event_name}'")
-            })?;
+            let field = ContextField::from_name(name)
+                .wrap_err_with(|| format!("in event '{contract_name}.{event_name}'"))?;
 
             if !seen.insert(name.as_str()) {
                 return Err(eyre::eyre!(
@@ -1790,8 +1847,7 @@ fn encode_topic_value(value: &str, solidity_type: &str) -> eyre::Result<B256> {
         }
         s if s.starts_with("uint") || s.starts_with("int") => {
             // Integer types: parse as U256, convert to B256
-            let n: alloy_primitives::U256 = if value.starts_with("0x") || value.starts_with("0X")
-            {
+            let n: alloy_primitives::U256 = if value.starts_with("0x") || value.starts_with("0X") {
                 value.parse().wrap_err("invalid hex integer")?
             } else {
                 alloy_primitives::U256::from_str_radix(value, 10)
@@ -1801,13 +1857,18 @@ fn encode_topic_value(value: &str, solidity_type: &str) -> eyre::Result<B256> {
         }
         _ => {
             // Fallback: try parsing as raw B256 hex
-            value.parse::<B256>().wrap_err("unsupported type for topic filter; provide raw 32-byte hex")
+            value
+                .parse::<B256>()
+                .wrap_err("unsupported type for topic filter; provide raw 32-byte hex")
         }
     }
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
 
@@ -2004,7 +2065,9 @@ table = "usdc_approvals"
 
         let sql = generate_insert_sql("usdc_transfers", &[], &columns, false);
         assert!(sql.contains("INSERT INTO usdc_transfers"));
-        assert!(sql.contains("block_number, tx_hash, tx_index, log_index, \"from_address\", \"to_address\""));
+        assert!(sql.contains(
+            "block_number, tx_hash, tx_index, log_index, \"from_address\", \"to_address\""
+        ));
         assert!(sql.contains("$1, $2, $3, $4, $5, $6"));
         assert!(sql.contains("ON CONFLICT"));
     }
@@ -2039,10 +2102,7 @@ table = "usdc_approvals"
 
     /// Create a unique temp dir for a test, write an ABI file, and return the dir path.
     fn setup_test_dir(suffix: &str, abi_json: &str) -> eyre::Result<std::path::PathBuf> {
-        let dir = std::env::temp_dir().join(format!(
-            "sieve_test_{suffix}_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("sieve_test_{suffix}_{}", std::process::id()));
         let abi_dir = dir.join("abis");
         std::fs::create_dir_all(&abi_dir)?;
         std::fs::write(abi_dir.join("erc20.json"), abi_json)?;
@@ -2075,7 +2135,11 @@ table = "usdc_approvals"
         let dir = setup_test_dir("resolve", ERC20_ABI)?;
 
         let config: SieveConfig = toml::from_str(FULL_TOML)?;
-        let ResolvedConfig { index_config, resolved_events: resolved, .. } = resolve_config(&config, &dir)?;
+        let ResolvedConfig {
+            index_config,
+            resolved_events: resolved,
+            ..
+        } = resolve_config(&config, &dir)?;
 
         assert_eq!(index_config.contracts.len(), 1);
         assert_eq!(resolved.len(), 2);
@@ -2422,7 +2486,10 @@ table = "uniswap_swaps"
         assert!(c.address.is_none());
         assert!(c.start_block.is_none());
 
-        let f = c.factory.as_ref().ok_or_else(|| eyre::eyre!("no factory"))?;
+        let f = c
+            .factory
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("no factory"))?;
         assert_eq!(f.address, "0x1F98431c8aD98523631AE4a59f267346ea31F984");
         assert_eq!(f.event, "PoolCreated");
         assert_eq!(f.param, "pool");
@@ -2580,9 +2647,11 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
 
     #[test]
     fn resolve_topic_filters_valid() -> eyre::Result<()> {
-        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
-            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
-        let event = abi.events.get("Transfer")
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(ERC20_ABI).map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi
+            .events
+            .get("Transfer")
             .and_then(|v| v.first())
             .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
 
@@ -2598,7 +2667,8 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         assert_eq!(filters[0].values.len(), 1);
 
         // Verify B256 encoding: address left-padded to 32 bytes
-        let expected_addr: Address = "0x28C6c06298d514Db089934071355E5743bf21d60".parse()
+        let expected_addr: Address = "0x28C6c06298d514Db089934071355E5743bf21d60"
+            .parse()
             .map_err(|e| eyre::eyre!("{e}"))?;
         let expected = B256::left_padding_from(expected_addr.as_slice());
         assert!(filters[0].values.contains(&expected));
@@ -2607,9 +2677,11 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
 
     #[test]
     fn resolve_topic_filters_unknown_param_errors() -> eyre::Result<()> {
-        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
-            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
-        let event = abi.events.get("Transfer")
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(ERC20_ABI).map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi
+            .events
+            .get("Transfer")
             .and_then(|v| v.first())
             .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
 
@@ -2625,18 +2697,17 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
 
     #[test]
     fn resolve_topic_filters_non_indexed_errors() -> eyre::Result<()> {
-        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
-            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
-        let event = abi.events.get("Transfer")
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(ERC20_ABI).map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi
+            .events
+            .get("Transfer")
             .and_then(|v| v.first())
             .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
 
         // 'value' is NOT indexed in Transfer(address indexed from, address indexed to, uint256 value)
         let mut filter = HashMap::new();
-        filter.insert(
-            "value".to_string(),
-            vec!["100".to_string()],
-        );
+        filter.insert("value".to_string(), vec!["100".to_string()]);
 
         let Err(err) = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer") else {
             return Err(eyre::eyre!("expected error for non-indexed param"));
@@ -2647,9 +2718,11 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
 
     #[test]
     fn resolve_topic_filters_multi_value() -> eyre::Result<()> {
-        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ERC20_ABI)
-            .map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
-        let event = abi.events.get("Transfer")
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(ERC20_ABI).map_err(|e| eyre::eyre!("parse ABI: {e}"))?;
+        let event = abi
+            .events
+            .get("Transfer")
             .and_then(|v| v.first())
             .ok_or_else(|| eyre::eyre!("no Transfer event"))?;
 
@@ -2785,13 +2858,11 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         let sql = generate_call_create_table_sql(
             "swap_calls",
             &[],
-            &[
-                ResolvedColumn {
-                    column_name: "recipient".to_string(),
-                    param_name: "recipient".to_string(),
-                    pg_type: "text".to_string(),
-                },
-            ],
+            &[ResolvedColumn {
+                column_name: "recipient".to_string(),
+                param_name: "recipient".to_string(),
+                pg_type: "text".to_string(),
+            }],
             false,
         );
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS swap_calls"));
@@ -2806,12 +2877,7 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
 
     #[test]
     fn call_create_table_factory_child() {
-        let sql = generate_call_create_table_sql(
-            "pool_calls",
-            &[],
-            &[],
-            true,
-        );
+        let sql = generate_call_create_table_sql("pool_calls", &[], &[], true);
         assert!(sql.contains("contract_address TEXT NOT NULL"));
         assert!(sql.contains("UNIQUE (contract_address, block_number, tx_index)"));
     }
@@ -2821,13 +2887,11 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         let sql = generate_call_insert_sql(
             "swap_calls",
             &[ContextField::BlockTimestamp],
-            &[
-                ResolvedColumn {
-                    column_name: "recipient".to_string(),
-                    param_name: "recipient".to_string(),
-                    pg_type: "text".to_string(),
-                },
-            ],
+            &[ResolvedColumn {
+                column_name: "recipient".to_string(),
+                param_name: "recipient".to_string(),
+                pg_type: "text".to_string(),
+            }],
             false,
         );
         // Standard 3 params + 1 context + 1 user = 5
@@ -2857,7 +2921,9 @@ table = "usdc_transfers"
 "#;
         let config: SieveConfig = toml::from_str(toml_str)?;
         let Err(err) = resolve_config(&config, &dir) else {
-            return Err(eyre::eyre!("expected error for duplicate call/event table names"));
+            return Err(eyre::eyre!(
+                "expected error for duplicate call/event table names"
+            ));
         };
         assert!(err.to_string().contains("duplicate table name"));
 
@@ -2937,7 +3003,10 @@ backfill = false
         assert_eq!(config.streams.len(), 1);
         assert_eq!(config.streams[0].name, "my_webhook");
         assert_eq!(config.streams[0].stream_type, "webhook");
-        assert_eq!(config.streams[0].url.as_deref(), Some("http://localhost:8080/events"));
+        assert_eq!(
+            config.streams[0].url.as_deref(),
+            Some("http://localhost:8080/events")
+        );
         assert!(!config.streams[0].backfill);
         Ok(())
     }
@@ -3144,7 +3213,10 @@ url = "http://localhost:8080/events"
 
     #[test]
     fn snake_case_long_camel() {
-        assert_eq!(abi_param_to_snake_case("_annualInterestRate"), "annual_interest_rate");
+        assert_eq!(
+            abi_param_to_snake_case("_annualInterestRate"),
+            "annual_interest_rate"
+        );
     }
 
     #[test]
@@ -3166,7 +3238,10 @@ url = "http://localhost:8080/events"
         assert_eq!(abi_param_to_snake_case("txHash"), "param_tx_hash");
         assert_eq!(abi_param_to_snake_case("logIndex"), "param_log_index");
         assert_eq!(abi_param_to_snake_case("txIndex"), "param_tx_index");
-        assert_eq!(abi_param_to_snake_case("contractAddress"), "param_contract_address");
+        assert_eq!(
+            abi_param_to_snake_case("contractAddress"),
+            "param_contract_address"
+        );
     }
 
     #[test]
@@ -3189,7 +3264,11 @@ url = "http://localhost:8080/events"
             ],"name":"Foo","type":"event"}"#,
         )?;
 
-        let cols = vec![TomlColumn { param: "x".to_string(), name: Some("id".to_string()), pg_type: None }];
+        let cols = vec![TomlColumn {
+            param: "x".to_string(),
+            name: Some("id".to_string()),
+            pg_type: None,
+        }];
         let result = resolve_columns(Some(&cols), &abi_json, "Test", "Foo");
         assert!(result.is_err());
         assert!(format!("{result:?}").contains("conflicts with a reserved schema column"));
@@ -3219,7 +3298,10 @@ url = "http://localhost:8080/events"
         assert_eq!(abi_param_to_snake_case("token1"), "token1");
         assert_eq!(abi_param_to_snake_case("amount0Out"), "amount0_out");
         assert_eq!(abi_param_to_snake_case("amount1In"), "amount1_in");
-        assert_eq!(abi_param_to_snake_case("sqrtPriceLimitX96"), "sqrt_price_limit_x96");
+        assert_eq!(
+            abi_param_to_snake_case("sqrtPriceLimitX96"),
+            "sqrt_price_limit_x96"
+        );
         assert_eq!(abi_param_to_snake_case("sqrtPriceX96"), "sqrt_price_x96");
     }
 
@@ -3233,10 +3315,16 @@ url = "http://localhost:8080/events"
     #[test]
     fn snake_case_acronym_mid_word() {
         // Liquity/DeFi patterns
-        assert_eq!(abi_param_to_snake_case("isETHCollateral"), "is_eth_collateral");
+        assert_eq!(
+            abi_param_to_snake_case("isETHCollateral"),
+            "is_eth_collateral"
+        );
         assert_eq!(abi_param_to_snake_case("newICR"), "new_icr");
         assert_eq!(abi_param_to_snake_case("getAPR"), "get_apr");
-        assert_eq!(abi_param_to_snake_case("maxFeePercentage"), "max_fee_percentage");
+        assert_eq!(
+            abi_param_to_snake_case("maxFeePercentage"),
+            "max_fee_percentage"
+        );
     }
 
     #[test]
@@ -3244,7 +3332,10 @@ url = "http://localhost:8080/events"
         assert_eq!(abi_param_to_snake_case("_batchManager"), "batch_manager");
         assert_eq!(abi_param_to_snake_case("_boldAmount"), "bold_amount");
         assert_eq!(abi_param_to_snake_case("_troveId"), "trove_id");
-        assert_eq!(abi_param_to_snake_case("_annualInterestRate"), "annual_interest_rate");
+        assert_eq!(
+            abi_param_to_snake_case("_annualInterestRate"),
+            "annual_interest_rate"
+        );
         assert_eq!(abi_param_to_snake_case("_L_ETH"), "l_eth");
     }
 
@@ -3294,7 +3385,10 @@ url = "http://localhost:8080/events"
     #[test]
     fn snake_case_context_field_names_get_prefix() {
         // Context fields: block_timestamp, block_hash, tx_from, tx_to, tx_value, tx_gas_price
-        assert_eq!(abi_param_to_snake_case("block_timestamp"), "param_block_timestamp");
+        assert_eq!(
+            abi_param_to_snake_case("block_timestamp"),
+            "param_block_timestamp"
+        );
         assert_eq!(abi_param_to_snake_case("tx_from"), "param_tx_from");
         assert_eq!(abi_param_to_snake_case("tx_to"), "param_tx_to");
         assert_eq!(abi_param_to_snake_case("tx_value"), "param_tx_value");

@@ -69,7 +69,11 @@ impl BlockPayload {
     /// Create a new block payload.
     #[must_use]
     pub const fn new(header: Header, body: BlockBody, receipts: Vec<Receipt>) -> Self {
-        Self { header, body, receipts }
+        Self {
+            header,
+            body,
+            receipts,
+        }
     }
 
     /// Block header.

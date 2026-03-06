@@ -76,10 +76,7 @@ pub async fn run_api_server(
         .map_err(|e| eyre::eyre!("API server error: {e}"))
 }
 
-async fn graphql_handler(
-    State(state): State<ApiState>,
-    req: GraphQLRequest,
-) -> GraphQLResponse {
+async fn graphql_handler(State(state): State<ApiState>, req: GraphQLRequest) -> GraphQLResponse {
     state.schema.execute(req.into_inner()).await.into()
 }
 
@@ -101,7 +98,10 @@ async fn metrics_handler(State(state): State<ApiState>) -> impl IntoResponse {
         |body| {
             (
                 StatusCode::OK,
-                [("content-type", "application/openmetrics-text; version=1.0.0; charset=utf-8")],
+                [(
+                    "content-type",
+                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                )],
                 body,
             )
                 .into_response()

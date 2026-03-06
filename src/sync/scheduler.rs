@@ -323,16 +323,13 @@ impl PeerHealthTracker {
                 samples: 0,
             };
         }
-        let weighted_success = (entry.partials as f64).mul_add(
-            self.config.quality_partial_weight,
-            entry.successes as f64,
-        );
+        let weighted_success = (entry.partials as f64)
+            .mul_add(self.config.quality_partial_weight, entry.successes as f64);
         PeerQuality {
             score: (weighted_success / total as f64).clamp(0.0, 1.0),
             samples: total,
         }
     }
-
 }
 
 // ── BlockPeerBackoff ─────────────────────────────────────────────────
@@ -353,10 +350,13 @@ struct BlockPeerCooldown {
 impl BlockPeerBackoff {
     fn record_failure(&mut self, block: u64, peer_id: PeerId) {
         let key = (block, peer_id);
-        let entry = self.entries.entry(key).or_insert_with(|| BlockPeerCooldown {
-            fail_count: 0,
-            cooldown_until: Instant::now(),
-        });
+        let entry = self
+            .entries
+            .entry(key)
+            .or_insert_with(|| BlockPeerCooldown {
+                fail_count: 0,
+                cooldown_until: Instant::now(),
+            });
         entry.fail_count = entry.fail_count.saturating_add(1);
         let backoff = if entry.fail_count <= 1 {
             BACKOFF_INITIAL
@@ -825,8 +825,18 @@ mod tests {
         let batch = scheduler.next_batch_for_peer(peer_id, 200).await;
         assert!(!batch.blocks.is_empty());
 
-        let even: Vec<u64> = batch.blocks.iter().copied().filter(|b| b % 2 == 0).collect();
-        let odd: Vec<u64> = batch.blocks.iter().copied().filter(|b| b % 2 != 0).collect();
+        let even: Vec<u64> = batch
+            .blocks
+            .iter()
+            .copied()
+            .filter(|b| b % 2 == 0)
+            .collect();
+        let odd: Vec<u64> = batch
+            .blocks
+            .iter()
+            .copied()
+            .filter(|b| b % 2 != 0)
+            .collect();
 
         let s1 = Arc::clone(&scheduler);
         let s2 = Arc::clone(&scheduler);

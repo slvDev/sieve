@@ -84,13 +84,12 @@ impl Database {
     ///
     /// Returns an error if the query fails.
     pub async fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<B256>> {
-        let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT block_hash FROM _sieve_block_hashes WHERE block_number = $1",
-        )
-        .bind(block_number.as_u64() as i64)
-        .fetch_optional(&self.pool)
-        .await
-        .wrap_err("failed to read block hash")?;
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT block_hash FROM _sieve_block_hashes WHERE block_number = $1")
+                .bind(block_number.as_u64() as i64)
+                .fetch_optional(&self.pool)
+                .await
+                .wrap_err("failed to read block hash")?;
 
         match row {
             Some((bytes,)) => {
@@ -173,13 +172,11 @@ pub async fn rollback_to(
         .wrap_err("failed to rollback block hashes")?;
 
     // Unconditional SET — rollback explicitly lowers the checkpoint
-    sqlx::query(
-        "UPDATE _sieve_checkpoints SET block_number = $1, updated_at = NOW() WHERE id = 1",
-    )
-    .bind(block_number.as_u64() as i64)
-    .execute(&mut **tx)
-    .await
-    .wrap_err("failed to reset checkpoint after rollback")?;
+    sqlx::query("UPDATE _sieve_checkpoints SET block_number = $1, updated_at = NOW() WHERE id = 1")
+        .bind(block_number.as_u64() as i64)
+        .execute(&mut **tx)
+        .await
+        .wrap_err("failed to reset checkpoint after rollback")?;
 
     Ok(())
 }
@@ -193,12 +190,10 @@ pub async fn rollback_to(
 ///
 /// Returns an error if the query fails.
 pub async fn load_factory_children(db: &Database, config: &IndexConfig) -> eyre::Result<u64> {
-    let rows = sqlx::query(
-        "SELECT factory_name, child_address FROM _sieve_factory_children",
-    )
-    .fetch_all(db.pool())
-    .await
-    .wrap_err("failed to load factory children")?;
+    let rows = sqlx::query("SELECT factory_name, child_address FROM _sieve_factory_children")
+        .fetch_all(db.pool())
+        .await
+        .wrap_err("failed to load factory children")?;
 
     let mut count = 0u64;
     for row in &rows {
@@ -219,11 +214,7 @@ pub async fn load_factory_children(db: &Database, config: &IndexConfig) -> eyre:
 /// Validate and register a single persisted factory child.
 ///
 /// Returns `true` if the child was successfully registered.
-fn register_persisted_child(
-    config: &IndexConfig,
-    factory_name: &str,
-    child_bytes: &[u8],
-) -> bool {
+fn register_persisted_child(config: &IndexConfig, factory_name: &str, child_bytes: &[u8]) -> bool {
     if child_bytes.len() != 20 {
         tracing::warn!(
             factory = factory_name,
@@ -235,11 +226,7 @@ fn register_persisted_child(
 
     let child_address = Address::from_slice(child_bytes);
 
-    let Some(contract_idx) = config
-        .contracts
-        .iter()
-        .position(|c| c.name == factory_name)
-    else {
+    let Some(contract_idx) = config.contracts.iter().position(|c| c.name == factory_name) else {
         tracing::warn!(
             factory = factory_name,
             "factory child references unknown contract, skipping"
@@ -474,10 +461,7 @@ pub async fn create_transfer_tables(
                 .execute(db.pool())
                 .await
                 .wrap_err_with(|| {
-                    format!(
-                        "failed to create index for table '{}'",
-                        transfer.table_name
-                    )
+                    format!("failed to create index for table '{}'", transfer.table_name)
                 })?;
         }
 
@@ -494,10 +478,7 @@ pub async fn create_transfer_tables(
 /// # Errors
 ///
 /// Returns an error if any DDL statement fails.
-pub async fn create_call_tables(
-    db: &Database,
-    calls: &[ResolvedCall],
-) -> eyre::Result<()> {
+pub async fn create_call_tables(db: &Database, calls: &[ResolvedCall]) -> eyre::Result<()> {
     for call in calls {
         sqlx::raw_sql(&call.create_table_sql)
             .execute(db.pool())
@@ -519,13 +500,15 @@ pub async fn create_call_tables(
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
 
     async fn test_db() -> eyre::Result<Database> {
-        let url = std::env::var("DATABASE_URL")
-            .wrap_err("DATABASE_URL not set")?;
+        let url = std::env::var("DATABASE_URL").wrap_err("DATABASE_URL not set")?;
         let db = Database::connect(&url).await?;
         create_internal_tables(&db).await?;
         Ok(db)
@@ -549,9 +532,7 @@ mod tests {
         // Update checkpoint
         let mut tx = db.begin().await?;
         update_checkpoint(&mut tx, BlockNumber::new(21_000_100)).await?;
-        tx.commit()
-            .await
-            .wrap_err("commit failed")?;
+        tx.commit().await.wrap_err("commit failed")?;
 
         // Should now return the block number
         let checkpoint = db.last_checkpoint().await?;

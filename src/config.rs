@@ -169,7 +169,6 @@ impl IndexConfig {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.remove(address);
     }
-
 }
 
 /// Hardcoded USDC Transfer config for tests.
@@ -194,7 +193,10 @@ pub fn usdc_transfer_config() -> eyre::Result<IndexConfig> {
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
     use alloy_primitives::address;
@@ -205,10 +207,9 @@ mod tests {
         let contract = &config.contracts[0];
 
         // keccak256("Transfer(address,address,uint256)")
-        let expected: B256 =
-            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-                .parse()
-                .map_err(|e| eyre::eyre!("parse error: {e}"))?;
+        let expected: B256 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            .parse()
+            .map_err(|e| eyre::eyre!("parse error: {e}"))?;
 
         assert!(contract.events.contains_key(&expected));
         assert_eq!(contract.events.len(), 1);
@@ -275,12 +276,7 @@ mod tests {
     fn zero_address_skipped_in_static_map() -> eyre::Result<()> {
         let abi_json = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]"#;
 
-        let contract = ContractConfig::new(
-            "FactoryChild",
-            Address::ZERO,
-            abi_json,
-            &["Transfer"],
-        )?;
+        let contract = ContractConfig::new("FactoryChild", Address::ZERO, abi_json, &["Transfer"])?;
 
         let config = IndexConfig::new(vec![contract]);
 

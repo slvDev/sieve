@@ -69,11 +69,7 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
 
     let mut matched = Vec::new();
 
-    for (tx_idx, (receipt, tx_hash)) in payload
-        .receipts()
-        .iter()
-        .zip(tx_hashes.iter())
-        .enumerate()
+    for (tx_idx, (receipt, tx_hash)) in payload.receipts().iter().zip(tx_hashes.iter()).enumerate()
     {
         let tx_index = TxIndex::from_usize(tx_idx);
         for (log_idx, log) in receipt.logs.iter().enumerate() {
@@ -227,7 +223,10 @@ fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> Option
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
     use crate::config::usdc_transfer_config;
@@ -255,18 +254,10 @@ mod tests {
         );
 
         // Log 1: wrong address
-        let wrong_addr_log = make_log(
-            wrong_addr,
-            vec![transfer_selector],
-            Bytes::new(),
-        );
+        let wrong_addr_log = make_log(wrong_addr, vec![transfer_selector], Bytes::new());
 
         // Log 2: right address, wrong topic
-        let wrong_topic_log = make_log(
-            usdc_addr,
-            vec![B256::ZERO],
-            Bytes::new(),
-        );
+        let wrong_topic_log = make_log(usdc_addr, vec![B256::ZERO], Bytes::new());
 
         let receipt = make_receipt(vec![matching_log, wrong_addr_log, wrong_topic_log]);
 
@@ -515,9 +506,11 @@ mod tests {
                 {"indexed":true,"internalType":"address","name":"pool","type":"address"}
             ],"name":"PoolCreated","type":"event"}
         ]"#;
-        let abi: alloy_json_abi::JsonAbi = serde_json::from_str(abi_json)
-            .map_err(|e| eyre::eyre!("parse: {e}"))?;
-        let creation_event = abi.events.get("PoolCreated")
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(abi_json).map_err(|e| eyre::eyre!("parse: {e}"))?;
+        let creation_event = abi
+            .events
+            .get("PoolCreated")
             .and_then(|v| v.first())
             .ok_or_else(|| eyre::eyre!("no PoolCreated event"))?;
 

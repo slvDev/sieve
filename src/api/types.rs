@@ -4,8 +4,8 @@
 //! extracting `PgRow` values into JSON maps, and mapping PG types to
 //! GraphQL `TypeRef` values.
 
-use async_graphql::dynamic::TypeRef;
 use crate::toml_config::{ContextField, ResolvedCall, ResolvedEvent, ResolvedTransfer};
+use async_graphql::dynamic::TypeRef;
 use serde_json::Value as JsonValue;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -30,11 +30,31 @@ pub struct ColumnMeta {
 #[must_use]
 pub fn build_columns_meta(event: &ResolvedEvent) -> Vec<ColumnMeta> {
     let mut cols = vec![
-        ColumnMeta { name: "id".to_string(), pg_type: "bigserial".to_string(), nullable: false },
-        ColumnMeta { name: "block_number".to_string(), pg_type: "bigint".to_string(), nullable: false },
-        ColumnMeta { name: "tx_hash".to_string(), pg_type: "bytea".to_string(), nullable: false },
-        ColumnMeta { name: "tx_index".to_string(), pg_type: "integer".to_string(), nullable: false },
-        ColumnMeta { name: "log_index".to_string(), pg_type: "integer".to_string(), nullable: false },
+        ColumnMeta {
+            name: "id".to_string(),
+            pg_type: "bigserial".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "block_number".to_string(),
+            pg_type: "bigint".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_hash".to_string(),
+            pg_type: "bytea".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_index".to_string(),
+            pg_type: "integer".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "log_index".to_string(),
+            pg_type: "integer".to_string(),
+            nullable: false,
+        },
     ];
 
     if event.is_factory_child {
@@ -71,13 +91,41 @@ pub fn build_columns_meta(event: &ResolvedEvent) -> Vec<ColumnMeta> {
 #[must_use]
 pub fn build_transfer_columns_meta(transfer: &ResolvedTransfer) -> Vec<ColumnMeta> {
     let mut cols = vec![
-        ColumnMeta { name: "id".to_string(), pg_type: "bigserial".to_string(), nullable: false },
-        ColumnMeta { name: "block_number".to_string(), pg_type: "bigint".to_string(), nullable: false },
-        ColumnMeta { name: "tx_hash".to_string(), pg_type: "bytea".to_string(), nullable: false },
-        ColumnMeta { name: "tx_index".to_string(), pg_type: "integer".to_string(), nullable: false },
-        ColumnMeta { name: "from_address".to_string(), pg_type: "text".to_string(), nullable: false },
-        ColumnMeta { name: "to_address".to_string(), pg_type: "text".to_string(), nullable: false },
-        ColumnMeta { name: "value".to_string(), pg_type: "numeric".to_string(), nullable: false },
+        ColumnMeta {
+            name: "id".to_string(),
+            pg_type: "bigserial".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "block_number".to_string(),
+            pg_type: "bigint".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_hash".to_string(),
+            pg_type: "bytea".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_index".to_string(),
+            pg_type: "integer".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "from_address".to_string(),
+            pg_type: "text".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "to_address".to_string(),
+            pg_type: "text".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "value".to_string(),
+            pg_type: "numeric".to_string(),
+            nullable: false,
+        },
     ];
 
     for cf in &transfer.context_fields {
@@ -98,10 +146,26 @@ pub fn build_transfer_columns_meta(transfer: &ResolvedTransfer) -> Vec<ColumnMet
 #[must_use]
 pub fn build_call_columns_meta(call: &ResolvedCall) -> Vec<ColumnMeta> {
     let mut cols = vec![
-        ColumnMeta { name: "id".to_string(), pg_type: "bigserial".to_string(), nullable: false },
-        ColumnMeta { name: "block_number".to_string(), pg_type: "bigint".to_string(), nullable: false },
-        ColumnMeta { name: "tx_hash".to_string(), pg_type: "bytea".to_string(), nullable: false },
-        ColumnMeta { name: "tx_index".to_string(), pg_type: "integer".to_string(), nullable: false },
+        ColumnMeta {
+            name: "id".to_string(),
+            pg_type: "bigserial".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "block_number".to_string(),
+            pg_type: "bigint".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_hash".to_string(),
+            pg_type: "bytea".to_string(),
+            nullable: false,
+        },
+        ColumnMeta {
+            name: "tx_index".to_string(),
+            pg_type: "integer".to_string(),
+            nullable: false,
+        },
     ];
 
     if call.is_factory_child {
@@ -134,8 +198,11 @@ pub fn build_call_columns_meta(call: &ResolvedCall) -> Vec<ColumnMeta> {
 /// Base PG type for a context field (without NOT NULL suffix).
 const fn context_field_base_type(cf: ContextField) -> &'static str {
     match cf {
-        ContextField::BlockTimestamp | ContextField::TxGasPrice | ContextField::TxGasUsed
-        | ContextField::TxNonce | ContextField::CumulativeGasUsed => "bigint",
+        ContextField::BlockTimestamp
+        | ContextField::TxGasPrice
+        | ContextField::TxGasUsed
+        | ContextField::TxNonce
+        | ContextField::CumulativeGasUsed => "bigint",
         ContextField::BlockHash => "bytea",
         ContextField::TxFrom | ContextField::TxTo => "text",
         ContextField::TxValue => "numeric",
@@ -366,21 +433,58 @@ mod tests {
         let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["id", "block_number", "tx_hash", "tx_index", "log_index",
-                 "block_timestamp", "tx_from", "from_address", "value"]
+            vec![
+                "id",
+                "block_number",
+                "tx_hash",
+                "tx_index",
+                "log_index",
+                "block_timestamp",
+                "tx_from",
+                "from_address",
+                "value"
+            ]
         );
     }
 
     #[test]
     fn select_clause_casts_correctly() {
         let meta = vec![
-            ColumnMeta { name: "id".to_string(), pg_type: "bigserial".to_string(), nullable: false },
-            ColumnMeta { name: "block_number".to_string(), pg_type: "bigint".to_string(), nullable: false },
-            ColumnMeta { name: "tx_hash".to_string(), pg_type: "bytea".to_string(), nullable: false },
-            ColumnMeta { name: "name".to_string(), pg_type: "text".to_string(), nullable: false },
-            ColumnMeta { name: "amount".to_string(), pg_type: "numeric".to_string(), nullable: false },
-            ColumnMeta { name: "active".to_string(), pg_type: "boolean".to_string(), nullable: false },
-            ColumnMeta { name: "idx".to_string(), pg_type: "integer".to_string(), nullable: false },
+            ColumnMeta {
+                name: "id".to_string(),
+                pg_type: "bigserial".to_string(),
+                nullable: false,
+            },
+            ColumnMeta {
+                name: "block_number".to_string(),
+                pg_type: "bigint".to_string(),
+                nullable: false,
+            },
+            ColumnMeta {
+                name: "tx_hash".to_string(),
+                pg_type: "bytea".to_string(),
+                nullable: false,
+            },
+            ColumnMeta {
+                name: "name".to_string(),
+                pg_type: "text".to_string(),
+                nullable: false,
+            },
+            ColumnMeta {
+                name: "amount".to_string(),
+                pg_type: "numeric".to_string(),
+                nullable: false,
+            },
+            ColumnMeta {
+                name: "active".to_string(),
+                pg_type: "boolean".to_string(),
+                nullable: false,
+            },
+            ColumnMeta {
+                name: "idx".to_string(),
+                pg_type: "integer".to_string(),
+                nullable: false,
+            },
         ];
         let clause = build_select_clause(&meta);
         assert_eq!(
@@ -394,14 +498,32 @@ mod tests {
     #[test]
     fn graphql_type_mapping() {
         // Non-nullable
-        assert_eq!(format!("{:?}", pg_to_graphql_type("text", false)), format!("{:?}", TypeRef::named_nn(TypeRef::STRING)));
-        assert_eq!(format!("{:?}", pg_to_graphql_type("boolean", false)), format!("{:?}", TypeRef::named_nn(TypeRef::BOOLEAN)));
-        assert_eq!(format!("{:?}", pg_to_graphql_type("integer", false)), format!("{:?}", TypeRef::named_nn(TypeRef::INT)));
-        assert_eq!(format!("{:?}", pg_to_graphql_type("bigserial", false)), format!("{:?}", TypeRef::named_nn(TypeRef::ID)));
+        assert_eq!(
+            format!("{:?}", pg_to_graphql_type("text", false)),
+            format!("{:?}", TypeRef::named_nn(TypeRef::STRING))
+        );
+        assert_eq!(
+            format!("{:?}", pg_to_graphql_type("boolean", false)),
+            format!("{:?}", TypeRef::named_nn(TypeRef::BOOLEAN))
+        );
+        assert_eq!(
+            format!("{:?}", pg_to_graphql_type("integer", false)),
+            format!("{:?}", TypeRef::named_nn(TypeRef::INT))
+        );
+        assert_eq!(
+            format!("{:?}", pg_to_graphql_type("bigserial", false)),
+            format!("{:?}", TypeRef::named_nn(TypeRef::ID))
+        );
         // bigint → String (not Int, because i32 overflow)
-        assert_eq!(format!("{:?}", pg_to_graphql_type("bigint", false)), format!("{:?}", TypeRef::named_nn(TypeRef::STRING)));
+        assert_eq!(
+            format!("{:?}", pg_to_graphql_type("bigint", false)),
+            format!("{:?}", TypeRef::named_nn(TypeRef::STRING))
+        );
         // Nullable
-        assert_eq!(format!("{:?}", pg_to_graphql_type("text", true)), format!("{:?}", TypeRef::named(TypeRef::STRING)));
+        assert_eq!(
+            format!("{:?}", pg_to_graphql_type("text", true)),
+            format!("{:?}", TypeRef::named(TypeRef::STRING))
+        );
     }
 
     #[test]
@@ -441,8 +563,18 @@ mod tests {
         // contract_address appears after standard columns, before context columns
         assert_eq!(
             names,
-            vec!["id", "block_number", "tx_hash", "tx_index", "log_index",
-                 "contract_address", "block_timestamp", "tx_from", "from_address", "value"]
+            vec![
+                "id",
+                "block_number",
+                "tx_hash",
+                "tx_index",
+                "log_index",
+                "contract_address",
+                "block_timestamp",
+                "tx_from",
+                "from_address",
+                "value"
+            ]
         );
 
         // contract_address is text, not nullable
@@ -474,8 +606,15 @@ mod tests {
         let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["id", "block_number", "tx_hash", "tx_index",
-                 "from_address", "to_address", "value"]
+            vec![
+                "id",
+                "block_number",
+                "tx_hash",
+                "tx_index",
+                "from_address",
+                "to_address",
+                "value"
+            ]
         );
         // No log_index for transfers
         assert!(meta.iter().all(|c| c.name != "log_index"));
@@ -515,8 +654,15 @@ mod tests {
         let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["id", "block_number", "tx_hash", "tx_index",
-                 "block_timestamp", "recipient", "amount_in"]
+            vec![
+                "id",
+                "block_number",
+                "tx_hash",
+                "tx_index",
+                "block_timestamp",
+                "recipient",
+                "amount_in"
+            ]
         );
         // No log_index for calls
         assert!(meta.iter().all(|c| c.name != "log_index"));
@@ -530,8 +676,16 @@ mod tests {
         let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["id", "block_number", "tx_hash", "tx_index",
-                 "contract_address", "block_timestamp", "recipient", "amount_in"]
+            vec![
+                "id",
+                "block_number",
+                "tx_hash",
+                "tx_index",
+                "contract_address",
+                "block_timestamp",
+                "recipient",
+                "amount_in"
+            ]
         );
     }
 
@@ -543,9 +697,17 @@ mod tests {
         let names: Vec<&str> = meta.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["id", "block_number", "tx_hash", "tx_index",
-                 "from_address", "to_address", "value",
-                 "block_timestamp", "tx_gas_price"]
+            vec![
+                "id",
+                "block_number",
+                "tx_hash",
+                "tx_index",
+                "from_address",
+                "to_address",
+                "value",
+                "block_timestamp",
+                "tx_gas_price"
+            ]
         );
     }
 }

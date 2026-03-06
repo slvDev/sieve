@@ -91,9 +91,7 @@ pub struct EventPayload {
 #[must_use]
 pub fn dyn_sol_to_json(value: &DynSolValue) -> serde_json::Value {
     match value {
-        DynSolValue::Address(addr) => {
-            serde_json::Value::String(Address::to_checksum(addr, None))
-        }
+        DynSolValue::Address(addr) => serde_json::Value::String(Address::to_checksum(addr, None)),
         DynSolValue::Bool(b) => serde_json::Value::Bool(*b),
         DynSolValue::Uint(val, _) => serde_json::Value::String(val.to_string()),
         DynSolValue::Int(val, _) => serde_json::Value::String(val.to_string()),
@@ -161,10 +159,7 @@ impl StreamDispatcher {
     /// Each sink is paired with a `backfill` flag: if `false`, the sink is
     /// skipped when `is_backfill` is `true` on the notification.
     #[must_use]
-    pub fn new(
-        sinks: Vec<(Box<dyn StreamSink>, bool)>,
-        capacity: usize,
-    ) -> Self {
+    pub fn new(sinks: Vec<(Box<dyn StreamSink>, bool)>, capacity: usize) -> Self {
         let (tx, rx) = mpsc::channel(capacity);
         tokio::spawn(run_delivery(rx, sinks));
         Self { tx }
@@ -254,7 +249,10 @@ async fn deliver_events(entries: &[SinkEntry], payloads: &[EventPayload], is_bac
 }
 
 #[cfg(test)]
-#[expect(clippy::panic_in_result_fn, reason = "assertions in tests are idiomatic")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -330,8 +328,14 @@ mod tests {
     #[test]
     fn event_payload_serializes_to_json() -> eyre::Result<()> {
         let mut data = serde_json::Map::new();
-        data.insert("from".to_string(), serde_json::Value::String("0xABC".to_string()));
-        data.insert("value".to_string(), serde_json::Value::String("1000000".to_string()));
+        data.insert(
+            "from".to_string(),
+            serde_json::Value::String("0xABC".to_string()),
+        );
+        data.insert(
+            "value".to_string(),
+            serde_json::Value::String("1000000".to_string()),
+        );
 
         let payload = EventPayload {
             table: "usdc_transfers".to_string(),
@@ -396,7 +400,10 @@ mod tests {
     fn dyn_sol_to_json_address() {
         let addr = alloy_primitives::address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let val = dyn_sol_to_json(&DynSolValue::Address(addr));
-        assert_eq!(val, serde_json::Value::String("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string()));
+        assert_eq!(
+            val,
+            serde_json::Value::String("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string())
+        );
     }
 
     #[test]
@@ -569,7 +576,10 @@ mod tests {
         let dispatcher = StreamDispatcher::new(vec![(sink, true)], 16);
 
         let mut data = serde_json::Map::new();
-        data.insert("from".to_string(), serde_json::Value::String("0xABC".to_string()));
+        data.insert(
+            "from".to_string(),
+            serde_json::Value::String("0xABC".to_string()),
+        );
 
         dispatcher.send_events(
             vec![EventPayload {

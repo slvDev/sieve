@@ -46,10 +46,7 @@ struct FollowContext {
 ///
 /// Returns an error on unrecoverable failures (DB errors, deep reorgs).
 #[instrument(skip_all, fields(start_block = start_block.as_u64()))]
-pub async fn run_follow_loop(
-    start_block: BlockNumber,
-    ctx: SyncContext,
-) -> eyre::Result<()> {
+pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre::Result<()> {
     info!(start_block = start_block.as_u64(), "entering follow mode");
 
     let fctx = FollowContext {
@@ -81,9 +78,7 @@ pub async fn run_follow_loop(
 /// Run a single follow epoch. Returns `true` if the loop should exit.
 async fn run_follow_epoch(ctx: &FollowContext) -> eyre::Result<bool> {
     match discover_gap(ctx).await? {
-        EpochAction::Wait => {
-            Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await)
-        }
+        EpochAction::Wait => Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await),
         EpochAction::Reorg => Ok(false),
         EpochAction::Sync { next_block, head } => {
             let gap = sync_epoch(ctx, next_block, head).await?;
@@ -118,11 +113,10 @@ enum EpochAction {
 
 /// Discover the current chain head and determine the epoch action.
 async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
-    let baseline = ctx
-        .db
-        .last_checkpoint()
-        .await?
-        .map_or_else(|| ctx.start_block.as_u64().saturating_sub(1), BlockNumber::as_u64);
+    let baseline = ctx.db.last_checkpoint().await?.map_or_else(
+        || ctx.start_block.as_u64().saturating_sub(1),
+        BlockNumber::as_u64,
+    );
 
     let Some(observed_head) = discover_head_p2p(&ctx.pool, baseline, 3, 1024).await? else {
         debug!("no new blocks discovered, waiting");
@@ -211,7 +205,10 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
 /// Run reorg preflight and rollback if needed.
 /// Returns `true` if a reorg was handled (caller should `continue` the loop)
 /// or if we should wait and retry. Returns `false` to proceed with sync.
-#[expect(clippy::too_many_arguments, reason = "follow loop passes individual fields")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "follow loop passes individual fields"
+)]
 async fn should_rollback_reorg(
     db: &Database,
     pool: &PeerPool,
@@ -235,7 +232,16 @@ async fn should_rollback_reorg(
             Ok(true)
         }
         ReorgCheck::ReorgDetected { anchor } => {
-            execute_rollback(db, handlers, transfer_handlers, call_handlers, config, &anchor, baseline).await?;
+            execute_rollback(
+                db,
+                handlers,
+                transfer_handlers,
+                call_handlers,
+                config,
+                &anchor,
+                baseline,
+            )
+            .await?;
             Ok(true)
         }
     }
@@ -258,7 +264,9 @@ async fn execute_rollback(
     let ancestor_block = BlockNumber::new(ancestor);
     let mut tx = db.begin().await?;
     handlers.rollback_all(ancestor_block, &mut tx).await?;
-    transfer_handlers.rollback_all(ancestor_block, &mut tx).await?;
+    transfer_handlers
+        .rollback_all(ancestor_block, &mut tx)
+        .await?;
     call_handlers.rollback_all(ancestor_block, &mut tx).await?;
     db::rollback_factory_children(&mut tx, ancestor_block, config).await?;
     db::rollback_to(&mut tx, ancestor_block).await?;

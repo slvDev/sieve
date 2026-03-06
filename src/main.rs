@@ -21,10 +21,10 @@ mod metrics;
 mod p2p;
 mod stream;
 mod sync;
-mod toml_config;
-mod types;
 #[cfg(test)]
 mod test_utils;
+mod toml_config;
+mod types;
 
 use types::BlockNumber;
 
@@ -58,8 +58,14 @@ async fn main() -> eyre::Result<()> {
                 start_block,
                 etherscan_api_key,
             } => {
-                cmd_add_contract(&cli, address, name.as_deref(), *start_block, etherscan_api_key.as_deref())
-                    .await
+                cmd_add_contract(
+                    &cli,
+                    address,
+                    name.as_deref(),
+                    *start_block,
+                    etherscan_api_key.as_deref(),
+                )
+                .await
             }
             cli::Command::Inspect => cmd_inspect(&cli),
             cli::Command::Peers => cmd_peers().await,
@@ -90,7 +96,11 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     info!(
         start_block = startup.start_block.as_u64(),
         end_block = cli.end_block,
-        mode = if cli.end_block.is_some() { "historical" } else { "follow" },
+        mode = if cli.end_block.is_some() {
+            "historical"
+        } else {
+            "follow"
+        },
         "sieve starting"
     );
 
@@ -101,7 +111,10 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     let db = Arc::new(setup_database(cli, &startup).await?);
 
     let index_config = Arc::new(startup.index_config);
-    info!(contracts = index_config.contracts.len(), "loaded index config");
+    info!(
+        contracts = index_config.contracts.len(),
+        "loaded index config"
+    );
 
     // Load persisted factory children from previous runs
     if !startup.factories.is_empty() {
@@ -177,7 +190,10 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
 
     // P2P
     let session = p2p::connect_mainnet_peers().await?;
-    info!(peers = session.pool.len(), "connected to ethereum p2p network");
+    info!(
+        peers = session.pool.len(),
+        "connected to ethereum p2p network"
+    );
 
     let is_backfill = cli.end_block.is_some();
 
@@ -240,10 +256,7 @@ fn load_resolved_config(cli: &cli::Cli) -> eyre::Result<ResolvedStartup> {
 /// # Errors
 ///
 /// Returns an error if no database URL is available from any source.
-fn resolve_database_url(
-    cli: &cli::Cli,
-    config: &toml_config::SieveConfig,
-) -> eyre::Result<String> {
+fn resolve_database_url(cli: &cli::Cli, config: &toml_config::SieveConfig) -> eyre::Result<String> {
     cli.database_url
         .clone()
         .or_else(|| config.database.as_ref().and_then(|d| d.url.clone()))
@@ -336,7 +349,46 @@ url = "postgres://postgres:sieve@localhost:5432/sieve"
     std::fs::write(config_path, template)
         .map_err(|e| eyre::eyre!("failed to write {}: {e}", cli.config))?;
 
-    println!("created {} and abis/", cli.config);
+    let compose_path = Path::new("docker-compose.yml");
+    if !compose_path.exists() {
+        let compose = r#"services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: sieve
+      POSTGRES_DB: sieve
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  sieve:
+    image: ghcr.io/slvdev/sieve:latest
+    ports:
+      - "4000:4000"
+      - "30303:30303"
+      - "30303:30303/udp"
+    depends_on:
+      - postgres
+    command:
+      - "--config"
+      - "/app/sieve.toml"
+      - "--database-url"
+      - "postgres://postgres:sieve@postgres:5432/sieve"
+      - "--api-port"
+      - "4000"
+    volumes:
+      - ./sieve.toml:/app/sieve.toml:ro
+      - ./abis:/app/abis:ro
+
+volumes:
+  pgdata:
+"#;
+        std::fs::write(compose_path, compose)
+            .map_err(|e| eyre::eyre!("failed to write docker-compose.yml: {e}"))?;
+    }
+
+    println!("created {}, abis/, and docker-compose.yml", cli.config);
     Ok(())
 }
 
@@ -497,7 +549,11 @@ async fn cmd_add_contract(
     file.write_all(toml_block.as_bytes())
         .map_err(|e| eyre::eyre!("failed to write to {}: {e}", cli.config))?;
 
-    println!("added {contract_name} ({} events) to {}", events.len(), cli.config);
+    println!(
+        "added {contract_name} ({} events) to {}",
+        events.len(),
+        cli.config
+    );
     println!("  abi: {abi_path}");
     if info.is_proxy {
         println!("  note: proxy detected — using implementation ABI");
@@ -649,7 +705,11 @@ fn print_event_detail(event: &toml_config::ResolvedEvent) {
         println!("        columns: {}", cols.join(", "));
     }
     if !event.context_fields.is_empty() {
-        let ctx: Vec<&str> = event.context_fields.iter().map(|f| f.pg_column_name()).collect();
+        let ctx: Vec<&str> = event
+            .context_fields
+            .iter()
+            .map(|f| f.pg_column_name())
+            .collect();
         println!("        context: {}", ctx.join(", "));
     }
     if !event.topic_filters.is_empty() {
@@ -673,7 +733,11 @@ fn print_call_detail(call: &toml_config::ResolvedCall) {
         println!("        columns: {}", cols.join(", "));
     }
     if !call.context_fields.is_empty() {
-        let ctx: Vec<&str> = call.context_fields.iter().map(|f| f.pg_column_name()).collect();
+        let ctx: Vec<&str> = call
+            .context_fields
+            .iter()
+            .map(|f| f.pg_column_name())
+            .collect();
         println!("        context: {}", ctx.join(", "));
     }
 }
@@ -717,10 +781,7 @@ fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
 async fn cmd_peers() -> eyre::Result<()> {
     println!("Connecting to Ethereum P2P network...");
     let session = p2p::connect_mainnet_peers().await?;
-    println!(
-        "Startup complete: {} peers connected",
-        session.pool.len()
-    );
+    println!("Startup complete: {} peers connected", session.pool.len());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
@@ -755,7 +816,9 @@ async fn run_indexer(
 
         if effective_start > end_block {
             info!("nothing to index");
-            ctx.metrics.is_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.metrics
+                .is_ready
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
 
@@ -763,7 +826,9 @@ async fn run_indexer(
         let outcome = sync::run_sync(effective_start, end_block, ctx).await?;
 
         // Historical sync complete — mark as ready
-        metrics.is_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .is_ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         info!(
             blocks = outcome.blocks_fetched,
@@ -828,7 +893,11 @@ async fn resolve_effective_start(
         }
         if checkpoint >= start_block {
             let resume_from = BlockNumber::new(checkpoint.as_u64() + 1);
-            info!(checkpoint = checkpoint.as_u64(), resume_from = resume_from.as_u64(), "resuming from checkpoint");
+            info!(
+                checkpoint = checkpoint.as_u64(),
+                resume_from = resume_from.as_u64(),
+                "resuming from checkpoint"
+            );
             return Ok(resume_from);
         }
     }
@@ -842,16 +911,12 @@ async fn resolve_effective_start(
 #[expect(clippy::exit, reason = "second Ctrl+C requires immediate hard exit")]
 async fn shutdown_handler(stop_tx: watch::Sender<bool>) {
     // First Ctrl+C → graceful shutdown
-    tokio::signal::ctrl_c()
-        .await
-        .ok();
+    tokio::signal::ctrl_c().await.ok();
     warn!("shutdown signal received; stopping after draining");
     let _ = stop_tx.send(true);
 
     // Second Ctrl+C → hard exit
-    tokio::signal::ctrl_c()
-        .await
-        .ok();
+    tokio::signal::ctrl_c().await.ok();
     warn!("second shutdown signal received; forcing exit");
     std::process::exit(130);
 }
@@ -909,16 +974,14 @@ fn build_stream_sinks(
         .iter()
         .filter_map(|s| {
             let sink: Box<dyn stream::StreamSink> = match s.stream_type.as_str() {
-                "webhook" => {
-                    Box::new(stream::webhook::WebhookSink::new(s.name.clone(), s.url.clone()))
-                }
+                "webhook" => Box::new(stream::webhook::WebhookSink::new(
+                    s.name.clone(),
+                    s.url.clone(),
+                )),
                 "rabbitmq" => {
                     let exchange = s.exchange.clone().unwrap_or_default();
                     let default_routing_key = ["{table}", ".", "{event}"].concat();
-                    let routing_key = s
-                        .routing_key
-                        .clone()
-                        .unwrap_or(default_routing_key);
+                    let routing_key = s.routing_key.clone().unwrap_or(default_routing_key);
                     Box::new(stream::rabbitmq::RabbitMqSink::new(
                         s.name.clone(),
                         s.url.clone(),
@@ -960,8 +1023,13 @@ mod tests {
     #[test]
     fn generate_contract_toml_with_start_block() {
         let events = vec![("Transfer".to_owned(), "usdc_transfer".to_owned())];
-        let toml =
-            generate_contract_toml("USDC", "0xA0b8", "abis/usdc.json", Some(21_000_000), &events);
+        let toml = generate_contract_toml(
+            "USDC",
+            "0xA0b8",
+            "abis/usdc.json",
+            Some(21_000_000),
+            &events,
+        );
         assert!(toml.contains("start_block = 21000000"));
         assert!(!toml.contains("# start_block"));
     }
