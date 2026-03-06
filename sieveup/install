@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# Sieve Installer
+# Downloads and installs sieveup, then runs it to install sieve
+
+SIEVE_DIR="${SIEVE_DIR:-$HOME/.sieve}"
+SIEVE_BIN_DIR="$SIEVE_DIR/bin"
+
+REPO="slvDev/sieve"
+SIEVEUP_URL="https://raw.githubusercontent.com/$REPO/main/sieveup/sieveup"
+
+main() {
+    echo "Installing sieveup..."
+
+    # Create directories
+    mkdir -p "$SIEVE_BIN_DIR"
+
+    # Download sieveup
+    if command -v curl &> /dev/null; then
+        curl -fsSL "$SIEVEUP_URL" -o "$SIEVE_BIN_DIR/sieveup"
+    elif command -v wget &> /dev/null; then
+        wget -qO "$SIEVE_BIN_DIR/sieveup" "$SIEVEUP_URL"
+    else
+        echo "Error: curl or wget is required"
+        exit 1
+    fi
+
+    # Make executable
+    chmod +x "$SIEVE_BIN_DIR/sieveup"
+
+    # Add to PATH (sets PROFILE variable)
+    add_to_path
+
+    echo ""
+
+    # Run sieveup to install sieve
+    "$SIEVE_BIN_DIR/sieveup"
+
+    # Final message with source instruction
+    echo ""
+    if [[ -n "$PROFILE" ]]; then
+        echo "Run 'source $PROFILE' or start a new terminal to use sieve."
+    fi
+    echo "Run 'sieveup' anytime to update."
+}
+
+add_to_path() {
+    case $SHELL in
+        */zsh)
+            PROFILE="${ZDOTDIR-"$HOME"}/.zshenv"
+            add_to_file "$PROFILE"
+            ;;
+        */bash)
+            if [[ -f "$HOME/.bash_profile" ]]; then
+                PROFILE="$HOME/.bash_profile"
+            else
+                PROFILE="$HOME/.bashrc"
+            fi
+            add_to_file "$PROFILE"
+            ;;
+        */fish)
+            PROFILE="$HOME/.config/fish/config.fish"
+            add_to_fish
+            ;;
+        *)
+            echo "Could not detect shell. Add $SIEVE_BIN_DIR to your PATH manually."
+            ;;
+    esac
+}
+
+add_to_file() {
+    local file="$1"
+    local line="export PATH=\"\$PATH:$SIEVE_BIN_DIR\""
+
+    # Check if already added
+    if [[ -f "$file" ]] && grep -q "$SIEVE_BIN_DIR" "$file"; then
+        return
+    fi
+
+    echo "" >> "$file"
+    echo "# Sieve" >> "$file"
+    echo "$line" >> "$file"
+}
+
+add_to_fish() {
+    local fish_config="$HOME/.config/fish/config.fish"
+    mkdir -p "$(dirname "$fish_config")"
+
+    if [[ -f "$fish_config" ]] && grep -q "$SIEVE_BIN_DIR" "$fish_config"; then
+        return
+    fi
+
+    echo "" >> "$fish_config"
+    echo "# Sieve" >> "$fish_config"
+    echo "fish_add_path -a \"$SIEVE_BIN_DIR\"" >> "$fish_config"
+}
+
+main

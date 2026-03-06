@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -e
+
+# Sieveup - Sieve Version Manager
+# Downloads and installs sieve binary from GitHub Releases
+
+SIEVE_DIR="${SIEVE_DIR:-$HOME/.sieve}"
+SIEVE_BIN_DIR="$SIEVE_DIR/bin"
+
+REPO="slvDev/sieve"
+VERSION=""
+
+main() {
+    parse_args "$@"
+
+    local os arch target
+    os=$(detect_os)
+    arch=$(detect_arch)
+    target=$(get_target "$os" "$arch")
+
+    if [[ -z "$target" ]]; then
+        echo "Error: Unsupported platform: $os $arch"
+        exit 1
+    fi
+
+    local version
+    if [[ -n "$VERSION" ]]; then
+        version="$VERSION"
+    else
+        version=$(get_latest_version)
+    fi
+
+    # Check if already installed with same version
+    if [[ -x "$SIEVE_BIN_DIR/sieve" ]]; then
+        local current_version
+        current_version=$("$SIEVE_BIN_DIR/sieve" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        if [[ "$current_version" == "$version" ]]; then
+            echo "sieve $version is already installed"
+            exit 0
+        fi
+    fi
+
+    echo "Installing sieve $version ($target)..."
+
+    download_and_install "$version" "$target"
+
+    echo ""
+    echo "sieve $version installed successfully!"
+    echo ""
+    "$SIEVE_BIN_DIR/sieve" --version 2>/dev/null || true
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--version)
+                VERSION="$2"
+                shift 2
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+}
+
+show_help() {
+    cat <<EOF
+sieveup - Sieve version manager
+
+USAGE:
+    sieveup [OPTIONS]
+
+OPTIONS:
+    -v, --version <VERSION>    Install specific version (e.g., 0.1.0)
+    -h, --help                 Show this help message
+
+EXAMPLES:
+    sieveup                    Install latest stable version
+    sieveup -v 0.1.0           Install version 0.1.0
+EOF
+}
+
+detect_os() {
+    local os
+    os=$(uname -s)
+
+    case $os in
+        Darwin)
+            echo "macos"
+            ;;
+        Linux)
+            echo "linux"
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+
+    case $arch in
+        x86_64|amd64)
+            echo "x86_64"
+            ;;
+        arm64|aarch64)
+            echo "aarch64"
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+get_target() {
+    local os="$1"
+    local arch="$2"
+
+    case "$os-$arch" in
+        macos-x86_64)
+            echo "x86_64-apple-darwin"
+            ;;
+        macos-aarch64)
+            echo "aarch64-apple-darwin"
+            ;;
+        linux-x86_64)
+            echo "x86_64-unknown-linux-gnu"
+            ;;
+        linux-aarch64)
+            echo "aarch64-unknown-linux-gnu"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+get_latest_version() {
+    local url="https://api.github.com/repos/$REPO/releases/latest"
+    local version
+
+    if command -v curl &> /dev/null; then
+        version=$(curl -fsSL "$url" | grep '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    elif command -v wget &> /dev/null; then
+        version=$(wget -qO- "$url" | grep '"tag_name"' | sed -E 's/.*"v?([^"]+)".*/\1/')
+    else
+        echo "Error: curl or wget is required"
+        exit 1
+    fi
+
+    if [[ -z "$version" ]]; then
+        echo "Error: Could not fetch latest version"
+        exit 1
+    fi
+
+    echo "$version"
+}
+
+download_and_install() {
+    local version="$1"
+    local target="$2"
+    local filename="sieve-${target}.tar.gz"
+    local url="https://github.com/$REPO/releases/download/v${version}/${filename}"
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    echo "Downloading from $url"
+
+    # Download
+    if command -v curl &> /dev/null; then
+        curl -fsSL "$url" -o "$tmp_dir/$filename"
+    elif command -v wget &> /dev/null; then
+        wget -qO "$tmp_dir/$filename" "$url"
+    fi
+
+    # Extract
+    tar -xzf "$tmp_dir/$filename" -C "$tmp_dir"
+
+    # Install
+    mkdir -p "$SIEVE_BIN_DIR"
+    mv "$tmp_dir/sieve" "$SIEVE_BIN_DIR/sieve"
+    chmod +x "$SIEVE_BIN_DIR/sieve"
+}
+
+main "$@"
