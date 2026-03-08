@@ -929,19 +929,55 @@ async fn flush_batch(
 }
 
 /// Inner flush: open one transaction, store all blocks, commit.
+///
+/// Phase 1: per-block preparation — store block hashes, factory children,
+/// build event contexts, scan transfers/calls, compute outcomes.
+/// Phase 2: batch insert — multi-row INSERT all events/transfers/calls.
+/// Phase 3: checkpoint + commit.
 async fn flush_batch_inner(
     batch: &[ProcessedBlock],
     ctx: &ProcessContext<'_>,
 ) -> eyre::Result<Vec<ProcessOutcome>> {
     let mut tx = ctx.db.begin().await?;
     let mut outcomes = Vec::with_capacity(batch.len());
+    let mut all_events: Vec<(&decode::DecodedEvent, EventContext)> = Vec::new();
+    let mut all_transfers: Vec<(NativeTransfer, EventContext)> = Vec::new();
+    let mut all_calls: Vec<(DecodedCall, EventContext)> = Vec::new();
 
+    // Phase 1: per-block preparation
     for block in batch {
-        let outcome = store_block_in_batch(block, ctx, &mut tx).await?;
+        let outcome = prepare_block_outcome(
+            block,
+            ctx,
+            &mut tx,
+            &mut all_events,
+            &mut all_transfers,
+            &mut all_calls,
+        )
+        .await?;
         outcomes.push(outcome);
     }
 
-    // Checkpoint with maximum block number (GREATEST ensures no backward movement)
+    // Phase 2: batch inserts
+    let event_refs: Vec<(&decode::DecodedEvent, &EventContext)> =
+        all_events.iter().map(|(e, c)| (*e, c)).collect();
+    ctx.handlers.batch_dispatch(&event_refs, &mut tx).await?;
+    if !all_transfers.is_empty() {
+        let transfer_refs: Vec<(&NativeTransfer, &EventContext)> =
+            all_transfers.iter().map(|(t, c)| (t, c)).collect();
+        ctx.transfer_handlers
+            .batch_dispatch(&transfer_refs, &mut tx)
+            .await?;
+    }
+    if !all_calls.is_empty() {
+        let call_refs: Vec<(&DecodedCall, &EventContext)> =
+            all_calls.iter().map(|(c, ctx)| (c, ctx)).collect();
+        ctx.call_handlers
+            .batch_dispatch(&call_refs, &mut tx)
+            .await?;
+    }
+
+    // Phase 3: checkpoint + commit
     if let Some(max_block) = batch.iter().map(|b| b.block_number).max() {
         db::update_checkpoint(&mut tx, max_block).await?;
     }
@@ -953,11 +989,17 @@ async fn flush_batch_inner(
     Ok(outcomes)
 }
 
-/// Store one block's data within an existing transaction.
-async fn store_block_in_batch(
-    block: &ProcessedBlock,
+/// Prepare one block's outcome and accumulate events/transfers/calls for batch insert.
+///
+/// Stores block hashes and factory children (small, per-block). Accumulates
+/// events, transfers, and calls into the shared vecs for Phase 2 batch insert.
+async fn prepare_block_outcome<'a>(
+    block: &'a ProcessedBlock,
     ctx: &ProcessContext<'_>,
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    all_events: &mut Vec<(&'a decode::DecodedEvent, EventContext)>,
+    all_transfers: &mut Vec<(NativeTransfer, EventContext)>,
+    all_calls: &mut Vec<(DecodedCall, EventContext)>,
 ) -> eyre::Result<ProcessOutcome> {
     db::store_block_hash(tx, block.block_number, block.block_hash.as_slice()).await?;
 
@@ -972,10 +1014,13 @@ async fn store_block_in_batch(
     let mut event_payloads: Vec<crate::stream::EventPayload> = Vec::new();
     let mut sender_cache: HashMap<TxIndex, Address> = HashMap::new();
 
+    // Events: count matches and accumulate for batch insert
     for event in &block.decoded_events {
         let event_context =
             build_event_context(&block.payload, block.block_hash, event, &mut sender_cache)?;
-        let dispatched = ctx.handlers.dispatch(event, &event_context, tx).await?;
+        let dispatched = ctx
+            .handlers
+            .matching_count(&event.contract_name, &event.event_name);
         if dispatched > 0 {
             track_event_table(ctx.event_table_map, event, dispatched, &mut table_counts);
             if ctx.has_streams {
@@ -987,31 +1032,32 @@ async fn store_block_in_batch(
                     &mut event_payloads,
                 );
             }
+            all_events.push((event, event_context));
         }
         stored_count = stored_count.saturating_add(dispatched);
     }
 
-    let transfer_count = store_transfers(
+    // Transfers: scan and accumulate for batch insert
+    let transfer_count = accumulate_transfers(
         &block.payload,
         block.block_hash,
         &mut sender_cache,
         ctx,
-        tx,
+        all_transfers,
         &mut table_counts,
         &mut event_payloads,
-    )
-    .await?;
+    )?;
 
-    let call_count = store_calls(
+    // Calls: scan and accumulate for batch insert
+    let call_count = accumulate_calls(
         &block.payload,
         block.block_hash,
         &mut sender_cache,
         ctx,
-        tx,
+        all_calls,
         &mut table_counts,
         &mut event_payloads,
-    )
-    .await?;
+    )?;
 
     let table_counts = table_counts
         .into_iter()
@@ -1230,61 +1276,57 @@ fn build_call_payload(
     }
 }
 
-/// Scan and store native transfers, updating table_counts and event_payloads.
-async fn store_transfers(
+/// Scan native transfers and accumulate for batch insert (no DB writes).
+fn accumulate_transfers(
     payload: &BlockPayload,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     ctx: &ProcessContext<'_>,
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    all_transfers: &mut Vec<(NativeTransfer, EventContext)>,
     table_counts: &mut HashMap<String, (String, u64)>,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
 ) -> eyre::Result<u64> {
     if ctx.transfer_handlers.is_empty() {
         return Ok(0);
     }
-    let count = scan_and_store_transfers(
+    scan_transfers(
         payload,
         block_hash,
         sender_cache,
         ctx.transfer_handlers,
-        tx,
         ctx.has_streams,
+        all_transfers,
         event_payloads,
         table_counts,
         ctx.receipt_tables,
     )
-    .await?;
-    Ok(count)
 }
 
-/// Scan and store function calls, updating table_counts and event_payloads.
-async fn store_calls(
+/// Scan function calls and accumulate for batch insert (no DB writes).
+fn accumulate_calls(
     payload: &BlockPayload,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     ctx: &ProcessContext<'_>,
-    tx: &mut sqlx::Transaction<'_, Postgres>,
+    all_calls: &mut Vec<(DecodedCall, EventContext)>,
     table_counts: &mut HashMap<String, (String, u64)>,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
 ) -> eyre::Result<u64> {
     if ctx.call_handlers.is_empty() {
         return Ok(0);
     }
-    let count = scan_and_store_calls(
+    scan_calls(
         payload,
         block_hash,
         sender_cache,
         ctx.config,
         ctx.call_handlers,
-        tx,
         ctx.has_streams,
+        all_calls,
         event_payloads,
         table_counts,
         ctx.receipt_tables,
     )
-    .await?;
-    Ok(count)
 }
 
 /// Compute per-transaction gas used from cumulative gas values.
@@ -1362,23 +1404,24 @@ fn build_event_context(
     })
 }
 
-/// Scan block transactions for native ETH transfers and store them.
+/// Scan block transactions for native ETH transfers (no DB writes).
 ///
 /// Iterates all transactions in the block body, skipping zero-value,
-/// contract-creation, and reverted transactions. Uses the shared sender cache.
+/// contract-creation, and reverted transactions. Accumulates matching
+/// transfers for batch insert.
 ///
-/// Returns the number of transfers stored.
+/// Returns the number of transfers matched.
 #[expect(
     clippy::too_many_arguments,
     reason = "per-table counting adds table_counts"
 )]
-async fn scan_and_store_transfers(
+fn scan_transfers(
     payload: &BlockPayload,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     transfer_handlers: &TransferRegistry,
-    tx: &mut sqlx::Transaction<'_, Postgres>,
     has_streams: bool,
+    all_transfers: &mut Vec<(NativeTransfer, EventContext)>,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
     table_counts: &mut HashMap<String, (String, u64)>,
     receipt_tables: &HashSet<String>,
@@ -1389,23 +1432,17 @@ async fn scan_and_store_transfers(
 
     for (tx_idx, tx_signed) in payload.body().transactions.iter().enumerate() {
         let tx_index = TxIndex::from_usize(tx_idx);
-        // Skip zero-value transactions (no ETH transfer)
         if tx_signed.value().is_zero() {
             continue;
         }
-
-        // Skip reverted transactions (value not actually transferred)
         if !receipts.get(tx_idx).is_some_and(|r| r.success) {
             continue;
         }
-
-        // Skip contract creations (no recipient)
         let to_address = match tx_signed.kind() {
             TxKind::Call(addr) => addr,
             TxKind::Create => continue,
         };
 
-        // Recover sender (use cache)
         let from_address = if let Some(&cached) = sender_cache.get(&tx_index) {
             cached
         } else {
@@ -1425,6 +1462,11 @@ async fn scan_and_store_transfers(
             value: tx_signed.value(),
         };
 
+        let matched_tables = transfer_handlers.matched_table_names(&transfer);
+        if matched_tables.is_empty() {
+            continue;
+        }
+
         let context = EventContext {
             block_timestamp: payload.header().timestamp,
             block_hash,
@@ -1438,47 +1480,45 @@ async fn scan_and_store_transfers(
             tx_status: true,
         };
 
-        let dispatched = transfer_handlers.dispatch(&transfer, &context, tx).await?;
-        if dispatched > 0 {
-            for table_name in transfer_handlers.matched_table_names(&transfer) {
-                let entry = table_counts
-                    .entry(table_name.to_string())
-                    .or_insert_with(|| ("transfer".to_string(), 0));
-                entry.1 = entry.1.saturating_add(1);
-                if has_streams {
-                    let include = receipt_tables.contains(table_name);
-                    event_payloads.push(build_transfer_payload(
-                        &transfer, &context, table_name, include,
-                    ));
-                }
+        let dispatched = matched_tables.len() as u64;
+        for table_name in &matched_tables {
+            let entry = table_counts
+                .entry((*table_name).to_string())
+                .or_insert_with(|| ("transfer".to_string(), 0));
+            entry.1 = entry.1.saturating_add(1);
+            if has_streams {
+                let include = receipt_tables.contains(*table_name);
+                event_payloads.push(build_transfer_payload(
+                    &transfer, &context, table_name, include,
+                ));
             }
         }
+
+        all_transfers.push((transfer, context));
         count = count.saturating_add(dispatched);
     }
 
     Ok(count)
 }
 
-/// Scan block transactions for function calls and store them.
+/// Scan block transactions for function calls (no DB writes).
 ///
 /// Iterates all transactions in the block body, matching calldata selectors
-/// against configured functions. Skips contract creations, short calldata,
-/// and reverted transactions. Uses `JsonAbiExt::abi_decode_input` to decode
-/// the calldata arguments.
+/// against configured functions. Accumulates matching calls for batch insert.
 ///
-/// Returns the number of calls stored.
+/// Returns the number of calls matched.
 #[expect(
     clippy::too_many_arguments,
     reason = "per-table counting adds table_counts"
 )]
-async fn scan_and_store_calls(
+fn scan_calls(
     payload: &BlockPayload,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     config: &IndexConfig,
     call_handlers: &CallRegistry,
-    tx: &mut sqlx::Transaction<'_, Postgres>,
     has_streams: bool,
+    all_calls: &mut Vec<(DecodedCall, EventContext)>,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
     table_counts: &mut HashMap<String, (String, u64)>,
     receipt_tables: &HashSet<String>,
@@ -1491,36 +1531,29 @@ async fn scan_and_store_calls(
         let tx_index = TxIndex::from_usize(tx_idx);
         let input = tx_signed.input();
 
-        // Skip transactions with no calldata or too short for a selector
         if input.len() < 4 {
             continue;
         }
 
-        // Skip contract creations (no recipient)
         let to_address = match tx_signed.kind() {
             TxKind::Call(addr) => addr,
             TxKind::Create => continue,
         };
 
-        // Look up contract config for this address
         let Some(contract) = config.contract_for_address(&to_address) else {
             continue;
         };
 
-        // Extract 4-byte function selector
         let selector = Selector::from_slice(&input[..4]);
 
-        // Look up function ABI
         let Some(function) = contract.functions.get(&selector) else {
             continue;
         };
 
-        // Skip reverted transactions (call had no effect)
         if !receipts.get(tx_idx).is_some_and(|r| r.success) {
             continue;
         }
 
-        // Decode function arguments (calldata without 4-byte selector prefix)
         let decoded_values = match function.abi_decode_input(&input[4..]) {
             Ok(values) => values,
             Err(e) => {
@@ -1535,7 +1568,6 @@ async fn scan_and_store_calls(
             }
         };
 
-        // Build decoded params from function inputs + decoded values
         let params: Vec<DecodedParam> = function
             .inputs
             .iter()
@@ -1547,7 +1579,6 @@ async fn scan_and_store_calls(
             })
             .collect();
 
-        // Recover sender (use cache)
         let from_address = if let Some(&cached) = sender_cache.get(&tx_index) {
             cached
         } else {
@@ -1568,6 +1599,12 @@ async fn scan_and_store_calls(
             contract_address: to_address,
         };
 
+        let matched_tables = call_handlers
+            .matched_table_names(&decoded_call.contract_name, &decoded_call.function_name);
+        if matched_tables.is_empty() {
+            continue;
+        }
+
         let context = EventContext {
             block_timestamp: payload.header().timestamp,
             block_hash,
@@ -1581,26 +1618,24 @@ async fn scan_and_store_calls(
             tx_status: true,
         };
 
-        let dispatched = call_handlers.dispatch(&decoded_call, &context, tx).await?;
-        if dispatched > 0 {
-            for table_name in call_handlers
-                .matched_table_names(&decoded_call.contract_name, &decoded_call.function_name)
-            {
-                let entry = table_counts
-                    .entry(table_name.to_string())
-                    .or_insert_with(|| (decoded_call.function_name.clone(), 0));
-                entry.1 = entry.1.saturating_add(1);
-                if has_streams {
-                    let include = receipt_tables.contains(table_name);
-                    event_payloads.push(build_call_payload(
-                        &decoded_call,
-                        &context,
-                        table_name,
-                        include,
-                    ));
-                }
+        let dispatched = matched_tables.len() as u64;
+        for table_name in &matched_tables {
+            let entry = table_counts
+                .entry((*table_name).to_string())
+                .or_insert_with(|| (decoded_call.function_name.clone(), 0));
+            entry.1 = entry.1.saturating_add(1);
+            if has_streams {
+                let include = receipt_tables.contains(*table_name);
+                event_payloads.push(build_call_payload(
+                    &decoded_call,
+                    &context,
+                    table_name,
+                    include,
+                ));
             }
         }
+
+        all_calls.push((decoded_call, context));
         count = count.saturating_add(dispatched);
     }
 

@@ -17,7 +17,114 @@ use eyre::WrapErr;
 use sqlx::postgres::PgArguments;
 use sqlx::query::Query;
 use sqlx::{Postgres, Transaction};
+use std::fmt::Write;
 use tracing::debug;
+
+/// Maximum number of SQL parameters per query (Postgres limit is 65535).
+const MAX_PARAMS_PER_QUERY: usize = 60_000;
+
+// ── Multi-row INSERT support ──────────────────────────────────────────
+
+/// Metadata for building multi-row INSERT statements.
+///
+/// Parsed from a single-row INSERT SQL at handler construction time.
+#[derive(Debug, Clone)]
+struct BatchInsertMeta {
+    /// Column list: `INSERT INTO "table" ("c1", "c2", ...) VALUES `
+    prefix: String,
+    /// Conflict clause: ` ON CONFLICT (...) DO NOTHING`
+    suffix: String,
+    /// Number of `$N` parameters per row.
+    params_per_row: usize,
+    /// 0-based parameter positions within a row that need `::numeric` cast.
+    numeric_param_indices: Vec<usize>,
+}
+
+/// Parse a single-row INSERT SQL into batch insert metadata.
+///
+/// Expects format: `INSERT INTO ... VALUES ($1, $2::numeric, ...) ON CONFLICT ...`
+/// Returns a zero-param meta for empty or unparseable SQL (used in tests).
+#[must_use]
+fn parse_batch_meta(insert_sql: &str) -> BatchInsertMeta {
+    // Split at " VALUES (" to get prefix and the rest
+    let Some(values_pos) = insert_sql.find(" VALUES (") else {
+        return BatchInsertMeta {
+            prefix: insert_sql.to_string(),
+            suffix: String::new(),
+            params_per_row: 0,
+            numeric_param_indices: Vec::new(),
+        };
+    };
+    let prefix = format!("{} VALUES ", &insert_sql[..values_pos]);
+
+    // Find the closing paren of the VALUES clause
+    let after_values = values_pos + " VALUES (".len();
+    let close_paren = insert_sql[after_values..]
+        .find(')')
+        .map_or(insert_sql.len(), |p| after_values + p);
+
+    // Everything after ") " is the suffix (ON CONFLICT ...)
+    let suffix = if close_paren + 1 < insert_sql.len() {
+        insert_sql[close_paren + 1..].to_string()
+    } else {
+        String::new()
+    };
+
+    // Parse the params between VALUES ( and )
+    let params_str = &insert_sql[after_values..close_paren];
+    let mut params_per_row = 0usize;
+    let mut numeric_param_indices = Vec::new();
+
+    for part in params_str.split(", ") {
+        let trimmed = part.trim();
+        if trimmed.contains("::numeric") {
+            numeric_param_indices.push(params_per_row);
+        }
+        if trimmed.starts_with('$') {
+            params_per_row += 1;
+        }
+    }
+
+    BatchInsertMeta {
+        prefix,
+        suffix,
+        params_per_row,
+        numeric_param_indices,
+    }
+}
+
+/// Build a multi-row INSERT SQL from batch metadata.
+///
+/// Produces: `{prefix}($1, $2::numeric, $3), ($4, $5::numeric, $6){suffix}`
+#[must_use]
+fn build_multi_row_insert(meta: &BatchInsertMeta, row_count: usize) -> String {
+    let capacity = meta.prefix.len() + meta.suffix.len() + row_count * meta.params_per_row * 8;
+    let mut sql = String::with_capacity(capacity);
+    sql.push_str(&meta.prefix);
+
+    for row in 0..row_count {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('(');
+        let offset = row * meta.params_per_row;
+        for col in 0..meta.params_per_row {
+            if col > 0 {
+                sql.push_str(", ");
+            }
+            let idx = offset + col + 1; // $1-based
+            if meta.numeric_param_indices.contains(&col) {
+                let _ = write!(sql, "${idx}::numeric");
+            } else {
+                let _ = write!(sql, "${idx}");
+            }
+        }
+        sql.push(')');
+    }
+
+    sql.push_str(&meta.suffix);
+    sql
+}
 
 /// Block and transaction context for enriching events.
 ///
@@ -74,6 +181,25 @@ pub trait EventHandler: Send + Sync {
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()>;
 
+    /// Insert multiple events in a single multi-row INSERT.
+    ///
+    /// Default implementation falls back to per-row [`handle`](Self::handle).
+    /// [`ConfigDrivenHandler`] overrides with an efficient multi-row INSERT.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any INSERT query fails.
+    async fn batch_handle(
+        &self,
+        rows: &[(&DecodedEvent, &EventContext)],
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        for (event, context) in rows {
+            self.handle(event, context, tx).await?;
+        }
+        Ok(())
+    }
+
     /// Roll back this handler's data above `block_number`.
     ///
     /// Called during reorg handling. Each handler is responsible for deleting
@@ -110,29 +236,6 @@ impl HandlerRegistry {
         Self { handlers }
     }
 
-    /// Dispatch a decoded event to all matching handlers.
-    ///
-    /// Returns the number of handlers that processed the event.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any matching handler fails.
-    pub async fn dispatch(
-        &self,
-        event: &DecodedEvent,
-        context: &EventContext,
-        tx: &mut Transaction<'_, Postgres>,
-    ) -> eyre::Result<u64> {
-        let mut count = 0u64;
-        for handler in &self.handlers {
-            if handler.matches(&event.contract_name, &event.event_name) {
-                handler.handle(event, context, tx).await?;
-                count = count.saturating_add(1);
-            }
-        }
-        Ok(count)
-    }
-
     /// Roll back all handlers' data above `block_number`.
     ///
     /// # Errors
@@ -146,6 +249,53 @@ impl HandlerRegistry {
         for handler in &self.handlers {
             handler.rollback(block_number, tx).await?;
         }
+        Ok(())
+    }
+
+    /// Count how many handlers match a given event (without executing INSERTs).
+    #[must_use]
+    pub fn matching_count(&self, contract_name: &str, event_name: &str) -> u64 {
+        self.handlers
+            .iter()
+            .filter(|h| h.matches(contract_name, event_name))
+            .count() as u64
+    }
+
+    /// Batch-insert events grouped by handler.
+    ///
+    /// Events are grouped by handler index, then each handler's
+    /// [`batch_handle`](EventHandler::batch_handle) is called once
+    /// with all its matched events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any handler's batch INSERT fails.
+    pub async fn batch_dispatch(
+        &self,
+        events: &[(&DecodedEvent, &EventContext)],
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        // Group events by handler index
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.handlers.len()];
+        for (event_idx, (event, _)) in events.iter().enumerate() {
+            for (handler_idx, handler) in self.handlers.iter().enumerate() {
+                if handler.matches(&event.contract_name, &event.event_name) {
+                    groups[handler_idx].push(event_idx);
+                }
+            }
+        }
+
+        for (handler_idx, event_indices) in groups.iter().enumerate() {
+            if event_indices.is_empty() {
+                continue;
+            }
+            let rows: Vec<(&DecodedEvent, &EventContext)> = event_indices
+                .iter()
+                .map(|&idx| (events[idx].0, events[idx].1))
+                .collect();
+            self.handlers[handler_idx].batch_handle(&rows, tx).await?;
+        }
+
         Ok(())
     }
 
@@ -176,6 +326,8 @@ pub struct ConfigDrivenHandler {
     handler_name: String,
     /// Whether this handler is for a factory-child contract.
     is_factory_child: bool,
+    /// Batch insert metadata parsed from `insert_sql`.
+    batch_meta: BatchInsertMeta,
 }
 
 impl ConfigDrivenHandler {
@@ -184,11 +336,43 @@ impl ConfigDrivenHandler {
     pub fn new(resolved: ResolvedEvent) -> Self {
         let handler_name = format!("{}:{}", resolved.contract_name, resolved.event_name);
         let is_factory_child = resolved.is_factory_child;
+        let batch_meta = parse_batch_meta(&resolved.insert_sql);
         Self {
             resolved,
             handler_name,
             is_factory_child,
+            batch_meta,
         }
+    }
+
+    /// Insert multiple events in a single multi-row INSERT statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch INSERT query fails.
+    pub async fn batch_handle(
+        &self,
+        rows: &[(&DecodedEvent, &EventContext)],
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let max_rows = MAX_PARAMS_PER_QUERY / self.batch_meta.params_per_row.max(1);
+        for chunk in rows.chunks(max_rows) {
+            let sql = build_multi_row_insert(&self.batch_meta, chunk.len());
+            let mut query = sqlx::query(&sql);
+            for (event, context) in chunk {
+                query =
+                    bind_event_row(query, event, context, &self.resolved, self.is_factory_child)?;
+            }
+            query.execute(&mut **tx).await.wrap_err_with(|| {
+                format!("failed batch insert into '{}'", self.resolved.table_name,)
+            })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -215,41 +399,8 @@ impl EventHandler for ConfigDrivenHandler {
             "inserting event"
         );
 
-        // Start building the query with pre-built INSERT SQL
-        let mut query = sqlx::query(&self.resolved.insert_sql);
-
-        // Bind standard columns: block_number, tx_hash, tx_index, log_index
-        query = query
-            .bind(event.block_number.as_u64() as i64)
-            .bind(event.tx_hash.as_slice())
-            .bind(event.tx_index.as_i32())
-            .bind(event.log_index.as_i32());
-
-        // Bind contract_address for factory children ($5)
-        if self.is_factory_child {
-            query = query.bind(Address::to_checksum(&event.contract_address, None));
-        }
-
-        // Bind context columns (between standard and user columns)
-        for cf in &self.resolved.context_fields {
-            query = bind_context_field(query, *cf, context);
-        }
-
-        // Bind user-defined columns
-        for col in &self.resolved.columns {
-            let param =
-                find_param(&event.indexed, &event.body, &col.param_name).ok_or_else(|| {
-                    eyre::eyre!(
-                        "param '{}' not found in decoded event {}.{}",
-                        col.param_name,
-                        event.contract_name,
-                        event.event_name
-                    )
-                })?;
-
-            query = bind_dyn_value(query, &param.value, &col.pg_type)?;
-        }
-
+        let query = sqlx::query(&self.resolved.insert_sql);
+        let query = bind_event_row(query, event, context, &self.resolved, self.is_factory_child)?;
         query.execute(&mut **tx).await.wrap_err_with(|| {
             format!(
                 "failed to insert into '{}' for {}.{}",
@@ -258,6 +409,14 @@ impl EventHandler for ConfigDrivenHandler {
         })?;
 
         Ok(())
+    }
+
+    async fn batch_handle(
+        &self,
+        rows: &[(&DecodedEvent, &EventContext)],
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> eyre::Result<()> {
+        Self::batch_handle(self, rows, tx).await
     }
 
     async fn rollback(
@@ -272,6 +431,107 @@ impl EventHandler for ConfigDrivenHandler {
             .wrap_err_with(|| format!("failed to rollback '{}'", self.resolved.table_name))?;
         Ok(())
     }
+}
+
+// ── Row binding helpers ───────────────────────────────────────────────
+
+/// Bind all parameters for one event row to a query.
+fn bind_event_row<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    event: &DecodedEvent,
+    context: &EventContext,
+    resolved: &ResolvedEvent,
+    is_factory_child: bool,
+) -> eyre::Result<Query<'q, Postgres, PgArguments>> {
+    let mut q = query
+        .bind(event.block_number.as_u64() as i64)
+        .bind(event.tx_hash.as_slice().to_vec())
+        .bind(event.tx_index.as_i32())
+        .bind(event.log_index.as_i32());
+
+    if is_factory_child {
+        q = q.bind(Address::to_checksum(&event.contract_address, None));
+    }
+
+    for cf in &resolved.context_fields {
+        q = bind_context_field(q, *cf, context);
+    }
+
+    for col in &resolved.columns {
+        let param = find_param(&event.indexed, &event.body, &col.param_name).ok_or_else(|| {
+            eyre::eyre!(
+                "param '{}' not found in decoded event {}.{}",
+                col.param_name,
+                event.contract_name,
+                event.event_name
+            )
+        })?;
+        q = bind_dyn_value(q, &param.value, &col.pg_type)?;
+    }
+
+    Ok(q)
+}
+
+/// Bind all parameters for one transfer row to a query.
+fn bind_transfer_row<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    transfer: &NativeTransfer,
+    context: &EventContext,
+    resolved: &ResolvedTransfer,
+) -> Query<'q, Postgres, PgArguments> {
+    let mut q = query
+        .bind(transfer.block_number.as_u64() as i64)
+        .bind(transfer.tx_hash.as_slice().to_vec())
+        .bind(transfer.tx_index.as_i32())
+        .bind(Address::to_checksum(&transfer.from_address, None))
+        .bind(Address::to_checksum(&transfer.to_address, None))
+        .bind(transfer.value.to_string());
+
+    for cf in &resolved.context_fields {
+        q = bind_context_field(q, *cf, context);
+    }
+
+    q
+}
+
+/// Bind all parameters for one call row to a query.
+fn bind_call_row<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    call: &DecodedCall,
+    context: &EventContext,
+    resolved: &ResolvedCall,
+    is_factory_child: bool,
+) -> eyre::Result<Query<'q, Postgres, PgArguments>> {
+    let mut q = query
+        .bind(call.block_number.as_u64() as i64)
+        .bind(call.tx_hash.as_slice().to_vec())
+        .bind(call.tx_index.as_i32());
+
+    if is_factory_child {
+        q = q.bind(Address::to_checksum(&call.contract_address, None));
+    }
+
+    for cf in &resolved.context_fields {
+        q = bind_context_field(q, *cf, context);
+    }
+
+    for col in &resolved.columns {
+        let param = call
+            .params
+            .iter()
+            .find(|p| p.name == col.param_name)
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "param '{}' not found in decoded call {}.{}",
+                    col.param_name,
+                    call.contract_name,
+                    call.function_name
+                )
+            })?;
+        q = bind_dyn_value(q, &param.value, &col.pg_type)?;
+    }
+
+    Ok(q)
 }
 
 // ── DynSolValue binding ───────────────────────────────────────────────
@@ -375,13 +635,19 @@ pub struct NativeTransfer {
 #[derive(Debug)]
 pub struct TransferHandler {
     resolved: ResolvedTransfer,
+    /// Batch insert metadata parsed from `insert_sql`.
+    batch_meta: BatchInsertMeta,
 }
 
 impl TransferHandler {
     /// Create a new transfer handler from a resolved transfer definition.
     #[must_use]
-    pub const fn new(resolved: ResolvedTransfer) -> Self {
-        Self { resolved }
+    pub fn new(resolved: ResolvedTransfer) -> Self {
+        let batch_meta = parse_batch_meta(&resolved.insert_sql);
+        Self {
+            resolved,
+            batch_meta,
+        }
     }
 
     /// Check if a native transfer matches this handler's address filters.
@@ -396,46 +662,31 @@ impl TransferHandler {
         from_ok && to_ok
     }
 
-    /// Store a native transfer into the database.
+    /// Insert multiple transfers in a single multi-row INSERT statement.
     ///
     /// # Errors
     ///
-    /// Returns an error if the INSERT query fails.
-    pub async fn handle(
+    /// Returns an error if the batch INSERT query fails.
+    pub async fn batch_handle(
         &self,
-        transfer: &NativeTransfer,
-        context: &EventContext,
+        rows: &[(&NativeTransfer, &EventContext)],
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()> {
-        debug!(
-            handler = %self.resolved.name,
-            block = transfer.block_number.as_u64(),
-            table = %self.resolved.table_name,
-            "inserting native transfer"
-        );
-
-        let mut query = sqlx::query(&self.resolved.insert_sql);
-
-        // Bind fixed columns: $1-$6
-        query = query
-            .bind(transfer.block_number.as_u64() as i64)
-            .bind(transfer.tx_hash.as_slice())
-            .bind(transfer.tx_index.as_i32())
-            .bind(Address::to_checksum(&transfer.from_address, None))
-            .bind(Address::to_checksum(&transfer.to_address, None))
-            .bind(transfer.value.to_string());
-
-        // Bind context columns ($7+)
-        for cf in &self.resolved.context_fields {
-            query = bind_context_field(query, *cf, context);
+        if rows.is_empty() {
+            return Ok(());
         }
 
-        query.execute(&mut **tx).await.wrap_err_with(|| {
-            format!(
-                "failed to insert native transfer into '{}'",
-                self.resolved.table_name
-            )
-        })?;
+        let max_rows = MAX_PARAMS_PER_QUERY / self.batch_meta.params_per_row.max(1);
+        for chunk in rows.chunks(max_rows) {
+            let sql = build_multi_row_insert(&self.batch_meta, chunk.len());
+            let mut query = sqlx::query(&sql);
+            for (transfer, context) in chunk {
+                query = bind_transfer_row(query, transfer, context, &self.resolved);
+            }
+            query.execute(&mut **tx).await.wrap_err_with(|| {
+                format!("failed batch insert into '{}'", self.resolved.table_name,)
+            })?;
+        }
 
         Ok(())
     }
@@ -481,27 +732,37 @@ impl TransferRegistry {
             .collect()
     }
 
-    /// Dispatch a native transfer to all matching handlers.
-    ///
-    /// Returns the number of handlers that processed the transfer.
+    /// Batch-insert transfers grouped by handler.
     ///
     /// # Errors
     ///
-    /// Returns an error if any matching handler fails.
-    pub async fn dispatch(
+    /// Returns an error if any handler's batch INSERT fails.
+    pub async fn batch_dispatch(
         &self,
-        transfer: &NativeTransfer,
-        context: &EventContext,
+        transfers: &[(&NativeTransfer, &EventContext)],
         tx: &mut Transaction<'_, Postgres>,
-    ) -> eyre::Result<u64> {
-        let mut count = 0u64;
-        for handler in &self.handlers {
-            if handler.matches_filter(transfer) {
-                handler.handle(transfer, context, tx).await?;
-                count = count.saturating_add(1);
+    ) -> eyre::Result<()> {
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.handlers.len()];
+        for (idx, (transfer, _)) in transfers.iter().enumerate() {
+            for (handler_idx, handler) in self.handlers.iter().enumerate() {
+                if handler.matches_filter(transfer) {
+                    groups[handler_idx].push(idx);
+                }
             }
         }
-        Ok(count)
+
+        for (handler_idx, indices) in groups.iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let rows: Vec<(&NativeTransfer, &EventContext)> = indices
+                .iter()
+                .map(|&idx| (transfers[idx].0, transfers[idx].1))
+                .collect();
+            self.handlers[handler_idx].batch_handle(&rows, tx).await?;
+        }
+
+        Ok(())
     }
 
     /// Roll back all handlers' data above `block_number`.
@@ -551,22 +812,22 @@ pub struct DecodedCall {
 #[derive(Debug)]
 pub struct CallHandler {
     resolved: ResolvedCall,
-    /// Pre-computed handler name for logging.
-    handler_name: String,
     /// Whether this handler is for a factory-child contract.
     is_factory_child: bool,
+    /// Batch insert metadata parsed from `insert_sql`.
+    batch_meta: BatchInsertMeta,
 }
 
 impl CallHandler {
     /// Create a new call handler from a resolved call definition.
     #[must_use]
     pub fn new(resolved: ResolvedCall) -> Self {
-        let handler_name = format!("{}:{}", resolved.contract_name, resolved.function_name);
         let is_factory_child = resolved.is_factory_child;
+        let batch_meta = parse_batch_meta(&resolved.insert_sql);
         Self {
             resolved,
-            handler_name,
             is_factory_child,
+            batch_meta,
         }
     }
 
@@ -577,66 +838,31 @@ impl CallHandler {
         self.resolved.contract_name == contract_name && self.resolved.function_name == function_name
     }
 
-    /// Store a decoded call into the database.
+    /// Insert multiple calls in a single multi-row INSERT statement.
     ///
     /// # Errors
     ///
-    /// Returns an error if the INSERT query fails.
-    pub async fn handle(
+    /// Returns an error if the batch INSERT query fails.
+    pub async fn batch_handle(
         &self,
-        call: &DecodedCall,
-        context: &EventContext,
+        rows: &[(&DecodedCall, &EventContext)],
         tx: &mut Transaction<'_, Postgres>,
     ) -> eyre::Result<()> {
-        debug!(
-            handler = %self.handler_name,
-            block = call.block_number.as_u64(),
-            table = %self.resolved.table_name,
-            "inserting function call"
-        );
-
-        let mut query = sqlx::query(&self.resolved.insert_sql);
-
-        // Bind standard columns: block_number, tx_hash, tx_index
-        query = query
-            .bind(call.block_number.as_u64() as i64)
-            .bind(call.tx_hash.as_slice())
-            .bind(call.tx_index.as_i32());
-
-        // Bind contract_address for factory children ($4)
-        if self.is_factory_child {
-            query = query.bind(Address::to_checksum(&call.contract_address, None));
+        if rows.is_empty() {
+            return Ok(());
         }
 
-        // Bind context columns
-        for cf in &self.resolved.context_fields {
-            query = bind_context_field(query, *cf, context);
+        let max_rows = MAX_PARAMS_PER_QUERY / self.batch_meta.params_per_row.max(1);
+        for chunk in rows.chunks(max_rows) {
+            let sql = build_multi_row_insert(&self.batch_meta, chunk.len());
+            let mut query = sqlx::query(&sql);
+            for (call, context) in chunk {
+                query = bind_call_row(query, call, context, &self.resolved, self.is_factory_child)?;
+            }
+            query.execute(&mut **tx).await.wrap_err_with(|| {
+                format!("failed batch insert into '{}'", self.resolved.table_name,)
+            })?;
         }
-
-        // Bind user-defined columns
-        for col in &self.resolved.columns {
-            let param = call
-                .params
-                .iter()
-                .find(|p| p.name == col.param_name)
-                .ok_or_else(|| {
-                    eyre::eyre!(
-                        "param '{}' not found in decoded call {}.{}",
-                        col.param_name,
-                        call.contract_name,
-                        call.function_name
-                    )
-                })?;
-
-            query = bind_dyn_value(query, &param.value, &col.pg_type)?;
-        }
-
-        query.execute(&mut **tx).await.wrap_err_with(|| {
-            format!(
-                "failed to insert into '{}' for {}.{}",
-                self.resolved.table_name, call.contract_name, call.function_name
-            )
-        })?;
 
         Ok(())
     }
@@ -682,27 +908,37 @@ impl CallRegistry {
             .collect()
     }
 
-    /// Dispatch a decoded call to all matching handlers.
-    ///
-    /// Returns the number of handlers that processed the call.
+    /// Batch-insert calls grouped by handler.
     ///
     /// # Errors
     ///
-    /// Returns an error if any matching handler fails.
-    pub async fn dispatch(
+    /// Returns an error if any handler's batch INSERT fails.
+    pub async fn batch_dispatch(
         &self,
-        call: &DecodedCall,
-        context: &EventContext,
+        calls: &[(&DecodedCall, &EventContext)],
         tx: &mut Transaction<'_, Postgres>,
-    ) -> eyre::Result<u64> {
-        let mut count = 0u64;
-        for handler in &self.handlers {
-            if handler.matches(&call.contract_name, &call.function_name) {
-                handler.handle(call, context, tx).await?;
-                count = count.saturating_add(1);
+    ) -> eyre::Result<()> {
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.handlers.len()];
+        for (idx, (call, _)) in calls.iter().enumerate() {
+            for (handler_idx, handler) in self.handlers.iter().enumerate() {
+                if handler.matches(&call.contract_name, &call.function_name) {
+                    groups[handler_idx].push(idx);
+                }
             }
         }
-        Ok(count)
+
+        for (handler_idx, indices) in groups.iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let rows: Vec<(&DecodedCall, &EventContext)> = indices
+                .iter()
+                .map(|&idx| (calls[idx].0, calls[idx].1))
+                .collect();
+            self.handlers[handler_idx].batch_handle(&rows, tx).await?;
+        }
+
+        Ok(())
     }
 
     /// Roll back all handlers' data above `block_number`.
@@ -1311,5 +1547,79 @@ mod tests {
         assert!(matched.contains(&"usdc_transfers_v1"));
         assert!(matched.contains(&"usdc_transfers_v2"));
         assert!(!matched.contains(&"dai_transfers"));
+    }
+
+    // ── Batch insert tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_batch_meta_basic() {
+        let sql = r#"INSERT INTO "t" ("a", "b", "c") VALUES ($1, $2::numeric, $3) ON CONFLICT (a) DO NOTHING"#;
+        let meta = parse_batch_meta(sql);
+        assert_eq!(meta.params_per_row, 3);
+        assert_eq!(meta.numeric_param_indices, vec![1]);
+        assert!(meta.prefix.contains("VALUES"));
+        assert!(meta.suffix.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn parse_batch_meta_empty_sql() {
+        let meta = parse_batch_meta("");
+        assert_eq!(meta.params_per_row, 0);
+        assert!(meta.numeric_param_indices.is_empty());
+    }
+
+    #[test]
+    fn build_multi_row_insert_single_row() {
+        let meta = BatchInsertMeta {
+            prefix: r#"INSERT INTO "t" ("a", "b") VALUES "#.to_string(),
+            suffix: " ON CONFLICT DO NOTHING".to_string(),
+            params_per_row: 2,
+            numeric_param_indices: vec![],
+        };
+        let sql = build_multi_row_insert(&meta, 1);
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "t" ("a", "b") VALUES ($1, $2) ON CONFLICT DO NOTHING"#
+        );
+    }
+
+    #[test]
+    fn build_multi_row_insert_multiple_rows() {
+        let meta = BatchInsertMeta {
+            prefix: r#"INSERT INTO "t" ("a", "b") VALUES "#.to_string(),
+            suffix: String::new(),
+            params_per_row: 2,
+            numeric_param_indices: vec![],
+        };
+        let sql = build_multi_row_insert(&meta, 3);
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "t" ("a", "b") VALUES ($1, $2), ($3, $4), ($5, $6)"#
+        );
+    }
+
+    #[test]
+    fn build_multi_row_insert_with_numeric() {
+        let meta = BatchInsertMeta {
+            prefix: "INSERT INTO t VALUES ".to_string(),
+            suffix: String::new(),
+            params_per_row: 3,
+            numeric_param_indices: vec![1],
+        };
+        let sql = build_multi_row_insert(&meta, 2);
+        assert_eq!(
+            sql,
+            "INSERT INTO t VALUES ($1, $2::numeric, $3), ($4, $5::numeric, $6)"
+        );
+    }
+
+    #[test]
+    fn parse_and_rebuild_roundtrip() {
+        let original = r#"INSERT INTO "usdc_transfers" ("block_number", "tx_hash", "tx_index", "log_index", "value") VALUES ($1, $2, $3, $4, $5::numeric) ON CONFLICT ("block_number", "tx_index", "log_index") DO NOTHING"#;
+        let meta = parse_batch_meta(original);
+        assert_eq!(meta.params_per_row, 5);
+        assert_eq!(meta.numeric_param_indices, vec![4]);
+        let rebuilt = build_multi_row_insert(&meta, 1);
+        assert_eq!(rebuilt, original);
     }
 }
