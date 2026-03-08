@@ -34,7 +34,7 @@ impl Database {
     /// Returns an error if the connection fails.
     pub async fn connect(url: &str) -> eyre::Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(16)
             .connect(url)
             .await
             .wrap_err("failed to connect to database")?;

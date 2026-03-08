@@ -88,7 +88,7 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            blocks_per_assignment: 32,
+            blocks_per_assignment: 128,
             initial_blocks_per_assignment: 32,
             max_attempts_per_block: DEFAULT_ESCALATION_THRESHOLD,
             shard_size: 10_000,
