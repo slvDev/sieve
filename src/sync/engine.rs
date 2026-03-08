@@ -42,6 +42,12 @@ use tracing::{debug, info, instrument, warn};
 const MAX_CONCURRENT_FETCHES: usize = 32;
 const PAYLOAD_CHANNEL_SIZE: usize = 256;
 
+/// Maximum number of blocks to batch in a single DB transaction.
+const BATCH_SIZE: usize = 64;
+
+/// How long to wait for more payloads before flushing a partial batch.
+const BATCH_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// RAII guard that increments an atomic counter and a Prometheus gauge
 /// on creation, and decrements both on drop.
 struct ActiveTaskGuard {
@@ -95,6 +101,8 @@ struct ConsumerStats {
 /// Outcome of processing events from a single block.
 #[derive(Debug)]
 struct ProcessOutcome {
+    block_number: u64,
+    block_timestamp: u64,
     matched: u64,
     decoded: u64,
     stored: u64,
@@ -104,6 +112,19 @@ struct ProcessOutcome {
     table_counts: Vec<(String, String, u64)>,
     /// Per-event decoded payloads for streaming (only populated when streams are configured).
     event_payloads: Vec<crate::stream::EventPayload>,
+}
+
+/// CPU-processed block ready for DB storage.
+///
+/// Created by [`prepare_block`], consumed by [`flush_batch`].
+/// Keeps the original [`BlockPayload`] for transfer/call scanning.
+struct ProcessedBlock {
+    block_number: BlockNumber,
+    block_hash: B256,
+    factory_discoveries: Vec<filter::FactoryDiscovery>,
+    decoded_events: Vec<decode::DecodedEvent>,
+    matched_count: u64,
+    payload: BlockPayload,
 }
 
 // Compile-time size assertions for hot types (reth pattern).
@@ -636,6 +657,7 @@ async fn consume_payloads(
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
     let mut max_indexed_block: u64 = 0;
+    let mut batch: Vec<ProcessedBlock> = Vec::with_capacity(BATCH_SIZE);
 
     let ctx = ProcessContext {
         config: &config,
@@ -649,83 +671,67 @@ async fn consume_payloads(
         receipt_tables: &receipt_tables,
     };
 
-    while let Some(payload) = payload_rx.recv().await {
+    loop {
+        // Block indefinitely when batch is empty; use timeout when non-empty
+        let payload = if batch.is_empty() {
+            payload_rx.recv().await
+        } else {
+            match tokio::time::timeout(BATCH_FLUSH_TIMEOUT, payload_rx.recv()).await {
+                Ok(payload) => payload,
+                Err(_timeout) => {
+                    flush_batch(
+                        &mut batch,
+                        &ctx,
+                        &mut stats,
+                        &metrics,
+                        &mut max_indexed_block,
+                        stream_dispatcher.as_ref(),
+                        is_backfill,
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        };
+
+        // Channel closed: flush remaining batch and exit
+        let Some(payload) = payload else {
+            if !batch.is_empty() {
+                flush_batch(
+                    &mut batch,
+                    &ctx,
+                    &mut stats,
+                    &metrics,
+                    &mut max_indexed_block,
+                    stream_dispatcher.as_ref(),
+                    is_backfill,
+                )
+                .await;
+            }
+            break;
+        };
+
         stats.blocks_fetched = stats.blocks_fetched.saturating_add(1);
         stats.total_receipts = stats
             .total_receipts
             .saturating_add(payload.receipts().len() as u64);
 
-        match process_block_events(&payload, &ctx).await {
-            Ok(outcome) => {
-                stats.events_matched = stats.events_matched.saturating_add(outcome.matched);
-                stats.events_decoded = stats.events_decoded.saturating_add(outcome.decoded);
-                stats.events_stored = stats.events_stored.saturating_add(outcome.stored);
-                stats.transfers_stored = stats.transfers_stored.saturating_add(outcome.transfers);
-                stats.calls_stored = stats.calls_stored.saturating_add(outcome.calls);
+        batch.push(prepare_block(payload, &ctx));
 
-                // Update Prometheus counters
-                metrics.blocks_indexed.inc();
-                metrics.events_matched.inc_by(outcome.matched);
-                metrics.events_stored.inc_by(outcome.stored);
-                metrics.transfers_stored.inc_by(outcome.transfers);
-                metrics.calls_stored.inc_by(outcome.calls);
-
-                // Only advance the gauge forward (payloads arrive out of order)
-                let block_num = payload.header().number;
-                if block_num > max_indexed_block {
-                    max_indexed_block = block_num;
-                    metrics.indexed_block.set(block_num as i64);
-                }
-
-                // Dispatch stream notifications
-                if let Some(ref dispatcher) = stream_dispatcher {
-                    if !outcome.table_counts.is_empty() {
-                        let tables = outcome
-                            .table_counts
-                            .into_iter()
-                            .map(|(name, event, count)| crate::stream::TableNotification {
-                                name,
-                                event,
-                                count,
-                            })
-                            .collect();
-                        dispatcher.send(
-                            crate::stream::BlockNotification {
-                                block_number: block_num,
-                                block_timestamp: payload.header().timestamp,
-                                tables,
-                            },
-                            is_backfill,
-                        );
-                    }
-                    if !outcome.event_payloads.is_empty() {
-                        dispatcher.send_events(outcome.event_payloads, is_backfill);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    block = payload.header().number,
-                    error = %e,
-                    "failed to process block events"
-                );
-            }
+        if batch.len() >= BATCH_SIZE {
+            flush_batch(
+                &mut batch,
+                &ctx,
+                &mut stats,
+                &metrics,
+                &mut max_indexed_block,
+                stream_dispatcher.as_ref(),
+                is_backfill,
+            )
+            .await;
         }
 
-        if last_log.elapsed() >= Duration::from_secs(2) {
-            info!(
-                blocks_fetched = stats.blocks_fetched,
-                total_receipts = stats.total_receipts,
-                events_matched = stats.events_matched,
-                events_decoded = stats.events_decoded,
-                events_stored = stats.events_stored,
-                transfers_stored = stats.transfers_stored,
-                calls_stored = stats.calls_stored,
-                block_number = payload.header().number,
-                "sync progress"
-            );
-            last_log = Instant::now();
-        }
+        log_sync_progress(&stats, &mut last_log);
     }
 
     stats
@@ -747,92 +753,174 @@ struct ProcessContext<'a> {
     receipt_tables: &'a HashSet<String>,
 }
 
+/// Log sync progress every 2 seconds.
+fn log_sync_progress(stats: &ConsumerStats, last_log: &mut Instant) {
+    if last_log.elapsed() >= Duration::from_secs(2) {
+        info!(
+            blocks_fetched = stats.blocks_fetched,
+            total_receipts = stats.total_receipts,
+            events_matched = stats.events_matched,
+            events_decoded = stats.events_decoded,
+            events_stored = stats.events_stored,
+            transfers_stored = stats.transfers_stored,
+            calls_stored = stats.calls_stored,
+            "sync progress"
+        );
+        *last_log = Instant::now();
+    }
+}
+
 /// Compute the sealed hash for a block header.
 fn compute_block_hash(header: &reth_primitives_traits::Header) -> alloy_primitives::B256 {
     SealedHeader::seal_slow(header.clone()).hash()
 }
 
-/// Commit block hash and checkpoint for a block with no events to store.
-async fn commit_block_bookkeeping(
-    db_ref: &Database,
-    block_number: BlockNumber,
-    block_hash: &[u8],
-) -> eyre::Result<()> {
-    let mut tx = db_ref.begin().await?;
-    db::store_block_hash(&mut tx, block_number, block_hash).await?;
-    db::update_checkpoint(&mut tx, block_number).await?;
-    tx.commit()
-        .await
-        .wrap_err_with(|| format!("failed to commit block {}", block_number.as_u64()))?;
-    Ok(())
-}
-
-/// An empty `ProcessOutcome` for early returns.
-const fn empty_outcome(matched: u64) -> ProcessOutcome {
-    ProcessOutcome {
-        matched,
-        decoded: 0,
-        stored: 0,
-        transfers: 0,
-        calls: 0,
-        table_counts: vec![],
-        event_payloads: vec![],
-    }
-}
-
-/// Filter, decode, and store events from a single block payload.
-#[instrument(skip_all, fields(block_number = payload.header().number))]
-async fn process_block_events(
-    payload: &BlockPayload,
-    ctx: &ProcessContext<'_>,
-) -> eyre::Result<ProcessOutcome> {
+/// CPU-only block processing: factory pre-scan, filter, and decode.
+///
+/// Factory children are registered in-memory immediately (so subsequent
+/// blocks in the same batch can match them). DB persistence is deferred
+/// to [`flush_batch`].
+fn prepare_block(payload: BlockPayload, ctx: &ProcessContext<'_>) -> ProcessedBlock {
     let block_number = BlockNumber::new(payload.header().number);
     let block_hash = compute_block_hash(payload.header());
 
-    // Step 0: factory pre-scan (discovers new child contracts)
-    if !ctx.factories.is_empty() {
-        let discoveries = filter::scan_factory_events(payload, ctx.factories);
+    // Factory pre-scan: register children in-memory (no DB write)
+    let factory_discoveries = if ctx.factories.is_empty() {
+        Vec::new()
+    } else {
+        let discoveries = filter::scan_factory_events(&payload, ctx.factories);
         for d in &discoveries {
-            register_factory_child(ctx, d).await?;
+            register_factory_child_in_memory(ctx, d);
+        }
+        discoveries
+    };
+
+    // Filter + decode
+    let matched = filter::filter_block(&payload, ctx.config);
+    let matched_count = matched.len() as u64;
+    let decoded_events = decode_matched_logs(&matched, ctx.config);
+
+    ProcessedBlock {
+        block_number,
+        block_hash,
+        factory_discoveries,
+        decoded_events,
+        matched_count,
+        payload,
+    }
+}
+
+/// Register a factory child in-memory only (no DB write).
+fn register_factory_child_in_memory(
+    ctx: &ProcessContext<'_>,
+    discovery: &filter::FactoryDiscovery,
+) {
+    let Some(contract_idx) = ctx
+        .config
+        .contracts
+        .iter()
+        .position(|c| c.name == discovery.child_contract_name)
+    else {
+        warn!(
+            factory = %discovery.child_contract_name,
+            "factory child references unknown contract"
+        );
+        return;
+    };
+
+    if ctx
+        .config
+        .register_factory_child(discovery.child_address, contract_idx)
+    {
+        info!(
+            factory = %discovery.child_contract_name,
+            child = ?discovery.child_address,
+            block = discovery.block_number,
+            "registered new factory child"
+        );
+    }
+}
+
+/// Flush a batch of processed blocks to the database in a single transaction.
+///
+/// Opens one Postgres transaction, stores all block hashes, events,
+/// transfers, calls, and factory children. Updates the checkpoint once
+/// with the maximum block number (using GREATEST). Dispatches stream
+/// notifications after commit.
+async fn flush_batch(
+    batch: &mut Vec<ProcessedBlock>,
+    ctx: &ProcessContext<'_>,
+    stats: &mut ConsumerStats,
+    metrics: &SieveMetrics,
+    max_indexed_block: &mut u64,
+    stream_dispatcher: Option<&Arc<crate::stream::StreamDispatcher>>,
+    is_backfill: bool,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let batch_len = batch.len() as u64;
+
+    match flush_batch_inner(batch, ctx).await {
+        Ok(outcomes) => {
+            update_batch_stats(stats, metrics, max_indexed_block, &outcomes, batch_len);
+            dispatch_batch_notifications(stream_dispatcher, &outcomes, is_backfill);
+        }
+        Err(e) => {
+            warn!(batch_size = batch_len, error = %e, "failed to flush batch");
         }
     }
+    batch.clear();
+}
 
-    // Step 1: filter
-    let matched = filter::filter_block(payload, ctx.config);
-    let matched_count = matched.len() as u64;
-    let has_transfers = !ctx.transfer_handlers.is_empty();
-    let has_calls = !ctx.call_handlers.is_empty();
-
-    if matched.is_empty() && !has_transfers && !has_calls {
-        commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
-        return Ok(empty_outcome(0));
-    }
-
-    // Step 2: decode (CPU work, no DB)
-    let decoded_events = decode_matched_logs(&matched, ctx.config);
-    let decoded_count = decoded_events.len() as u64;
-
-    if decoded_events.is_empty() && !has_transfers && !has_calls {
-        commit_block_bookkeeping(ctx.db, block_number, block_hash.as_slice()).await?;
-        return Ok(empty_outcome(matched_count));
-    }
-
-    // Step 3: store in one transaction per block
+/// Inner flush: open one transaction, store all blocks, commit.
+async fn flush_batch_inner(
+    batch: &[ProcessedBlock],
+    ctx: &ProcessContext<'_>,
+) -> eyre::Result<Vec<ProcessOutcome>> {
     let mut tx = ctx.db.begin().await?;
+    let mut outcomes = Vec::with_capacity(batch.len());
+
+    for block in batch {
+        let outcome = store_block_in_batch(block, ctx, &mut tx).await?;
+        outcomes.push(outcome);
+    }
+
+    // Checkpoint with maximum block number (GREATEST ensures no backward movement)
+    if let Some(max_block) = batch.iter().map(|b| b.block_number).max() {
+        db::update_checkpoint(&mut tx, max_block).await?;
+    }
+
+    tx.commit()
+        .await
+        .wrap_err("failed to commit batch transaction")?;
+
+    Ok(outcomes)
+}
+
+/// Store one block's data within an existing transaction.
+async fn store_block_in_batch(
+    block: &ProcessedBlock,
+    ctx: &ProcessContext<'_>,
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+) -> eyre::Result<ProcessOutcome> {
+    db::store_block_hash(tx, block.block_number, block.block_hash.as_slice()).await?;
+
+    // Persist factory discoveries within the batch transaction
+    for d in &block.factory_discoveries {
+        db::store_factory_child(tx, &d.child_contract_name, &d.child_address, d.block_number)
+            .await?;
+    }
+
     let mut stored_count = 0u64;
     let mut table_counts: HashMap<String, (String, u64)> = HashMap::new();
     let mut event_payloads: Vec<crate::stream::EventPayload> = Vec::new();
-
-    db::store_block_hash(&mut tx, block_number, block_hash.as_slice()).await?;
-
     let mut sender_cache: HashMap<TxIndex, Address> = HashMap::new();
 
-    for event in &decoded_events {
-        let event_context = build_event_context(payload, block_hash, event, &mut sender_cache)?;
-        let dispatched = ctx
-            .handlers
-            .dispatch(event, &event_context, &mut tx)
-            .await?;
+    for event in &block.decoded_events {
+        let event_context =
+            build_event_context(&block.payload, block.block_hash, event, &mut sender_cache)?;
+        let dispatched = ctx.handlers.dispatch(event, &event_context, tx).await?;
         if dispatched > 0 {
             track_event_table(ctx.event_table_map, event, dispatched, &mut table_counts);
             if ctx.has_streams {
@@ -849,31 +937,26 @@ async fn process_block_events(
     }
 
     let transfer_count = store_transfers(
-        payload,
-        block_hash,
+        &block.payload,
+        block.block_hash,
         &mut sender_cache,
         ctx,
-        &mut tx,
+        tx,
         &mut table_counts,
         &mut event_payloads,
     )
     .await?;
 
     let call_count = store_calls(
-        payload,
-        block_hash,
+        &block.payload,
+        block.block_hash,
         &mut sender_cache,
         ctx,
-        &mut tx,
+        tx,
         &mut table_counts,
         &mut event_payloads,
     )
     .await?;
-
-    db::update_checkpoint(&mut tx, block_number).await?;
-    tx.commit()
-        .await
-        .wrap_err_with(|| format!("failed to commit block {}", block_number.as_u64()))?;
 
     let table_counts = table_counts
         .into_iter()
@@ -881,14 +964,78 @@ async fn process_block_events(
         .collect();
 
     Ok(ProcessOutcome {
-        matched: matched_count,
-        decoded: decoded_count,
+        block_number: block.block_number.as_u64(),
+        block_timestamp: block.payload.header().timestamp,
+        matched: block.matched_count,
+        decoded: block.decoded_events.len() as u64,
         stored: stored_count,
         transfers: transfer_count,
         calls: call_count,
         table_counts,
         event_payloads,
     })
+}
+
+/// Update consumer stats and Prometheus metrics after a successful batch flush.
+fn update_batch_stats(
+    stats: &mut ConsumerStats,
+    metrics: &SieveMetrics,
+    max_indexed_block: &mut u64,
+    outcomes: &[ProcessOutcome],
+    batch_len: u64,
+) {
+    metrics.blocks_indexed.inc_by(batch_len);
+    for outcome in outcomes {
+        stats.events_matched = stats.events_matched.saturating_add(outcome.matched);
+        stats.events_decoded = stats.events_decoded.saturating_add(outcome.decoded);
+        stats.events_stored = stats.events_stored.saturating_add(outcome.stored);
+        stats.transfers_stored = stats.transfers_stored.saturating_add(outcome.transfers);
+        stats.calls_stored = stats.calls_stored.saturating_add(outcome.calls);
+        metrics.events_matched.inc_by(outcome.matched);
+        metrics.events_stored.inc_by(outcome.stored);
+        metrics.transfers_stored.inc_by(outcome.transfers);
+        metrics.calls_stored.inc_by(outcome.calls);
+
+        if outcome.block_number > *max_indexed_block {
+            *max_indexed_block = outcome.block_number;
+            metrics.indexed_block.set(outcome.block_number as i64);
+        }
+    }
+}
+
+/// Dispatch stream notifications for all blocks in a flushed batch.
+fn dispatch_batch_notifications(
+    stream_dispatcher: Option<&Arc<crate::stream::StreamDispatcher>>,
+    outcomes: &[ProcessOutcome],
+    is_backfill: bool,
+) {
+    let Some(dispatcher) = stream_dispatcher else {
+        return;
+    };
+    for outcome in outcomes {
+        if !outcome.table_counts.is_empty() {
+            let tables = outcome
+                .table_counts
+                .iter()
+                .map(|(name, event, count)| crate::stream::TableNotification {
+                    name: name.clone(),
+                    event: event.clone(),
+                    count: *count,
+                })
+                .collect();
+            dispatcher.send(
+                crate::stream::BlockNotification {
+                    block_number: outcome.block_number,
+                    block_timestamp: outcome.block_timestamp,
+                    tables,
+                },
+                is_backfill,
+            );
+        }
+        if !outcome.event_payloads.is_empty() {
+            dispatcher.send_events(outcome.event_payloads.clone(), is_backfill);
+        }
+    }
 }
 
 /// Track an event's table in the table_counts map.
@@ -1158,54 +1305,6 @@ fn build_event_context(
         cumulative_gas_used: cumulative,
         tx_status: true,
     })
-}
-
-/// Register a factory-discovered child contract in both config and database.
-async fn register_factory_child(
-    ctx: &ProcessContext<'_>,
-    discovery: &filter::FactoryDiscovery,
-) -> eyre::Result<()> {
-    // Find the contract index by name
-    let Some(contract_idx) = ctx
-        .config
-        .contracts
-        .iter()
-        .position(|c| c.name == discovery.child_contract_name)
-    else {
-        warn!(
-            factory = %discovery.child_contract_name,
-            "factory child references unknown contract"
-        );
-        return Ok(());
-    };
-
-    // Register in config (returns false if already known)
-    if ctx
-        .config
-        .register_factory_child(discovery.child_address, contract_idx)
-    {
-        // Persist to database
-        let mut tx = ctx.db.begin().await?;
-        db::store_factory_child(
-            &mut tx,
-            &discovery.child_contract_name,
-            &discovery.child_address,
-            discovery.block_number,
-        )
-        .await?;
-        tx.commit()
-            .await
-            .wrap_err("failed to commit factory child registration")?;
-
-        info!(
-            factory = %discovery.child_contract_name,
-            child = ?discovery.child_address,
-            block = discovery.block_number,
-            "registered new factory child"
-        );
-    }
-
-    Ok(())
 }
 
 /// Scan block transactions for native ETH transfers and store them.
