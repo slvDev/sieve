@@ -8,7 +8,7 @@ WORKDIR /app
 # Cache dependency compilation — only rebuilds when Cargo.toml/Cargo.lock change
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main(){}" > src/main.rs && \
-    cargo build --release 2>/dev/null ; rm -rf src
+    cargo build --release && rm -rf src
 
 # Build real source (only sieve code recompiles)
 COPY src/ src/
