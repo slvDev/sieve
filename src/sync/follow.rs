@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::{debug, info, instrument, warn};
 
 /// Shared state for the follow loop, reducing argument counts.
@@ -65,7 +66,20 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
         receipt_tables: ctx.receipt_tables,
     };
 
+    let mut last_heartbeat = Instant::now();
+
     while !is_stopped(&fctx.stop_rx) {
+        let evicted = fctx.pool.evict_stale(Duration::from_secs(120));
+        if evicted > 0 {
+            info!(evicted, peers = fctx.pool.len(), "evicted stale peers");
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(30) {
+            info!(
+                peers = fctx.pool.len(),
+                "follow mode: waiting for new blocks"
+            );
+            last_heartbeat = Instant::now();
+        }
         if run_follow_epoch(&fctx).await? {
             break;
         }

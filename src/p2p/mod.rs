@@ -53,6 +53,7 @@ pub struct NetworkPeer {
     pub eth_version: EthVersion,
     pub messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
     pub head_number: u64,
+    pub last_success: Instant,
 }
 
 // ── P2pStats ─────────────────────────────────────────────────────────
@@ -151,6 +152,23 @@ impl PeerPool {
             .map(|p| p.head_number)
             .filter(|&h| h > 0)
             .max()
+    }
+
+    /// Remove peers with no successful request within `threshold`.
+    pub fn evict_stale(&self, threshold: Duration) -> usize {
+        let mut peers = self.peers.write();
+        let before = peers.len();
+        peers.retain(|p| p.last_success.elapsed() < threshold);
+        before - peers.len()
+    }
+
+    /// Update last-success timestamp for a peer.
+    #[expect(dead_code, reason = "called from sync engine on successful fetches")]
+    pub fn mark_peer_success(&self, peer_id: PeerId) {
+        let mut peers = self.peers.write();
+        if let Some(peer) = peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            peer.last_success = Instant::now();
+        }
     }
 }
 
@@ -315,6 +333,7 @@ fn spawn_peer_watcher(
                         eth_version: info.version,
                         messages,
                         head_number: 0,
+                        last_success: Instant::now(),
                     });
 
                     info!(peers = pool.len(), "peer connected");
@@ -434,7 +453,7 @@ static HEAD_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 ///
 /// Probes up to `probe_peers` peers, requesting headers starting at
 /// `baseline + 1`. Returns the highest block number actually confirmed
-/// via header fetch, or `None` if no peer has data above `baseline`.
+/// via header fetch, or `None` if the pool is empty.
 ///
 /// Uses a global cursor to rotate across peers between calls, spreading
 /// probe load evenly across the pool.
@@ -453,35 +472,42 @@ pub async fn discover_head_p2p(
         return Ok(None);
     }
 
-    let mut best_head: Option<u64> = None;
-    let mut probed = 0usize;
+    // IMPORTANT: do not trust `peer.head_number` as a head signal for follow mode.
+    //
+    // Many peers will return a `Status` best hash, but later refuse to serve headers by number
+    // (or will be behind / on a different fork). If we treat `head_number` as authoritative, we
+    // will tip-chase and spam `GetBlockHeaders` beyond the peer's view.
+    //
+    // Instead, only advance the observed head if we can actually fetch headers above `baseline`.
+    let mut best = baseline;
+    let probe_peers = probe_peers.max(1);
+    let probe_limit = probe_limit.clamp(1, MAX_HEADERS_PER_REQUEST);
+    let start = baseline.saturating_add(1);
 
-    // Don't skip peers based on self-reported head_number — many peers
-    // report stale heads but can still serve headers above baseline.
-    for _ in 0..peers.len() {
+    let len = peers.len();
+    let start_idx = HEAD_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) % len;
+    for (probed, offset) in (0..len).enumerate() {
         if probed >= probe_peers {
             break;
         }
-        let idx = HEAD_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) % peers.len();
-        let peer = &peers[idx];
-
-        match request_headers_batch(peer, baseline + 1, probe_limit).await {
+        let peer = &peers[(start_idx + offset) % len];
+        match request_headers_batch(peer, start, probe_limit).await {
             Ok(headers) => {
-                probed += 1;
-                for header in &headers {
-                    let num = header.number;
-                    if num > baseline {
-                        best_head = Some(best_head.map_or(num, |b: u64| b.max(num)));
-                    }
+                if let Some(last) = headers.last() {
+                    best = best.max(last.number);
                 }
             }
             Err(e) => {
-                debug!(peer_id = ?peer.peer_id, error = %e, "head probe failed");
+                debug!(
+                    peer_id = ?peer.peer_id,
+                    error = %e,
+                    "head probe failed"
+                );
             }
         }
     }
 
-    Ok(best_head)
+    Ok(Some(best))
 }
 
 // ── Low-level request functions ──────────────────────────────────────
