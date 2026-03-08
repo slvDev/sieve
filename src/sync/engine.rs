@@ -919,7 +919,7 @@ async fn flush_batch(
     match flush_batch_inner(batch, ctx).await {
         Ok(outcomes) => {
             update_batch_stats(stats, metrics, max_indexed_block, &outcomes, batch_len);
-            dispatch_batch_notifications(stream_dispatcher, &outcomes, is_backfill);
+            dispatch_batch_notifications(stream_dispatcher, outcomes, is_backfill);
         }
         Err(e) => {
             warn!(batch_size = batch_len, error = %e, "failed to flush batch");
@@ -1105,9 +1105,11 @@ fn update_batch_stats(
 }
 
 /// Dispatch stream notifications for all blocks in a flushed batch.
+///
+/// Takes ownership of `outcomes` to avoid cloning `event_payloads`.
 fn dispatch_batch_notifications(
     stream_dispatcher: Option<&Arc<crate::stream::StreamDispatcher>>,
-    outcomes: &[ProcessOutcome],
+    outcomes: Vec<ProcessOutcome>,
     is_backfill: bool,
 ) {
     let Some(dispatcher) = stream_dispatcher else {
@@ -1117,12 +1119,8 @@ fn dispatch_batch_notifications(
         if !outcome.table_counts.is_empty() {
             let tables = outcome
                 .table_counts
-                .iter()
-                .map(|(name, event, count)| crate::stream::TableNotification {
-                    name: name.clone(),
-                    event: event.clone(),
-                    count: *count,
-                })
+                .into_iter()
+                .map(|(name, event, count)| crate::stream::TableNotification { name, event, count })
                 .collect();
             dispatcher.send(
                 crate::stream::BlockNotification {
@@ -1134,7 +1132,7 @@ fn dispatch_batch_notifications(
             );
         }
         if !outcome.event_payloads.is_empty() {
-            dispatcher.send_events(outcome.event_payloads.clone(), is_backfill);
+            dispatcher.send_events(outcome.event_payloads, is_backfill);
         }
     }
 }
