@@ -40,7 +40,7 @@ use tokio::time::{sleep, Instant};
 use tracing::{debug, info, instrument, warn};
 
 const MAX_CONCURRENT_FETCHES: usize = 32;
-const PAYLOAD_CHANNEL_SIZE: usize = 256;
+const PAYLOAD_CHANNEL_SIZE: usize = 4096;
 
 /// Maximum number of blocks to batch in a single DB transaction.
 const BATCH_SIZE: usize = 64;
