@@ -45,6 +45,9 @@ const PAYLOAD_CHANNEL_SIZE: usize = 4096;
 /// Maximum number of blocks to batch in a single DB transaction.
 const BATCH_SIZE: usize = 64;
 
+/// Channel buffer between processing workers and the DB writer.
+const PROCESSED_CHANNEL_SIZE: usize = 2048;
+
 /// How long to wait for more payloads before flushing a partial batch.
 const BATCH_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -124,6 +127,7 @@ struct ProcessedBlock {
     factory_discoveries: Vec<filter::FactoryDiscovery>,
     decoded_events: Vec<decode::DecodedEvent>,
     matched_count: u64,
+    receipt_count: u64,
     payload: BlockPayload,
 }
 
@@ -169,6 +173,7 @@ pub async fn run_sync(
 
     // Channels
     let (payload_tx, payload_rx) = mpsc::channel::<BlockPayload>(PAYLOAD_CHANNEL_SIZE);
+    let (processed_tx, processed_rx) = mpsc::channel::<ProcessedBlock>(PROCESSED_CHANNEL_SIZE);
     let (ready_tx, ready_rx) = mpsc::unbounded_channel::<NetworkPeer>();
 
     // Local shutdown signal for the peer feeder (triggered when fetch loop exits)
@@ -178,14 +183,21 @@ pub async fn run_sync(
     let feeder_handle =
         spawn_peer_feeder(Arc::clone(&ctx.pool), ready_tx.clone(), feeder_shutdown_rx);
 
-    // Spawn payload consumer
-    let consumer_handle = tokio::spawn(consume_payloads(
+    // Spawn N parallel processing workers (CPU: filter + decode)
+    let mut worker_set = spawn_processing_workers(
         payload_rx,
+        processed_tx,
+        Arc::clone(&ctx.config),
+        Arc::clone(&ctx.factories),
+    );
+
+    // Spawn DB writer (reads ProcessedBlocks, batches, commits)
+    let consumer_handle = tokio::spawn(consume_payloads(
+        processed_rx,
         Arc::clone(&ctx.config),
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.handlers),
         Arc::clone(&ctx.metrics),
-        Arc::clone(&ctx.factories),
         Arc::clone(&ctx.transfer_handlers),
         Arc::clone(&ctx.call_handlers),
         Arc::clone(&ctx.event_table_map),
@@ -209,10 +221,12 @@ pub async fn run_sync(
     };
     run_fetch_loop(&fetch_ctx, ready_rx, &ctx.stop_rx).await;
 
-    // Shutdown peer feeder and consumer
+    // Shutdown: feeder → workers → DB writer
     let _ = feeder_shutdown_tx.send(true);
     let _ = feeder_handle.await;
-    drop(payload_tx);
+    drop(payload_tx); // signals workers (payload_rx returns None)
+    while worker_set.join_next().await.is_some() {} // wait for workers to drain
+                                                    // All worker processed_tx clones dropped → DB writer sees channel close
 
     let stats = consumer_handle.await.wrap_err("consumer task failed")?;
 
@@ -635,18 +649,64 @@ async fn check_progress(
     *last_check = Instant::now();
 }
 
+// ── Processing workers ───────────────────────────────────────────────
+
+/// Spawn N parallel workers that read raw payloads, run CPU-bound
+/// filter+decode, and send `ProcessedBlock`s to the DB writer.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Arc/Sender are cloned into spawned tasks"
+)]
+fn spawn_processing_workers(
+    payload_rx: mpsc::Receiver<BlockPayload>,
+    processed_tx: mpsc::Sender<ProcessedBlock>,
+    config: Arc<IndexConfig>,
+    factories: Arc<Vec<ResolvedFactory>>,
+) -> JoinSet<()> {
+    let num_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+
+    info!(num_workers, "spawning block processing workers");
+
+    let payload_rx = Arc::new(tokio::sync::Mutex::new(payload_rx));
+    let mut workers = JoinSet::new();
+
+    for _ in 0..num_workers {
+        let rx = Arc::clone(&payload_rx);
+        let tx = processed_tx.clone();
+        let cfg = Arc::clone(&config);
+        let facts = Arc::clone(&factories);
+
+        workers.spawn(async move {
+            loop {
+                let payload = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+                let Some(payload) = payload else { break };
+                let processed = prepare_block(payload, &cfg, &facts);
+                if tx.send(processed).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    workers
+}
+
+// ── DB writer (payload consumer) ────────────────────────────────────
+
 #[expect(
     clippy::too_many_arguments,
     reason = "grouping these into a struct would add complexity without benefit"
 )]
 #[instrument(skip_all)]
 async fn consume_payloads(
-    mut payload_rx: mpsc::Receiver<BlockPayload>,
+    mut processed_rx: mpsc::Receiver<ProcessedBlock>,
     config: Arc<IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
     metrics: Arc<SieveMetrics>,
-    factories: Arc<Vec<ResolvedFactory>>,
     transfer_handlers: Arc<TransferRegistry>,
     call_handlers: Arc<CallRegistry>,
     event_table_map: Arc<HashMap<String, (String, String)>>,
@@ -663,7 +723,6 @@ async fn consume_payloads(
         config: &config,
         db: &db,
         handlers: &handlers,
-        factories: &factories,
         transfer_handlers: &transfer_handlers,
         call_handlers: &call_handlers,
         event_table_map: &event_table_map,
@@ -673,11 +732,11 @@ async fn consume_payloads(
 
     loop {
         // Block indefinitely when batch is empty; use timeout when non-empty
-        let payload = if batch.is_empty() {
-            payload_rx.recv().await
+        let processed = if batch.is_empty() {
+            processed_rx.recv().await
         } else {
-            match tokio::time::timeout(BATCH_FLUSH_TIMEOUT, payload_rx.recv()).await {
-                Ok(payload) => payload,
+            match tokio::time::timeout(BATCH_FLUSH_TIMEOUT, processed_rx.recv()).await {
+                Ok(processed) => processed,
                 Err(_timeout) => {
                     flush_batch(
                         &mut batch,
@@ -695,7 +754,7 @@ async fn consume_payloads(
         };
 
         // Channel closed: flush remaining batch and exit
-        let Some(payload) = payload else {
+        let Some(processed) = processed else {
             if !batch.is_empty() {
                 flush_batch(
                     &mut batch,
@@ -712,11 +771,9 @@ async fn consume_payloads(
         };
 
         stats.blocks_fetched = stats.blocks_fetched.saturating_add(1);
-        stats.total_receipts = stats
-            .total_receipts
-            .saturating_add(payload.receipts().len() as u64);
+        stats.total_receipts = stats.total_receipts.saturating_add(processed.receipt_count);
 
-        batch.push(prepare_block(payload, &ctx));
+        batch.push(processed);
 
         if batch.len() >= BATCH_SIZE {
             flush_batch(
@@ -737,12 +794,11 @@ async fn consume_payloads(
     stats
 }
 
-/// Shared references for the payload consumer (reduces argument counts).
+/// Shared references for the DB writer (reduces argument counts).
 struct ProcessContext<'a> {
     config: &'a IndexConfig,
     db: &'a Database,
     handlers: &'a HandlerRegistry,
-    factories: &'a [ResolvedFactory],
     transfer_handlers: &'a TransferRegistry,
     call_handlers: &'a CallRegistry,
     /// Maps `"contract:event"` key → `(table_name, event_name)`.
@@ -780,25 +836,30 @@ fn compute_block_hash(header: &reth_primitives_traits::Header) -> alloy_primitiv
 /// Factory children are registered in-memory immediately (so subsequent
 /// blocks in the same batch can match them). DB persistence is deferred
 /// to [`flush_batch`].
-fn prepare_block(payload: BlockPayload, ctx: &ProcessContext<'_>) -> ProcessedBlock {
+fn prepare_block(
+    payload: BlockPayload,
+    config: &IndexConfig,
+    factories: &[ResolvedFactory],
+) -> ProcessedBlock {
     let block_number = BlockNumber::new(payload.header().number);
     let block_hash = compute_block_hash(payload.header());
+    let receipt_count = payload.receipts().len() as u64;
 
     // Factory pre-scan: register children in-memory (no DB write)
-    let factory_discoveries = if ctx.factories.is_empty() {
+    let factory_discoveries = if factories.is_empty() {
         Vec::new()
     } else {
-        let discoveries = filter::scan_factory_events(&payload, ctx.factories);
+        let discoveries = filter::scan_factory_events(&payload, factories);
         for d in &discoveries {
-            register_factory_child_in_memory(ctx, d);
+            register_factory_child_in_memory(config, d);
         }
         discoveries
     };
 
     // Filter + decode
-    let matched = filter::filter_block(&payload, ctx.config);
+    let matched = filter::filter_block(&payload, config);
     let matched_count = matched.len() as u64;
-    let decoded_events = decode_matched_logs(&matched, ctx.config);
+    let decoded_events = decode_matched_logs(&matched, config);
 
     ProcessedBlock {
         block_number,
@@ -806,17 +867,14 @@ fn prepare_block(payload: BlockPayload, ctx: &ProcessContext<'_>) -> ProcessedBl
         factory_discoveries,
         decoded_events,
         matched_count,
+        receipt_count,
         payload,
     }
 }
 
 /// Register a factory child in-memory only (no DB write).
-fn register_factory_child_in_memory(
-    ctx: &ProcessContext<'_>,
-    discovery: &filter::FactoryDiscovery,
-) {
-    let Some(contract_idx) = ctx
-        .config
+fn register_factory_child_in_memory(config: &IndexConfig, discovery: &filter::FactoryDiscovery) {
+    let Some(contract_idx) = config
         .contracts
         .iter()
         .position(|c| c.name == discovery.child_contract_name)
@@ -828,10 +886,7 @@ fn register_factory_child_in_memory(
         return;
     };
 
-    if ctx
-        .config
-        .register_factory_child(discovery.child_address, contract_idx)
-    {
+    if config.register_factory_child(discovery.child_address, contract_idx) {
         info!(
             factory = %discovery.child_contract_name,
             child = ?discovery.child_address,
