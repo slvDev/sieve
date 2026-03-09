@@ -5,12 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cache dependency compilation — only rebuilds when Cargo.toml/Cargo.lock change
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main(){}" > src/main.rs && \
-    cargo build --release && rm -rf src
-
-# Build real source (only sieve code recompiles)
 COPY src/ src/
 RUN cargo build --release
 
