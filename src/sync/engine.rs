@@ -40,13 +40,13 @@ use tokio::time::{sleep, Instant};
 use tracing::{debug, info, instrument, warn};
 
 const MAX_CONCURRENT_FETCHES: usize = 32;
-const PAYLOAD_CHANNEL_SIZE: usize = 4096;
+const PAYLOAD_CHANNEL_SIZE: usize = 8192;
 
 /// Maximum number of blocks to batch in a single DB transaction.
 const BATCH_SIZE: usize = 64;
 
 /// Channel buffer between processing workers and the DB writer.
-const PROCESSED_CHANNEL_SIZE: usize = 2048;
+const PROCESSED_CHANNEL_SIZE: usize = 8192;
 
 /// How long to wait for more payloads before flushing a partial batch.
 const BATCH_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);

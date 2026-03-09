@@ -106,6 +106,7 @@ pub struct PeerHealthConfig {
     aimd_min_batch: usize,
     aimd_initial_batch: usize,
     aimd_max_batch: usize,
+    aimd_increase_step: usize,
     quality_partial_weight: f64,
 }
 
@@ -115,12 +116,13 @@ impl PeerHealthConfig {
         let max_batch = config.blocks_per_assignment.max(1);
         let initial_batch = config.initial_blocks_per_assignment.max(1).min(max_batch);
         Self {
-            aimd_increase_after: 5,
+            aimd_increase_after: 3,
             aimd_partial_decrease: 0.7,
             aimd_failure_decrease: 0.5,
             aimd_min_batch: 1,
             aimd_initial_batch: initial_batch,
             aimd_max_batch: max_batch,
+            aimd_increase_step: 2,
             quality_partial_weight: 1.0,
         }
     }
@@ -205,7 +207,8 @@ impl PeerHealthTracker {
         entry.backoff_duration = Duration::ZERO;
         entry.success_streak = entry.success_streak.saturating_add(1);
         if entry.success_streak >= self.config.aimd_increase_after {
-            entry.batch_limit = self.clamp_batch_limit(entry.batch_limit.saturating_add(1));
+            let step = self.config.aimd_increase_step;
+            entry.batch_limit = self.clamp_batch_limit(entry.batch_limit.saturating_add(step));
             entry.success_streak = 0;
         }
         entry.batch_limit_max = entry.batch_limit_max.max(entry.batch_limit);
