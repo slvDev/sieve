@@ -110,17 +110,19 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
 
     let db = Arc::new(setup_database(cli, &startup).await?);
 
-    let index_config = Arc::new(startup.index_config);
-    info!(
-        contracts = index_config.contracts.len(),
-        "loaded index config"
-    );
+    // Metrics
+    let metrics = Arc::new(metrics::SieveMetrics::new());
 
-    // Load persisted factory children from previous runs
-    if !startup.factories.is_empty() {
-        db::load_factory_children(&db, &index_config).await?;
-    }
-    let factories = Arc::new(startup.factories);
+    // GraphQL API (must be built before resolved_transfers/calls are consumed)
+    maybe_spawn_api(cli, &startup, &db, &metrics, &stop_rx)?;
+
+    // Build maps that reference resolved events/transfers/calls before consuming them
+    let event_table_map = build_event_table_map(&startup.resolved_events);
+    let receipt_tables = Arc::new(build_receipt_tables(
+        &startup.resolved_events,
+        &startup.resolved_transfers,
+        &startup.resolved_calls,
+    ));
 
     // Build handlers from resolved events
     let handlers: Vec<Box<dyn handler::EventHandler>> = startup
@@ -133,51 +135,37 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     let handlers = Arc::new(handler::HandlerRegistry::new(handlers));
     info!(handlers = handlers.len(), "registered event handlers");
 
-    // Metrics
-    let metrics = Arc::new(metrics::SieveMetrics::new());
+    let index_config = Arc::new(startup.index_config);
+    info!(
+        contracts = index_config.contracts.len(),
+        "loaded index config"
+    );
 
-    // GraphQL API server (optional — must be built before transfers are consumed)
-    if let Some(api_port) = cli.api_port {
-        let schema = api::build_schema(
-            &startup.resolved_events,
-            &startup.resolved_transfers,
-            &startup.resolved_calls,
-            db.pool().clone(),
-        )?;
-        let api_stop = stop_rx.clone();
-        let api_metrics = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            if let Err(e) = api::run_api_server(api_port, schema, api_metrics, api_stop).await {
-                tracing::error!(error = %e, "API server error");
-            }
-        });
+    // Load persisted factory children from previous runs
+    if !startup.factories.is_empty() {
+        db::load_factory_children(&db, &index_config).await?;
     }
-
-    // Build event_table_map: "contract:event" → (table_name, event_name)
-    let event_table_map = build_event_table_map(&startup.resolved_events);
-
-    // Build receipt_tables before transfers/calls are consumed
-    let receipt_tables = Arc::new(build_receipt_tables(
-        &startup.resolved_events,
-        &startup.resolved_transfers,
-        &startup.resolved_calls,
-    ));
+    let factories = Arc::new(startup.factories);
 
     // Build transfer handlers from resolved transfers
-    let transfer_handlers: Vec<handler::TransferHandler> = startup
+    let transfer_handler_vec: Vec<handler::TransferHandler> = startup
         .resolved_transfers
         .into_iter()
         .map(handler::TransferHandler::new)
         .collect();
-    let transfer_handlers = Arc::new(handler::TransferRegistry::new(transfer_handlers));
+    let has_transfers = !transfer_handler_vec.is_empty();
+    let transfer_handlers = Arc::new(handler::TransferRegistry::new(transfer_handler_vec));
 
     // Build call handlers from resolved calls
-    let call_handlers: Vec<handler::CallHandler> = startup
+    let call_handler_vec: Vec<handler::CallHandler> = startup
         .resolved_calls
         .into_iter()
         .map(handler::CallHandler::new)
         .collect();
-    let call_handlers = Arc::new(handler::CallRegistry::new(call_handlers));
+    let has_calls = !call_handler_vec.is_empty();
+    let call_handlers = Arc::new(handler::CallRegistry::new(call_handler_vec));
+
+    let bloom_filter = build_bloom_filter(&index_config, has_transfers, has_calls, &factories);
 
     // Stream dispatcher (webhooks)
     let stream_dispatcher = if startup.resolved_streams.is_empty() {
@@ -211,6 +199,7 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
         event_table_map: Arc::new(event_table_map),
         is_backfill,
         receipt_tables,
+        bloom_filter,
     };
 
     run_indexer(cli, startup.start_block, ctx).await
@@ -923,6 +912,63 @@ async fn shutdown_handler(stop_tx: watch::Sender<bool>) {
 
 /// Build the event table map: `"contract:event"` → `(table_name, event_name)`.
 ///
+/// Spawn the GraphQL API server if `--api-port` is set.
+fn maybe_spawn_api(
+    cli: &cli::Cli,
+    startup: &StartupConfig,
+    db: &Arc<db::Database>,
+    metrics: &Arc<metrics::SieveMetrics>,
+    stop_rx: &watch::Receiver<bool>,
+) -> eyre::Result<()> {
+    let Some(api_port) = cli.api_port else {
+        return Ok(());
+    };
+    let schema = api::build_schema(
+        &startup.resolved_events,
+        &startup.resolved_transfers,
+        &startup.resolved_calls,
+        db.pool().clone(),
+    )?;
+    let api_stop = stop_rx.clone();
+    let api_metrics = Arc::clone(metrics);
+    tokio::spawn(async move {
+        if let Err(e) = api::run_api_server(api_port, schema, api_metrics, api_stop).await {
+            tracing::error!(error = %e, "API server error");
+        }
+    });
+    Ok(())
+}
+
+/// Build a bloom filter for skipping blocks with no matching contract addresses.
+///
+/// Enabled only when the config has no transfer handlers, no call handlers,
+/// and no factory contracts (those need full block data for every block).
+fn build_bloom_filter(
+    index_config: &config::IndexConfig,
+    has_transfers: bool,
+    has_calls: bool,
+    factories: &[toml_config::ResolvedFactory],
+) -> Option<Arc<filter::BloomFilter>> {
+    if has_transfers || has_calls || !factories.is_empty() {
+        info!("bloom filter disabled (transfers, calls, or factories configured)");
+        return None;
+    }
+    let addresses: Vec<alloy_primitives::Address> = index_config
+        .contracts
+        .iter()
+        .filter(|c| c.address != alloy_primitives::Address::ZERO)
+        .map(|c| c.address)
+        .collect();
+    if addresses.is_empty() {
+        return None;
+    }
+    info!(
+        addresses = addresses.len(),
+        "bloom filter enabled — skipping blocks with no matching contracts"
+    );
+    Some(Arc::new(filter::BloomFilter::new(addresses)))
+}
+
 /// Used by the sync engine to map decoded events to table names for
 /// stream notification payloads.
 fn build_event_table_map(

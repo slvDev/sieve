@@ -5,6 +5,7 @@
 
 use crate::config::IndexConfig;
 use crate::db::Database;
+use crate::filter::BloomFilter;
 use crate::handler::{CallRegistry, HandlerRegistry, TransferRegistry};
 use crate::metrics::SieveMetrics;
 use crate::p2p::PeerPool;
@@ -55,6 +56,9 @@ pub struct SyncContext {
     pub is_backfill: bool,
     /// Table names that have `include_receipts = true` (for streaming enrichment).
     pub receipt_tables: Arc<HashSet<String>>,
+    /// Bloom filter for skipping blocks with no matching contract addresses.
+    /// `None` when transfers, calls, or factories are configured.
+    pub bloom_filter: Option<Arc<BloomFilter>>,
 }
 
 /// Full payload for a block: header, body, receipts.

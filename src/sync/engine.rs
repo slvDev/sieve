@@ -218,6 +218,7 @@ pub async fn run_sync(
         end_block,
         payload_tx: &payload_tx,
         ready_tx: &ready_tx,
+        bloom_filter: &ctx.bloom_filter,
     };
     run_fetch_loop(&fetch_ctx, ready_rx, &ctx.stop_rx).await;
 
@@ -293,6 +294,7 @@ struct FetchLoopContext<'a> {
     end_block: BlockNumber,
     payload_tx: &'a mpsc::Sender<BlockPayload>,
     ready_tx: &'a mpsc::UnboundedSender<NetworkPeer>,
+    bloom_filter: &'a Option<Arc<crate::filter::BloomFilter>>,
 }
 
 /// Mutable state carried across fetch loop iterations.
@@ -484,6 +486,7 @@ async fn dispatch_best_peer(
         peer_health: Arc::clone(ctx.peer_health),
         payload_tx: ctx.payload_tx.clone(),
         ready_tx: ctx.ready_tx.clone(),
+        bloom_filter: ctx.bloom_filter.clone(),
     };
     let params = FetchTaskParams {
         peer,

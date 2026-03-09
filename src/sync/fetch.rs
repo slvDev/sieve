@@ -1,6 +1,9 @@
 //! Fetch logic and task execution.
 
-use crate::p2p::{fetch_payloads_for_peer, NetworkPeer, PayloadFetchOutcome};
+use crate::filter::BloomFilter;
+use crate::p2p::{
+    fetch_headers_for_peer, fetch_payloads_for_headers, fetch_payloads_for_peer, NetworkPeer,
+};
 use crate::sync::scheduler::{PeerHealthTracker, PeerWorkScheduler};
 use crate::sync::{BlockPayload, FetchMode};
 use eyre::{eyre, Result};
@@ -15,6 +18,7 @@ use tracing::instrument;
 pub struct FetchIngestOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
+    pub bloom_skipped: Vec<u64>,
     #[expect(
         dead_code,
         reason = "populated during fetch for future metrics/logging"
@@ -24,29 +28,80 @@ pub struct FetchIngestOutcome {
 
 /// Fetch full block payloads for a consecutive batch of blocks.
 ///
+/// When a bloom filter is provided, only blocks whose header bloom matches
+/// any configured contract address will have bodies+receipts fetched.
+/// Non-matching blocks are returned in `bloom_skipped`.
+///
 /// # Errors
 ///
 /// Returns an error if the block batch is not consecutive or the fetch fails.
-pub async fn fetch_ingest_batch(peer: &NetworkPeer, blocks: &[u64]) -> Result<FetchIngestOutcome> {
+pub async fn fetch_ingest_batch(
+    peer: &NetworkPeer,
+    blocks: &[u64],
+    bloom_filter: Option<&BloomFilter>,
+) -> Result<FetchIngestOutcome> {
     if blocks.is_empty() {
         return Ok(FetchIngestOutcome {
             payloads: Vec::new(),
             missing_blocks: Vec::new(),
+            bloom_skipped: Vec::new(),
             fetch_stats: crate::p2p::FetchStageStats::default(),
         });
     }
     ensure_consecutive(blocks)?;
     let start = blocks[0];
     let end = blocks[blocks.len() - 1];
-    let PayloadFetchOutcome {
-        payloads,
-        missing_blocks,
-        fetch_stats,
-    } = fetch_payloads_for_peer(peer, start..=end).await?;
+
+    // No bloom filter → fetch everything (original path)
+    let Some(bloom) = bloom_filter else {
+        let outcome = fetch_payloads_for_peer(peer, start..=end).await?;
+        return Ok(FetchIngestOutcome {
+            payloads: outcome.payloads,
+            missing_blocks: outcome.missing_blocks,
+            bloom_skipped: Vec::new(),
+            fetch_stats: outcome.fetch_stats,
+        });
+    };
+
+    // Phase 1: fetch headers only
+    let header_outcome = fetch_headers_for_peer(peer, start..=end).await?;
+
+    // Phase 2: bloom filter — partition into matching and skipped
+    let mut need_fetch = Vec::new();
+    let mut bloom_skipped = Vec::new();
+    for header in header_outcome.headers {
+        if bloom.header_may_match(&header) {
+            need_fetch.push(header);
+        } else {
+            bloom_skipped.push(header.number);
+        }
+    }
+
+    if need_fetch.is_empty() {
+        return Ok(FetchIngestOutcome {
+            payloads: Vec::new(),
+            missing_blocks: header_outcome.missing_blocks,
+            bloom_skipped,
+            fetch_stats: crate::p2p::FetchStageStats {
+                headers_ms: header_outcome.headers_ms,
+                headers_requests: header_outcome.headers_requests,
+                ..crate::p2p::FetchStageStats::default()
+            },
+        });
+    }
+
+    // Phase 3: fetch bodies+receipts only for matching headers
+    let mut result = fetch_payloads_for_headers(peer, need_fetch).await?;
+    result.missing_blocks.extend(header_outcome.missing_blocks);
+    result.bloom_skipped = bloom_skipped;
+    result.fetch_stats.headers_ms = header_outcome.headers_ms;
+    result.fetch_stats.headers_requests = header_outcome.headers_requests;
+
     Ok(FetchIngestOutcome {
-        payloads,
-        missing_blocks,
-        fetch_stats,
+        payloads: result.payloads,
+        missing_blocks: result.missing_blocks,
+        bloom_skipped: result.bloom_skipped,
+        fetch_stats: result.fetch_stats,
     })
 }
 
@@ -67,6 +122,7 @@ pub struct FetchTaskContext {
     pub peer_health: Arc<PeerHealthTracker>,
     pub payload_tx: mpsc::Sender<BlockPayload>,
     pub ready_tx: mpsc::UnboundedSender<NetworkPeer>,
+    pub bloom_filter: Option<Arc<BloomFilter>>,
 }
 
 /// Parameters for a single fetch task invocation.
@@ -92,7 +148,7 @@ pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
     let _permit = permit;
 
     let fetch_started = tokio::time::Instant::now();
-    let result = fetch_ingest_batch(&peer, &blocks).await;
+    let result = fetch_ingest_batch(&peer, &blocks, ctx.bloom_filter.as_deref()).await;
     let fetch_elapsed = fetch_started.elapsed();
 
     match result {
@@ -122,14 +178,18 @@ async fn handle_fetch_success(
     let FetchIngestOutcome {
         payloads,
         missing_blocks,
+        bloom_skipped,
         fetch_stats: _,
     } = outcome;
 
-    let completed: Vec<u64> = payloads.iter().map(|p| p.header().number).collect();
+    // Mark both fetched AND bloom-skipped blocks as completed
+    let mut completed: Vec<u64> = payloads.iter().map(|p| p.header().number).collect();
+    completed.extend_from_slice(&bloom_skipped);
     if !completed.is_empty() {
         let _ = ctx.scheduler.mark_completed(&completed).await;
     }
 
+    let fetched_count = payloads.len();
     for payload in payloads {
         if ctx.payload_tx.send(payload).await.is_err() {
             break;
@@ -138,7 +198,8 @@ async fn handle_fetch_success(
 
     tracing::debug!(
         peer_id = ?peer.peer_id,
-        blocks_completed = completed.len(),
+        blocks_fetched = fetched_count,
+        bloom_skipped = bloom_skipped.len(),
         range_start = blocks.first().copied().unwrap_or(0),
         range_end = blocks.last().copied().unwrap_or(0),
         elapsed_ms = fetch_elapsed.as_millis() as u64,
@@ -149,7 +210,12 @@ async fn handle_fetch_success(
     if missing_blocks.is_empty() {
         ctx.scheduler.record_peer_success(peer.peer_id).await;
     } else {
-        handle_missing_blocks(ctx, peer, &completed, &missing_blocks, mode).await;
+        let fetched: Vec<u64> = completed
+            .iter()
+            .copied()
+            .filter(|b| !bloom_skipped.contains(b))
+            .collect();
+        handle_missing_blocks(ctx, peer, &fetched, &missing_blocks, mode).await;
     }
 }
 

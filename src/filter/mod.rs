@@ -12,9 +12,44 @@ use crate::sync::BlockPayload;
 use crate::toml_config::ResolvedFactory;
 use crate::types::{BlockNumber, LogIndex, TxIndex};
 use alloy_dyn_abi::{DynSolValue, EventExt};
-use alloy_primitives::{Address, Log, LogData, B256};
+use alloy_primitives::{Address, BloomInput, Log, LogData, B256};
+use reth_primitives_traits::Header;
 use std::collections::HashMap;
 use tracing::{debug, warn};
+
+// ── Bloom filter pre-screening ──────────────────────────────────────
+
+/// Pre-computed set of contract addresses for bloom filter pre-screening.
+///
+/// Ethereum block headers contain a `logs_bloom` (2048-bit bloom filter) that
+/// encodes all log-emitting addresses and topics. Checking our configured
+/// contract addresses against the bloom lets us skip fetching bodies+receipts
+/// for blocks that definitely contain no matching events (~98% of blocks).
+///
+/// False positives are possible (bloom says "maybe" but no real match).
+/// False negatives are impossible — if an event exists, the bloom WILL match.
+#[derive(Debug)]
+pub struct BloomFilter {
+    addresses: Vec<Address>,
+}
+
+impl BloomFilter {
+    /// Create a new bloom filter with the given contract addresses.
+    #[must_use]
+    pub fn new(addresses: Vec<Address>) -> Self {
+        Self { addresses }
+    }
+
+    /// Check if any configured address might have emitted a log in this block.
+    #[must_use]
+    pub fn header_may_match(&self, header: &Header) -> bool {
+        self.addresses.iter().any(|addr| {
+            header
+                .logs_bloom
+                .contains_input(BloomInput::Raw(addr.as_slice()))
+        })
+    }
+}
 
 /// A log that matched the user's filter criteria, with block context.
 pub struct FilteredLog {
@@ -552,5 +587,71 @@ mod tests {
         assert_eq!(discoveries[0].child_contract_name, "UniswapV3Pool");
         assert_eq!(discoveries[0].block_number, 12_369_700);
         Ok(())
+    }
+
+    // ── Bloom filter tests ──────────────────────────────────────────
+
+    #[test]
+    fn bloom_matches_address_in_header() {
+        use alloy_primitives::Bloom;
+
+        let addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        // Build a bloom that contains this address
+        let mut bloom = Bloom::default();
+        bloom.accrue(BloomInput::Raw(addr.as_slice()));
+
+        let header = Header {
+            logs_bloom: bloom,
+            ..Default::default()
+        };
+
+        let filter = BloomFilter::new(vec![addr]);
+        assert!(filter.header_may_match(&header));
+    }
+
+    #[test]
+    fn bloom_rejects_missing_address() {
+        let addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let other = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+
+        // Build a bloom with a different address
+        let mut bloom = alloy_primitives::Bloom::default();
+        bloom.accrue(BloomInput::Raw(other.as_slice()));
+
+        let header = Header {
+            logs_bloom: bloom,
+            ..Default::default()
+        };
+
+        let filter = BloomFilter::new(vec![addr]);
+        assert!(!filter.header_may_match(&header));
+    }
+
+    #[test]
+    fn bloom_rejects_empty_bloom() {
+        let addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let header = Header::default(); // empty bloom
+
+        let filter = BloomFilter::new(vec![addr]);
+        assert!(!filter.header_may_match(&header));
+    }
+
+    #[test]
+    fn bloom_matches_any_of_multiple_addresses() {
+        let addr1 = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let addr2 = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+
+        // Bloom only contains addr2
+        let mut bloom = alloy_primitives::Bloom::default();
+        bloom.accrue(BloomInput::Raw(addr2.as_slice()));
+
+        let header = Header {
+            logs_bloom: bloom,
+            ..Default::default()
+        };
+
+        let filter = BloomFilter::new(vec![addr1, addr2]);
+        assert!(filter.header_may_match(&header));
     }
 }

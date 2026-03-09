@@ -203,11 +203,21 @@ struct ChunkedResponse<T> {
     requests: u64,
 }
 
+/// Outcome of a header-only fetch for a peer.
+#[derive(Debug)]
+pub struct HeaderFetchOutcome {
+    pub headers: Vec<Header>,
+    pub missing_blocks: Vec<u64>,
+    pub headers_ms: u64,
+    pub headers_requests: u64,
+}
+
 /// Outcome of a full payload fetch for a peer.
 #[derive(Debug)]
 pub struct PayloadFetchOutcome {
     pub payloads: Vec<BlockPayload>,
     pub missing_blocks: Vec<u64>,
+    pub bloom_skipped: Vec<u64>,
     pub fetch_stats: FetchStageStats,
 }
 
@@ -812,10 +822,11 @@ async fn request_receipts_chunked_partial_with_stats(
 /// # Errors
 ///
 /// Returns an error if the underlying P2P requests fail.
-pub async fn fetch_payloads_for_peer(
+/// Fetch only headers for a block range from a peer.
+pub async fn fetch_headers_for_peer(
     peer: &NetworkPeer,
     range: std::ops::RangeInclusive<u64>,
-) -> Result<PayloadFetchOutcome> {
+) -> Result<HeaderFetchOutcome> {
     let start = *range.start();
     let end = *range.end();
     let count = (end - start + 1) as usize;
@@ -824,10 +835,9 @@ pub async fn fetch_payloads_for_peer(
     let headers_response = request_headers_chunked_with_stats(peer, start, count).await?;
     let headers_ms = headers_start.elapsed().as_millis() as u64;
     let headers_requests = headers_response.requests;
-    let headers = headers_response.headers;
 
     let mut headers_by_number = HashMap::new();
-    for header in headers {
+    for header in headers_response.headers {
         headers_by_number.insert(header.number, header);
     }
 
@@ -841,15 +851,28 @@ pub async fn fetch_payloads_for_peer(
         }
     }
 
+    Ok(HeaderFetchOutcome {
+        headers: ordered_headers,
+        missing_blocks,
+        headers_ms,
+        headers_requests,
+    })
+}
+
+/// Fetch bodies and receipts for a set of headers from a peer.
+///
+/// Headers must already be fetched; this computes their hashes and requests
+/// the corresponding bodies and receipts in parallel.
+pub async fn fetch_payloads_for_headers(
+    peer: &NetworkPeer,
+    ordered_headers: Vec<Header>,
+) -> Result<PayloadFetchOutcome> {
     if ordered_headers.is_empty() {
         return Ok(PayloadFetchOutcome {
             payloads: Vec::new(),
-            missing_blocks,
-            fetch_stats: FetchStageStats {
-                headers_ms,
-                headers_requests,
-                ..FetchStageStats::default()
-            },
+            missing_blocks: Vec::new(),
+            bloom_skipped: Vec::new(),
+            fetch_stats: FetchStageStats::default(),
         });
     }
 
@@ -877,6 +900,7 @@ pub async fn fetch_payloads_for_peer(
     let mut receipts = receipts.results;
 
     let mut payloads = Vec::with_capacity(ordered_headers.len());
+    let mut missing_blocks = Vec::new();
     for (idx, header) in ordered_headers.into_iter().enumerate() {
         let number = header.number;
         let body = bodies.get_mut(idx).and_then(Option::take);
@@ -899,13 +923,41 @@ pub async fn fetch_payloads_for_peer(
     Ok(PayloadFetchOutcome {
         payloads,
         missing_blocks,
+        bloom_skipped: Vec::new(),
         fetch_stats: FetchStageStats {
-            headers_ms,
+            headers_ms: 0,
             bodies_ms,
             receipts_ms,
-            headers_requests,
+            headers_requests: 0,
             bodies_requests,
             receipts_requests,
         },
     })
+}
+
+/// Fetch full block payloads (headers + bodies + receipts) for a range.
+pub async fn fetch_payloads_for_peer(
+    peer: &NetworkPeer,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<PayloadFetchOutcome> {
+    let header_outcome = fetch_headers_for_peer(peer, range).await?;
+
+    if header_outcome.headers.is_empty() {
+        return Ok(PayloadFetchOutcome {
+            payloads: Vec::new(),
+            missing_blocks: header_outcome.missing_blocks,
+            bloom_skipped: Vec::new(),
+            fetch_stats: FetchStageStats {
+                headers_ms: header_outcome.headers_ms,
+                headers_requests: header_outcome.headers_requests,
+                ..FetchStageStats::default()
+            },
+        });
+    }
+
+    let mut result = fetch_payloads_for_headers(peer, header_outcome.headers).await?;
+    result.missing_blocks.extend(header_outcome.missing_blocks);
+    result.fetch_stats.headers_ms = header_outcome.headers_ms;
+    result.fetch_stats.headers_requests = header_outcome.headers_requests;
+    Ok(result)
 }

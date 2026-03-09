@@ -37,6 +37,7 @@ struct FollowContext {
     stream_dispatcher: Option<Arc<StreamDispatcher>>,
     event_table_map: Arc<HashMap<String, (String, String)>>,
     receipt_tables: Arc<std::collections::HashSet<String>>,
+    bloom_filter: Option<Arc<crate::filter::BloomFilter>>,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -64,6 +65,7 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
         stream_dispatcher: ctx.stream_dispatcher,
         event_table_map: ctx.event_table_map,
         receipt_tables: ctx.receipt_tables,
+        bloom_filter: ctx.bloom_filter,
     };
 
     let mut last_heartbeat = Instant::now();
@@ -197,6 +199,7 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
         event_table_map: Arc::clone(&ctx.event_table_map),
         is_backfill: false,
         receipt_tables: Arc::clone(&ctx.receipt_tables),
+        bloom_filter: ctx.bloom_filter.clone(),
     };
 
     let outcome = run_sync(
