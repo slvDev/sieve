@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-03-11
+
+### Fixed
+
+- Follow-mode stall when all peers have stale head_cap (pending=1, inflight=0 indefinitely)
+- Background head tracker continuously probes chain tip via P2P, overrides per-peer head_cap in follow mode
+- Peer heads now updated after successful fetch (monotonic, never regresses)
+
 ## [0.1.0] - 2026-03-10
 
 Initial release.
