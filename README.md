@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Ethereum indexer that connects directly to P2P. No RPC provider needed.</strong><br>
-  100-200 blocks/sec. No API keys. No rate limits. No bills.<br>
+  ~1000 blocks/sec. No API keys. No rate limits. No bills.<br>
   Just Sieve, Postgres, and an internet connection.
 </p>
 
@@ -24,9 +24,11 @@ Sieve fetches the ABI, creates your tables, syncs the chain over P2P, and serves
 |                 | Other indexers                     | Sieve                     |
 | --------------- | ---------------------------------- | ------------------------- |
 | **Data source** | RPC provider ($225-$900/mo)        | Ethereum P2P network ($0) |
-| **Speed**       | Provider's rate limit              | 100-200 blocks/sec        |
+| **Speed**       | Provider's rate limit              | ~1000 blocks/sec        |
 | **Setup**       | API keys, accounts, billing        | One-line install          |
 | **Config**      | TypeScript / YAML / AssemblyScript | One TOML file             |
+
+*Benchmarked on Hetzner dedicated server (Germany), 11 contracts, 29 events, RabbitMQ streaming active.*
 
 ## Quick Start
 
