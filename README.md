@@ -1,40 +1,44 @@
-# Sieve
+<h1 align="center">Sieve</h1>
 
-An Ethereum event indexer that connects directly to the P2P network. No RPC provider needed.
+<p align="center">
+  <em>"I'm not like the rest of you. I'm stronger. I'm smarter. I'm better." — The Boys</em>
+</p>
 
-Sieve syncs block headers and receipts over Ethereum's devp2p protocol at 1000+ blocks/sec, filters for the events you care about, decodes them, and writes to PostgreSQL. Then it serves an auto-generated GraphQL API on top.
+<p align="center">
+  <strong>Ethereum indexer that connects directly to P2P. No RPC provider needed.</strong><br>
+  100-200 blocks/sec. No API keys. No rate limits. No bills.<br>
+  Just Sieve, Postgres, and an internet connection.
+</p>
 
-**Zero infrastructure cost.** No Alchemy. No Infura. No full node. Just Sieve, Postgres, and an internet connection.
+---
 
-## Why Sieve
+```bash
+sieve add-contract 0xA0b8...eB48 --etherscan-api-key $KEY
+sieve --api-port 4000
+```
 
-Every existing indexer — Ponder, rindexer, The Graph — requires an RPC endpoint. That means either running a full node (hundreds of GBs, ongoing maintenance) or paying a provider (rate limits, costs that scale with usage).
+Sieve fetches the ABI, creates your tables, syncs the chain over P2P, and serves a GraphQL API. Zero code.
 
-Sieve skips all of that. It speaks Ethereum's native P2P protocol directly, the same way nodes talk to each other. You get:
+## Why
 
-- **Fast sync** — 1000+ blocks/sec from the P2P network, proven by the [SHiNode](https://github.com/AantonC/SHiNode) engine it's built on
-- **Minimal storage** — only the events you define are stored. Full mainnet history in MBs, not hundreds of GBs
-- **No RPC bills** — connect to Ethereum peers directly, no API keys or rate limits
-- **Simple config** — one TOML file defines what to index. No code to write
-- **Production-ready** — auto-generated GraphQL API, Prometheus metrics, health probes, cursor pagination, reorg handling, webhook streaming
+|                 | Other indexers                     | Sieve                     |
+| --------------- | ---------------------------------- | ------------------------- |
+| **Data source** | RPC provider ($225-$900/mo)        | Ethereum P2P network ($0) |
+| **Speed**       | Provider's rate limit              | 100-200 blocks/sec        |
+| **Setup**       | API keys, accounts, billing        | One-line install          |
+| **Config**      | TypeScript / YAML / AssemblyScript | One TOML file             |
 
 ## Quick Start
 
-### Prerequisites
-
-- Rust 1.91+ (stable)
-- PostgreSQL 16+
-- Port 30303 open (TCP + UDP) for Ethereum P2P
-
-### 1. Build
+### 1. Install
 
 ```bash
-git clone https://github.com/example/sieve.git
-cd sieve
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/slvDev/sieve/main/sieveup/install | bash
 ```
 
-### 2. Create your config
+Run `sieveup` anytime to update to the latest version.
+
+### 2. Configure
 
 ```bash
 sieve init                        # creates sieve.toml and abis/
@@ -42,7 +46,7 @@ sieve add-contract 0xA0b8... \    # fetch ABI from Etherscan, add to config
   --etherscan-api-key $KEY
 ```
 
-Or copy the example and edit manually:
+Or write the TOML yourself:
 
 ```toml
 [database]
@@ -58,52 +62,56 @@ start_block = 21_000_000
 name = "Transfer"
 table = "usdc_transfers"
 context = ["block_timestamp", "tx_from"]
-columns = [
-  { param = "from",  name = "from_address", type = "text" },
-  { param = "to",    name = "to_address",   type = "text" },
-  { param = "value", name = "value",        type = "numeric" },
-]
 ```
 
-Place your ABI JSON files in the `abis/` directory. If columns are omitted, Sieve auto-generates them from the ABI with automatic snake_case conversion (e.g. `_troveId` → `trove_id`, `amount0Out` → `amount0_out`).
+Columns are auto-generated from the ABI. Solidity camelCase is converted to snake_case automatically (`_troveId` -> `trove_id`, `amount0Out` -> `amount0_out`). SQL reserved words are handled. You can [override columns](#contracts-and-events) if you want.
 
 ### 3. Run
 
 ```bash
-# Historical sync (specific range)
-./target/release/sieve --config sieve.toml --start-block 21000000 --end-block 21001000
-
-# Follow mode (sync history then follow new blocks)
-./target/release/sieve --config sieve.toml --api-port 4000
+sieve --api-port 4000
 ```
+
+That's it. Sieve backfills from each contract's `start_block`, catches up to the chain head, then follows new blocks in real-time. One command — no separate "historical sync" and "follow mode" steps.
 
 ### 4. Query
 
-With `--api-port`, Sieve serves a GraphQL API with a built-in GraphiQL explorer:
-
-```
-http://localhost:4000/          # GraphiQL IDE
-http://localhost:4000/graphql   # GraphQL endpoint
-http://localhost:4000/health    # Liveness probe
-http://localhost:4000/ready     # Readiness probe (503 during backfill)
-http://localhost:4000/metrics   # Prometheus metrics
-```
+GraphQL API with built-in GraphiQL explorer:
 
 ```graphql
 {
   usdc_transfers(
-    where: { from_address: "0xDead...beef" }
+    where: {
+      OR: [{ from_address: "0xAbc..." }, { to_address: "0xAbc..." }]
+      value_gte: "1000000000"
+    }
     order_by: block_number
     order_direction: desc
-    first: 10
+    first: 50
   ) {
     block_number
+    tx_hash
     from_address
     to_address
     value
+    block_timestamp
   }
 }
 ```
+
+Open `http://localhost:4000` for the GraphiQL IDE.
+
+## What Sieve Can Index
+
+**Event logs** -- filter by contract address, event signature, and indexed parameter values. The bread and butter.
+
+**Function calls** -- decode transaction calldata for specific function selectors. Only successful (non-reverted) calls.
+
+**Native ETH transfers** -- track value transfers with optional sender/receiver address filters. No ABI needed.
+
+**Factory contracts** -- dynamically discover and index child contracts as they're deployed.
+
+All of it configured in one TOML file. All of it stored in PostgreSQL. All of it queryable via GraphQL.
 
 ## Configuration Reference
 
@@ -116,55 +124,32 @@ address = "0x..."
 abi = "abis/my_contract.json"
 start_block = 21_000_000
 include_receipts = true     # adds gas_used, nonce, cumulative_gas_used, status columns
-                            # and enriches streaming payloads with receipt metadata
 
-# Index event logs
 [[contracts.events]]
-name = "Transfer"           # Event name from ABI
-table = "my_transfers"      # PostgreSQL table name
-context = [                 # Optional block/tx metadata columns
+name = "Transfer"
+table = "my_transfers"
+context = [                 # optional block/tx metadata columns
   "block_timestamp",
   "block_hash",
   "tx_from",
   "tx_to",
   "tx_value",
   "tx_gas_price",
-  # These are auto-added by include_receipts = true:
+  # auto-added by include_receipts = true:
   # "tx_gas_used", "tx_nonce", "cumulative_gas_used", "tx_status"
 ]
-columns = [                 # Optional column mapping (auto-generated if omitted)
+columns = [                 # optional -- auto-generated from ABI if omitted
   { param = "from",  name = "sender",   type = "text" },
   { param = "to",    name = "receiver", type = "text" },
   { param = "value", name = "amount",   type = "numeric" },
 ]
-# Column names are auto-converted to snake_case from Solidity camelCase.
-# SQL reserved words (from, to, value) and names that collide with
-# built-in columns (id, block_number, tx_hash, etc.) are handled
-# automatically — reserved words are quoted, collisions are prefixed.
 
-# Optional: filter by indexed parameters (only index specific values)
+# filter by indexed parameters (only index specific values)
 [contracts.events.filter]
 spender = ["0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"]
 ```
 
-### Receipt Context Fields
-
-Setting `include_receipts = true` on a contract or transfer auto-adds four context fields to all its tables and enriches streaming payloads with transaction metadata:
-
-| Context Field | SQL Type | Description |
-|---|---|---|
-| `tx_gas_used` | `BIGINT` | Per-transaction gas used (computed from cumulative) |
-| `tx_nonce` | `BIGINT` | Transaction nonce |
-| `cumulative_gas_used` | `BIGINT` | Cumulative gas used in block up to this tx |
-| `tx_status` | `BOOLEAN` | Receipt success (always true — Sieve only indexes successful txs) |
-
-When streaming is configured, `include_receipts = true` also adds `tx_value`, `tx_gas_price`, `gas_used`, `nonce`, `cumulative_gas_used`, and `status` to the JSON payload. This lets downstream consumers compute transaction costs (`gas_used × tx_gas_price`) without querying an RPC node.
-
-You can also use receipt context fields individually without the flag, by adding them to the `context` array (e.g. `context = ["tx_gas_used", "tx_nonce"]`).
-
 ### Function Call Indexing
-
-Index top-level function calls by decoding transaction calldata. Only successful (non-reverted) calls are stored.
 
 ```toml
 [[contracts.calls]]
@@ -179,24 +164,19 @@ columns = [
 
 ### Native ETH Transfers
 
-Track ETH transfers (non-zero value transactions) without any contract ABI:
-
 ```toml
 [[transfers]]
 name = "eth_transfers"
 table = "eth_transfers"
 start_block = 21_000_000
 context = ["block_timestamp", "tx_gas_price"]
-include_receipts = true   # adds tx_gas_used, tx_nonce, cumulative_gas_used, tx_status columns
+include_receipts = true
 
-# Optional: filter by sender/receiver
 [transfers.filter]
 from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
 ```
 
 ### Factory Contracts
-
-Automatically discover and index child contracts deployed by a factory:
 
 ```toml
 [[contracts]]
@@ -210,15 +190,32 @@ event = "PoolCreated"
 parameter = "pool"
 ```
 
-### Webhook Streaming
+### Receipt Context Fields
 
-Get notified via HTTP POST after each block is committed to the database. Useful for triggering materialized view refreshes, downstream pipelines, or cache invalidation.
+`include_receipts = true` on a contract or transfer auto-adds these columns:
+
+| Context Field         | SQL Type  | Description                                                        |
+| --------------------- | --------- | ------------------------------------------------------------------ |
+| `tx_gas_used`         | `BIGINT`  | Per-transaction gas used                                           |
+| `tx_nonce`            | `BIGINT`  | Transaction nonce                                                  |
+| `cumulative_gas_used` | `BIGINT`  | Cumulative gas used in block up to this tx                         |
+| `tx_status`           | `BOOLEAN` | Receipt success (always true -- Sieve only indexes successful txs) |
+
+Also enriches streaming payloads with `tx_value`, `tx_gas_price`, `gas_used`, `nonce`, `cumulative_gas_used`, and `status`. Lets downstream consumers compute transaction costs without an RPC node.
+
+Individual receipt fields can be added without the flag: `context = ["tx_gas_used", "tx_nonce"]`.
+
+## Streaming
+
+### Webhooks
+
+HTTP POST after each block is committed. Useful for triggering downstream pipelines or cache invalidation.
 
 ```toml
 [[streams]]
 name = "my_webhook"
 type = "webhook"
-url = "http://localhost:8080/sieve-events"
+url = "http://localhost:8080/sieve-events"  # or omit and set WEBHOOK_URL env var
 backfill = false   # skip during historical sync (default: true)
 ```
 
@@ -235,21 +232,17 @@ Payload:
 }
 ```
 
-- Best-effort delivery (failures are logged, never block indexing)
-- `backfill = false` skips notifications during historical sync
-- Multiple webhooks supported — each gets every block notification
+### RabbitMQ
 
-### RabbitMQ Streaming
-
-Publish each decoded event, function call, or transfer as an individual JSON message to a RabbitMQ exchange. Each message includes the full decoded data, routed by a configurable routing key.
+Per-event JSON messages to an AMQP exchange with configurable routing keys.
 
 ```toml
 [[streams]]
 name = "rabbitmq_events"
 type = "rabbitmq"
-url = "amqp://guest:guest@rabbitmq:5672/%2f"
+url = "amqp://guest:guest@rabbitmq:5672/%2f"  # or omit and set RABBITMQ_URL env var
 exchange = "sieve_events"
-routing_key = "{table}.{event}"   # optional, this is the default
+routing_key = "{table}.{event}"   # optional, default
 backfill = false
 ```
 
@@ -267,12 +260,6 @@ Message payload (one per event):
   "log_index": 5,
   "tx_index": 42,
   "tx_from": "0x1234...5678",
-  "tx_value": "1000000000000000000",
-  "tx_gas_price": 30000000000,
-  "gas_used": 65000,
-  "nonce": 42,
-  "cumulative_gas_used": 500000,
-  "status": true,
   "data": {
     "from": "0xDead...beef",
     "to": "0xCafe...babe",
@@ -281,50 +268,22 @@ Message payload (one per event):
 }
 ```
 
-- **`data` keys use raw ABI parameter names**, not the column names from your TOML config. If the Solidity ABI defines `_troveId`, the stream sends `_troveId` — even though PostgreSQL stores it as `trove_id`. This is intentional: ABI names are tied to the immutable smart contract, while TOML column names can change. Consumers should write a thin adapter to map field names as needed.
-- `contract_name` is the name from your TOML config (e.g. `"USDC"`). Empty for native transfers.
-- Receipt fields (`tx_value` through `status`) only present when the contract/transfer has `include_receipts = true`
-- Routing key supports `{table}` and `{event}` placeholders (e.g. `usdc_transfers.Transfer`)
-- Exchange is declared as `topic` type, durable
-- Messages are persistent (delivery mode 2) with `application/json` content type
-- Lazy connection — connects on first event, reconnects automatically on failure
-- Webhook and RabbitMQ streams can be used together — both fire after each block commit
+**Note:** `data` keys use raw ABI parameter names, not your TOML column names. If the Solidity ABI defines `_troveId`, the stream sends `_troveId` -- even though PostgreSQL stores it as `trove_id`. ABI names are immutable; config names can change.
+
+Receipt fields (`tx_value`, `tx_gas_price`, `gas_used`, `nonce`, `cumulative_gas_used`, `status`) are included when `include_receipts = true`.
+
+Both webhook and RabbitMQ streams can run simultaneously. Both are best-effort -- failures are logged, never block indexing. Lazy connection for RabbitMQ (auto-reconnect on failure).
 
 ## GraphQL API
 
-Sieve auto-generates a full GraphQL schema from your TOML config. Every table gets:
+Auto-generated from your TOML config. Every table gets:
 
-- **Queries** — singular and plural with filtering, sorting, pagination
-- **Filter operators** — `_eq`, `_ne`, `_gt`, `_gte`, `_lt`, `_lte`, `_in`, `_not_in`, `_contains`, `_starts_with`, `_ends_with`
-- **Composition** — `AND` / `OR` for complex filter logic
-- **Pagination** — cursor-based (`first`/`after`) and offset-based (`first`/`skip`)
-- **Sorting** — `order_by` + `order_direction`
+- **Filter operators** -- `_eq`, `_ne`, `_gt`, `_gte`, `_lt`, `_lte`, `_in`, `_not_in`, `_contains`, `_starts_with`, `_ends_with`
+- **Composition** -- `AND` / `OR` for complex filter logic
+- **Pagination** -- cursor-based (`first`/`after`) and offset-based (`first`/`skip`)
+- **Sorting** -- `order_by` + `order_direction`
 
-```graphql
-{
-  usdc_transfers(
-    where: {
-      OR: [
-        { from_address: "0xAbc..." }
-        { to_address: "0xAbc..." }
-      ]
-      value_gte: "1000000000"
-    }
-    order_by: block_number
-    order_direction: desc
-    first: 50
-  ) {
-    block_number
-    tx_hash
-    from_address
-    to_address
-    value
-    block_timestamp
-  }
-}
-```
-
-## CLI Reference
+## CLI
 
 ```
 sieve [OPTIONS]                Run the indexer
@@ -336,17 +295,39 @@ sieve add-contract <ADDRESS>   Fetch ABI from Etherscan and add to config
 sieve peers                    Test P2P connectivity (no DB or config needed)
 
 Options:
-  --config <PATH>         Path to TOML config file [default: sieve.toml]
-  --start-block <NUM>     Override start block for all contracts
+  --config <PATH>         Path to TOML config [default: sieve.toml]
+  --start-block <NUM>     Override start block
   --end-block <NUM>       Stop at this block (omit for follow mode)
-  --database-url <URL>    PostgreSQL URL (or set DATABASE_URL env var)
+  --database-url <URL>    PostgreSQL URL (or DATABASE_URL env var)
   --api-port <PORT>       Enable GraphQL API on this port
   --fresh                 Drop and recreate all tables before indexing
 ```
 
+### API Endpoints
+
+When running with `--api-port`:
+
+| Endpoint   | Description                     |
+| ---------- | ------------------------------- |
+| `/`        | GraphiQL IDE                    |
+| `/graphql` | GraphQL endpoint                |
+| `/health`  | Liveness probe                  |
+| `/ready`   | Readiness (503 during backfill) |
+| `/metrics` | Prometheus metrics              |
+
+### Environment Variables
+
+| Variable       | Purpose                   | Overridden by                                     |
+| -------------- | ------------------------- | ------------------------------------------------- |
+| `DATABASE_URL` | PostgreSQL connection URL | `--database-url` flag or `[database] url` in TOML |
+| `WEBHOOK_URL`  | Webhook endpoint URL      | `url` field in `[[streams]]` TOML section         |
+| `RABBITMQ_URL` | RabbitMQ connection URL   | `url` field in `[[streams]]` TOML section         |
+
+For production deployments, set secrets as environment variables instead of baking them into config files.
+
 ### `sieve add-contract`
 
-Fetches a verified contract ABI from Etherscan, saves it to `abis/`, and appends a `[[contracts]]` block with all events to your config. Auto-detects proxy contracts.
+Fetches a verified ABI from Etherscan, saves it to `abis/`, and appends a `[[contracts]]` block to your config. Auto-detects proxy contracts.
 
 ```bash
 sieve add-contract 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
@@ -365,27 +346,26 @@ sieve inspect --config sieve.toml
 
 ### `sieve peers`
 
-Tests P2P connectivity without requiring a database or config file. Connects to the Ethereum network and reports peer count and best known head every 5 seconds. Useful for diagnosing networking issues in Docker or NAT environments.
+Tests P2P connectivity without a database or config. Reports peer count and chain head every 5 seconds. Useful for diagnosing Docker/NAT issues.
 
 ```bash
 sieve peers
 # peers=5 best_head=22525078
 # peers=8 best_head=22525090
-# ^C Shutting down.
 ```
 
 ## Docker
 
-### Build and run with Docker Compose
+### Docker Compose
 
 ```bash
 cp sieve.example.toml sieve.toml   # edit for your contracts
 docker compose up -d
 ```
 
-This starts PostgreSQL and Sieve with the GraphQL API on port 4000. See `docker-compose.yml` for the full configuration.
+Starts PostgreSQL and Sieve with GraphQL API on port 4000.
 
-### Build the image manually
+### Manual build
 
 ```bash
 docker build -t sieve .
@@ -397,24 +377,7 @@ docker run \
   sieve --config /app/sieve.toml --database-url postgres://... --api-port 4000
 ```
 
-### Why config and ABIs are not baked into the image
-
-The Docker image contains only the Sieve binary. Your `sieve.toml` and `abis/` directory are mounted at runtime as volumes, not copied during build. This is intentional:
-
-- **Config is deployment-specific** — database URLs, start blocks, stream endpoints differ between environments
-- **ABIs change with your contracts** — no need to rebuild the image when adding a new contract
-- **Secrets stay out of images** — database credentials in `sieve.toml` should not be in a Docker layer
-- **One image, many deployments** — the same image works for dev, staging, and production with different mounted configs
-
-### Coolify / managed platforms
-
-Platforms like Coolify don't support local bind mounts. Use `Dockerfile.coolify` which bakes `sieve.toml` and `abis/` into the image:
-
-```bash
-docker build -f Dockerfile.coolify -t sieve .
-```
-
-In Coolify, set the build file to `Dockerfile.coolify` and pass `DATABASE_URL` as an environment variable. The TOML config and ABIs are baked into the image, so you need to rebuild when they change. Keep database credentials in environment variables, not in `sieve.toml` — use the `--database-url` flag or `DATABASE_URL` env var which override the TOML `[database]` section.
+Config and ABIs are mounted as volumes, not baked into the image. One image works for dev, staging, and production.
 
 > **Note:** Port 30303 (TCP + UDP) must be reachable from the internet for Ethereum P2P peer discovery.
 
@@ -422,43 +385,36 @@ In Coolify, set the build file to `Dockerfile.coolify` and pass `DATABASE_URL` a
 
 ```
 Ethereum P2P Network
-       │
-       ▼
-  P2P Layer (devp2p, eth/68-70, peer pool)
-       │
-       ▼
-  Sync Engine (AIMD batch sizing, 1000+ blocks/sec)
-       │
-       ├────────────────┬──────────────────┐
-       ▼                ▼                  ▼
-  Event Filter    Call Scanner      Transfer Scanner
-  (address+topic) (tx.input[0..4])  (tx.value > 0)
-       │                │                  │
-       ▼                ▼                  │
-  ABI Decoder     ABI Decoder             │
-  (log data)      (calldata)              │
-       │                │                  │
-       └────────────────┴──────────────────┘
-                        │
-                        ▼
-                  PostgreSQL ──────► Webhooks / RabbitMQ
-                        │
-                        ▼
-                  GraphQL API
+       |
+       v
+  Sync Engine (parallel workers, bloom filter pre-screening)
+       |
+       |-----------------+-----------------+
+       v                 v                 v
+  Event Filter     Call Scanner     Transfer Scanner
+       |                 |                 |
+       v                 v                 |
+  ABI Decoder      ABI Decoder            |
+       |                 |                 |
+       +-----------------+-----------------+
+                         |
+                         v
+                   PostgreSQL -------> Webhooks / RabbitMQ
+                         |
+                         v
+                   GraphQL API
 ```
 
+Sieve syncs block headers and receipts over Ethereum's devp2p protocol, filters logs against your TOML config at sync time, decodes matched events, and writes to PostgreSQL. Everything else is discarded — you only store what you asked for.
+
 - **Checkpoint/resume** — restarts from where it left off
-- **Reorg handling** — detects chain reorganizations (up to 64 blocks) and rolls back affected data
+- **Reorg handling** — detects reorganizations (up to 64 blocks) and rolls back affected data
 - **Follow mode** — after historical sync, follows the chain head in real-time
 - **Graceful shutdown** — Ctrl+C stops cleanly, progress is saved
 
-## Building Without jemalloc
+## Acknowledgments
 
-By default, Sieve uses jemalloc for better memory allocation performance. To build without it:
-
-```bash
-cargo build --release --no-default-features
-```
+Sieve's P2P sync engine is built on [SHiNode](https://github.com/vicnaum/shinode), a high-performance Ethereum node that proved 1000+ blocks/sec sync over devp2p. The networking layer uses [Reth](https://github.com/paradigmxyz/reth) crates for Ethereum P2P protocol support.
 
 ## License
 

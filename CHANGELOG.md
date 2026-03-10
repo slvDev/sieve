@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-03-06
+## [0.1.0] - 2026-03-10
 
 Initial release.
 
@@ -25,3 +25,9 @@ Initial release.
 - Etherscan integration — `add-contract` fetches verified ABIs with proxy detection
 - Docker support — multi-stage Dockerfile with dependency caching
 - Checkpoint/resume — automatic progress tracking, idempotent re-processing
+- Environment variable fallbacks — `DATABASE_URL`, `WEBHOOK_URL`, `RABBITMQ_URL` for production deployments
+- Bloom filter pre-screening — skip receipt fetching for ~98% of blocks with no matching events
+- Batched DB transactions — 64 blocks per COMMIT for faster writes
+- Parallel block processing — N CPU workers for decode/filter pipeline
+- AIMD batch growth — faster warmup from 32 to 128 blocks per request
+- `sieveup` installer — `curl | bash` install with automatic updates

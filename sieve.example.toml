@@ -1,14 +1,19 @@
 # sieve.example.toml — example config for indexing USDC events
+#
+# For production, use environment variables for secrets:
+#   DATABASE_URL  — PostgreSQL connection string (overrides [database] url)
+#   WEBHOOK_URL   — webhook endpoint (used when url is omitted from [[streams]])
+#   RABBITMQ_URL  — RabbitMQ connection string (used when url is omitted from [[streams]])
 
 [database]
-url = "postgres://postgres:sieve@localhost:5432/sieve"
+url = "postgres://postgres:sieve@localhost:5432/sieve"  # or omit and set DATABASE_URL
 
 [[contracts]]
 name = "USDC"
 address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 abi = "abis/erc20.json"
 start_block = 21_000_000
-# include_receipts = true  # uncomment to add gas_used, nonce, cumulative_gas_used, tx_status columns
+# include_receipts = true  # adds gas_used, nonce, cumulative_gas_used, tx_status columns
 
 [[contracts.events]]
 name = "Transfer"
@@ -53,7 +58,7 @@ context = ["block_timestamp", "tx_gas_price"]
 # Optional address filters (omit for all transfers)
 [transfers.filter]
 from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
-# to = ["0x..."]  # uncomment to filter by recipient
+# to = ["0x..."]  # filter by recipient
 
 # ── Webhook notifications ──────────────────────────────────────────────
 # Fires a JSON POST after each block is committed to the database.
@@ -62,7 +67,7 @@ from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
 # [[streams]]
 # name = "my_webhook"
 # type = "webhook"
-# url = "http://localhost:8080/sieve-events"
+# url = "http://localhost:8080/sieve-events"  # or omit and set WEBHOOK_URL
 # backfill = false   # skip during historical sync
 
 # ── RabbitMQ streaming ────────────────────────────────────────────────
@@ -72,7 +77,7 @@ from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
 # [[streams]]
 # name = "rabbitmq_events"
 # type = "rabbitmq"
-# url = "amqp://guest:guest@rabbitmq:5672/%2f"
+# url = "amqp://guest:guest@rabbitmq:5672/%2f"  # or omit and set RABBITMQ_URL
 # exchange = "sieve_events"
 # routing_key = "{table}.{event}"   # optional, this is the default
 # backfill = false
