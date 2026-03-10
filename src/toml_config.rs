@@ -1036,10 +1036,13 @@ fn resolve_streams(streams: &[TomlStream]) -> eyre::Result<Vec<ResolvedStream>> 
             return Err(eyre::eyre!("duplicate stream name '{}'", s.name));
         }
 
-        let url = s.url.as_deref().unwrap_or("").to_string();
-
         match s.stream_type.as_str() {
             "webhook" => {
+                let url = s
+                    .url
+                    .clone()
+                    .or_else(|| std::env::var("WEBHOOK_URL").ok())
+                    .unwrap_or_default();
                 if url.is_empty() {
                     return Err(eyre::eyre!(
                         "stream '{}' of type 'webhook' requires a 'url'",
@@ -1056,6 +1059,11 @@ fn resolve_streams(streams: &[TomlStream]) -> eyre::Result<Vec<ResolvedStream>> 
                 });
             }
             "rabbitmq" => {
+                let url = s
+                    .url
+                    .clone()
+                    .or_else(|| std::env::var("RABBITMQ_URL").ok())
+                    .unwrap_or_default();
                 if url.is_empty() {
                     return Err(eyre::eyre!(
                         "stream '{}' of type 'rabbitmq' requires a 'url'",
