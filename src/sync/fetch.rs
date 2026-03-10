@@ -3,6 +3,7 @@
 use crate::filter::BloomFilter;
 use crate::p2p::{
     fetch_headers_for_peer, fetch_payloads_for_headers, fetch_payloads_for_peer, NetworkPeer,
+    PeerPool,
 };
 use crate::sync::scheduler::{PeerHealthTracker, PeerWorkScheduler};
 use crate::sync::{BlockPayload, FetchMode};
@@ -120,6 +121,7 @@ fn ensure_consecutive(blocks: &[u64]) -> Result<()> {
 pub struct FetchTaskContext {
     pub scheduler: Arc<PeerWorkScheduler>,
     pub peer_health: Arc<PeerHealthTracker>,
+    pub pool: Arc<PeerPool>,
     pub payload_tx: mpsc::Sender<BlockPayload>,
     pub ready_tx: mpsc::UnboundedSender<NetworkPeer>,
     pub bloom_filter: Option<Arc<BloomFilter>>,
@@ -187,6 +189,9 @@ async fn handle_fetch_success(
     completed.extend_from_slice(&bloom_skipped);
     if !completed.is_empty() {
         let _ = ctx.scheduler.mark_completed(&completed).await;
+        if let Some(&max_block) = completed.iter().max() {
+            ctx.pool.update_peer_head(peer.peer_id, max_block);
+        }
     }
 
     let fetched_count = payloads.len();

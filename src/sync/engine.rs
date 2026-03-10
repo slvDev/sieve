@@ -219,6 +219,7 @@ pub async fn run_sync(
         payload_tx: &payload_tx,
         ready_tx: &ready_tx,
         bloom_filter: &ctx.bloom_filter,
+        head_seen_rx: &ctx.head_seen_rx,
     };
     run_fetch_loop(&fetch_ctx, ready_rx, &ctx.stop_rx).await;
 
@@ -295,6 +296,7 @@ struct FetchLoopContext<'a> {
     payload_tx: &'a mpsc::Sender<BlockPayload>,
     ready_tx: &'a mpsc::UnboundedSender<NetworkPeer>,
     bloom_filter: &'a Option<Arc<crate::filter::BloomFilter>>,
+    head_seen_rx: &'a Option<watch::Receiver<u64>>,
 }
 
 /// Mutable state carried across fetch loop iterations.
@@ -449,8 +451,15 @@ async fn dispatch_best_peer(
         return;
     }
 
-    // Head cap: use peer's head, or end_block if unprobed
-    let head_cap = if peer.head_number == 0 {
+    // Head cap: in follow mode use global observed head; otherwise per-peer head
+    let head_cap = if let Some(rx) = ctx.head_seen_rx {
+        let observed = *rx.borrow();
+        if observed > 0 {
+            observed
+        } else {
+            ctx.end_block.as_u64()
+        }
+    } else if peer.head_number == 0 {
         ctx.end_block.as_u64()
     } else {
         peer.head_number
@@ -484,6 +493,7 @@ async fn dispatch_best_peer(
     let task_ctx = FetchTaskContext {
         scheduler: Arc::clone(ctx.scheduler),
         peer_health: Arc::clone(ctx.peer_health),
+        pool: Arc::clone(ctx.pool),
         payload_tx: ctx.payload_tx.clone(),
         ready_tx: ctx.ready_tx.clone(),
         bloom_filter: ctx.bloom_filter.clone(),
@@ -524,8 +534,13 @@ async fn check_peer_eligibility(
         return Some(PeerAction::Recycle(500));
     }
 
-    // Stale-head detection: peer's probed head is below our work range
-    if peer.head_number > 0 && peer.head_number < ctx.start_block.as_u64() {
+    // Stale-head detection: peer's probed head is below our work range.
+    // Skip in follow mode — the head tracker verifies blocks exist on the network,
+    // and per-peer heads are stale (probed once at connect). Let fetches fail instead.
+    if ctx.head_seen_rx.is_none()
+        && peer.head_number > 0
+        && peer.head_number < ctx.start_block.as_u64()
+    {
         let gap = ctx.start_block.as_u64().saturating_sub(peer.head_number);
 
         // Peers more than 10k blocks behind are useless — drop entirely

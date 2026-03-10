@@ -59,6 +59,8 @@ pub struct SyncContext {
     /// Bloom filter for skipping blocks with no matching contract addresses.
     /// `None` when transfers, calls, or factories are configured.
     pub bloom_filter: Option<Arc<BloomFilter>>,
+    /// Global observed head from follow-mode head tracker (overrides per-peer head_cap).
+    pub head_seen_rx: Option<watch::Receiver<u64>>,
 }
 
 /// Full payload for a block: header, body, receipts.

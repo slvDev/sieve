@@ -133,11 +133,13 @@ impl PeerPool {
             .map(|p| p.head_number)
     }
 
-    /// Update a peer's head block number.
+    /// Update a peer's head block number (monotonic: only advances forward).
     pub fn update_peer_head(&self, peer_id: PeerId, head_number: u64) {
         let mut peers = self.peers.write();
         if let Some(peer) = peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            peer.head_number = head_number;
+            if head_number > peer.head_number {
+                peer.head_number = head_number;
+            }
         }
     }
 

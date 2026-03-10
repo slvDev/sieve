@@ -227,6 +227,7 @@ async fn build_sync_context(
         is_backfill: cli.end_block.is_some(),
         receipt_tables,
         bloom_filter,
+        head_seen_rx: None,
     })
 }
 

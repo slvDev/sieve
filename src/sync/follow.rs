@@ -38,6 +38,7 @@ struct FollowContext {
     event_table_map: Arc<HashMap<String, (String, String)>>,
     receipt_tables: Arc<std::collections::HashSet<String>>,
     bloom_filter: Option<Arc<crate::filter::BloomFilter>>,
+    head_seen_rx: watch::Receiver<u64>,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -50,6 +51,18 @@ struct FollowContext {
 #[instrument(skip_all, fields(start_block = start_block.as_u64()))]
 pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre::Result<()> {
     info!(start_block = start_block.as_u64(), "entering follow mode");
+
+    let baseline = ctx.db.last_checkpoint().await?.map_or_else(
+        || start_block.as_u64().saturating_sub(1),
+        BlockNumber::as_u64,
+    );
+    let (head_seen_tx, head_seen_rx) = watch::channel(0u64);
+    tokio::spawn(run_head_tracker(
+        Arc::clone(&ctx.pool),
+        head_seen_tx,
+        ctx.stop_rx.clone(),
+        baseline,
+    ));
 
     let fctx = FollowContext {
         pool: ctx.pool,
@@ -66,6 +79,7 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
         event_table_map: ctx.event_table_map,
         receipt_tables: ctx.receipt_tables,
         bloom_filter: ctx.bloom_filter,
+        head_seen_rx,
     };
 
     let mut last_heartbeat = Instant::now();
@@ -200,6 +214,7 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
         is_backfill: false,
         receipt_tables: Arc::clone(&ctx.receipt_tables),
         bloom_filter: ctx.bloom_filter.clone(),
+        head_seen_rx: Some(ctx.head_seen_rx.clone()),
     };
 
     let outcome = run_sync(
@@ -289,6 +304,37 @@ async fn execute_rollback(
     db::rollback_to(&mut tx, ancestor_block).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Background task that continuously probes P2P peers for the chain head.
+///
+/// Broadcasts the highest confirmed head via `head_seen_tx` so the fetch
+/// loop can use it as head_cap instead of stale per-peer heads.
+async fn run_head_tracker(
+    pool: Arc<PeerPool>,
+    head_seen_tx: watch::Sender<u64>,
+    mut stop_rx: watch::Receiver<bool>,
+    initial_baseline: u64,
+) {
+    let mut last_head = initial_baseline;
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() { break; }
+            }
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        if *stop_rx.borrow() {
+            break;
+        }
+        match discover_head_p2p(&pool, last_head, 3, 64).await {
+            Ok(Some(head)) if head > last_head => {
+                last_head = head;
+                let _ = head_seen_tx.send(head);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Sleep for `duration`, but return early if `stop_rx` signals shutdown.
