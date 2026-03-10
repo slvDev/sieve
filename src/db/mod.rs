@@ -35,6 +35,14 @@ impl Database {
     pub async fn connect(url: &str) -> eyre::Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(16)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET synchronous_commit = off")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(url)
             .await
             .wrap_err("failed to connect to database")?;
@@ -150,6 +158,32 @@ pub async fn store_block_hash(
     .execute(&mut **tx)
     .await
     .wrap_err("failed to store block hash")?;
+    Ok(())
+}
+
+/// Store multiple block hashes in a single UNNEST query.
+///
+/// # Errors
+///
+/// Returns an error if the batch INSERT fails.
+pub async fn store_block_hashes_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    block_numbers: &[i64],
+    block_hashes: &[Vec<u8>],
+) -> eyre::Result<()> {
+    if block_numbers.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO _sieve_block_hashes (block_number, block_hash) \
+         SELECT * FROM UNNEST($1::BIGINT[], $2::BYTEA[]) \
+         ON CONFLICT (block_number) DO UPDATE SET block_hash = EXCLUDED.block_hash",
+    )
+    .bind(block_numbers)
+    .bind(block_hashes)
+    .execute(&mut **tx)
+    .await
+    .wrap_err("failed to store block hashes")?;
     Ok(())
 }
 

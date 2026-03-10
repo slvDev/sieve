@@ -43,7 +43,7 @@ const MAX_CONCURRENT_FETCHES: usize = 32;
 const PAYLOAD_CHANNEL_SIZE: usize = 8192;
 
 /// Maximum number of blocks to batch in a single DB transaction.
-const BATCH_SIZE: usize = 64;
+const BATCH_SIZE: usize = 256;
 
 /// Channel buffer between processing workers and the DB writer.
 const PROCESSED_CHANNEL_SIZE: usize = 8192;
@@ -933,8 +933,9 @@ async fn flush_batch(
 
 /// Inner flush: open one transaction, store all blocks, commit.
 ///
-/// Phase 1: per-block preparation — store block hashes, factory children,
-/// build event contexts, scan transfers/calls, compute outcomes.
+/// Phase 0: batch store all block hashes in one UNNEST query.
+/// Phase 1: per-block preparation — factory children, build event contexts,
+/// scan transfers/calls, compute outcomes.
 /// Phase 2: batch insert — multi-row INSERT all events/transfers/calls.
 /// Phase 3: checkpoint + commit.
 async fn flush_batch_inner(
@@ -946,6 +947,17 @@ async fn flush_batch_inner(
     let mut all_events: Vec<(&decode::DecodedEvent, EventContext)> = Vec::new();
     let mut all_transfers: Vec<(NativeTransfer, EventContext)> = Vec::new();
     let mut all_calls: Vec<(DecodedCall, EventContext)> = Vec::new();
+
+    // Batch store all block hashes in one UNNEST query
+    let block_numbers: Vec<i64> = batch
+        .iter()
+        .map(|b| b.block_number.as_u64() as i64)
+        .collect();
+    let block_hashes: Vec<Vec<u8>> = batch
+        .iter()
+        .map(|b| b.block_hash.as_slice().to_vec())
+        .collect();
+    db::store_block_hashes_batch(&mut tx, &block_numbers, &block_hashes).await?;
 
     // Phase 1: per-block preparation
     for block in batch {
@@ -994,8 +1006,9 @@ async fn flush_batch_inner(
 
 /// Prepare one block's outcome and accumulate events/transfers/calls for batch insert.
 ///
-/// Stores block hashes and factory children (small, per-block). Accumulates
-/// events, transfers, and calls into the shared vecs for Phase 2 batch insert.
+/// Stores factory children (small, per-block). Accumulates events, transfers,
+/// and calls into the shared vecs for Phase 2 batch insert. Block hashes are
+/// stored in bulk by the caller via `store_block_hashes_batch`.
 async fn prepare_block_outcome<'a>(
     block: &'a ProcessedBlock,
     ctx: &ProcessContext<'_>,
@@ -1004,7 +1017,7 @@ async fn prepare_block_outcome<'a>(
     all_transfers: &mut Vec<(NativeTransfer, EventContext)>,
     all_calls: &mut Vec<(DecodedCall, EventContext)>,
 ) -> eyre::Result<ProcessOutcome> {
-    db::store_block_hash(tx, block.block_number, block.block_hash.as_slice()).await?;
+    // Block hashes are batched in flush_batch_inner via store_block_hashes_batch.
 
     // Persist factory discoveries within the batch transaction
     for d in &block.factory_discoveries {
