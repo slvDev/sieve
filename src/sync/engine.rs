@@ -1632,28 +1632,48 @@ fn scan_calls(
             tx_status: true,
         };
 
-        let dispatched = matched_tables.len() as u64;
-        for table_name in &matched_tables {
-            let entry = table_counts
-                .entry((*table_name).to_string())
-                .or_insert_with(|| (decoded_call.function_name.clone(), 0));
-            entry.1 = entry.1.saturating_add(1);
-            if has_streams {
-                let include = receipt_tables.contains(*table_name);
-                event_payloads.push(build_call_payload(
-                    &decoded_call,
-                    &context,
-                    table_name,
-                    include,
-                ));
-            }
-        }
+        count = count.saturating_add(track_call_tables(
+            &matched_tables,
+            &decoded_call,
+            &context,
+            has_streams,
+            event_payloads,
+            table_counts,
+            receipt_tables,
+        ));
 
         all_calls.push((decoded_call, context));
-        count = count.saturating_add(dispatched);
     }
 
     Ok(count)
+}
+
+/// Track per-table call counts and optionally build stream payloads.
+fn track_call_tables(
+    matched_tables: &[&str],
+    decoded_call: &DecodedCall,
+    context: &EventContext,
+    has_streams: bool,
+    event_payloads: &mut Vec<crate::stream::EventPayload>,
+    table_counts: &mut HashMap<String, (String, u64)>,
+    receipt_tables: &HashSet<String>,
+) -> u64 {
+    for table_name in matched_tables {
+        let entry = table_counts
+            .entry((*table_name).to_string())
+            .or_insert_with(|| (decoded_call.function_name.clone(), 0));
+        entry.1 = entry.1.saturating_add(1);
+        if has_streams {
+            let include = receipt_tables.contains(*table_name);
+            event_payloads.push(build_call_payload(
+                decoded_call,
+                context,
+                table_name,
+                include,
+            ));
+        }
+    }
+    matched_tables.len() as u64
 }
 
 /// Decode matched logs into events, logging any decode failures.

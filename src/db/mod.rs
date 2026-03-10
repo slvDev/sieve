@@ -144,6 +144,7 @@ pub async fn update_checkpoint(
 /// # Errors
 ///
 /// Returns an error if the INSERT/UPDATE query fails.
+#[cfg(test)]
 pub async fn store_block_hash(
     tx: &mut Transaction<'_, Postgres>,
     block_number: BlockNumber,

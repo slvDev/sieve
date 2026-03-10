@@ -116,15 +116,22 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     // GraphQL API (must be built before resolved_transfers/calls are consumed)
     maybe_spawn_api(cli, &startup, &db, &metrics, &stop_rx)?;
 
-    // Build maps that reference resolved events/transfers/calls before consuming them
-    let event_table_map = build_event_table_map(&startup.resolved_events);
-    let receipt_tables = Arc::new(build_receipt_tables(
-        &startup.resolved_events,
-        &startup.resolved_transfers,
-        &startup.resolved_calls,
-    ));
+    let start_block = startup.start_block;
+    let ctx = build_sync_context(cli, startup, &db, &metrics, stop_rx).await?;
 
-    // Build handlers from resolved events
+    run_indexer(cli, start_block, ctx).await
+}
+
+/// Build handler registries and related data from resolved config.
+fn build_registries(
+    startup: &StartupConfig,
+) -> (
+    Arc<handler::HandlerRegistry>,
+    Arc<handler::TransferRegistry>,
+    Arc<handler::CallRegistry>,
+    bool,
+    bool,
+) {
     let handlers: Vec<Box<dyn handler::EventHandler>> = startup
         .resolved_events
         .iter()
@@ -135,74 +142,92 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     let handlers = Arc::new(handler::HandlerRegistry::new(handlers));
     info!(handlers = handlers.len(), "registered event handlers");
 
+    let transfer_handler_vec: Vec<handler::TransferHandler> = startup
+        .resolved_transfers
+        .iter()
+        .cloned()
+        .map(handler::TransferHandler::new)
+        .collect();
+    let has_transfers = !transfer_handler_vec.is_empty();
+    let transfer_handlers = Arc::new(handler::TransferRegistry::new(transfer_handler_vec));
+
+    let call_handler_vec: Vec<handler::CallHandler> = startup
+        .resolved_calls
+        .iter()
+        .cloned()
+        .map(handler::CallHandler::new)
+        .collect();
+    let has_calls = !call_handler_vec.is_empty();
+    let call_handlers = Arc::new(handler::CallRegistry::new(call_handler_vec));
+
+    (
+        handlers,
+        transfer_handlers,
+        call_handlers,
+        has_transfers,
+        has_calls,
+    )
+}
+
+/// Build handler registries, connect P2P, and assemble the sync context.
+///
+/// # Errors
+///
+/// Returns an error on P2P connection or factory child loading failures.
+async fn build_sync_context(
+    cli: &cli::Cli,
+    startup: StartupConfig,
+    db: &Arc<db::Database>,
+    metrics: &Arc<metrics::SieveMetrics>,
+    stop_rx: watch::Receiver<bool>,
+) -> eyre::Result<sync::SyncContext> {
+    let event_table_map = build_event_table_map(&startup.resolved_events);
+    let receipt_tables = Arc::new(build_receipt_tables(
+        &startup.resolved_events,
+        &startup.resolved_transfers,
+        &startup.resolved_calls,
+    ));
+
+    let (handlers, transfer_handlers, call_handlers, has_transfers, has_calls) =
+        build_registries(&startup);
+
     let index_config = Arc::new(startup.index_config);
     info!(
         contracts = index_config.contracts.len(),
         "loaded index config"
     );
 
-    // Load persisted factory children from previous runs
     if !startup.factories.is_empty() {
-        db::load_factory_children(&db, &index_config).await?;
+        db::load_factory_children(db, &index_config).await?;
     }
     let factories = Arc::new(startup.factories);
 
-    // Build transfer handlers from resolved transfers
-    let transfer_handler_vec: Vec<handler::TransferHandler> = startup
-        .resolved_transfers
-        .into_iter()
-        .map(handler::TransferHandler::new)
-        .collect();
-    let has_transfers = !transfer_handler_vec.is_empty();
-    let transfer_handlers = Arc::new(handler::TransferRegistry::new(transfer_handler_vec));
-
-    // Build call handlers from resolved calls
-    let call_handler_vec: Vec<handler::CallHandler> = startup
-        .resolved_calls
-        .into_iter()
-        .map(handler::CallHandler::new)
-        .collect();
-    let has_calls = !call_handler_vec.is_empty();
-    let call_handlers = Arc::new(handler::CallRegistry::new(call_handler_vec));
-
     let bloom_filter = build_bloom_filter(&index_config, has_transfers, has_calls, &factories);
 
-    // Stream dispatcher (webhooks)
-    let stream_dispatcher = if startup.resolved_streams.is_empty() {
-        None
-    } else {
-        let sinks = build_stream_sinks(&startup.resolved_streams);
-        info!(streams = sinks.len(), "configured stream sinks");
-        Some(Arc::new(stream::StreamDispatcher::new(sinks, 256)))
-    };
+    let stream_dispatcher = build_stream_dispatcher(&startup.resolved_streams);
 
-    // P2P
     let session = p2p::connect_mainnet_peers().await?;
     info!(
         peers = session.pool.len(),
         "connected to ethereum p2p network"
     );
 
-    let is_backfill = cli.end_block.is_some();
-
-    let ctx = sync::SyncContext {
+    Ok(sync::SyncContext {
         pool: Arc::clone(&session.pool),
         config: index_config,
-        db,
+        db: Arc::clone(db),
         handlers,
-        metrics,
+        metrics: Arc::clone(metrics),
         stop_rx,
         factories,
         transfer_handlers,
         call_handlers,
         stream_dispatcher,
         event_table_map: Arc::new(event_table_map),
-        is_backfill,
+        is_backfill: cli.end_block.is_some(),
         receipt_tables,
         bloom_filter,
-    };
-
-    run_indexer(cli, startup.start_block, ctx).await
+    })
 }
 
 /// Resolved startup parameters from TOML config + CLI.
@@ -1012,6 +1037,18 @@ fn build_receipt_tables(
 
 /// Build stream sinks from resolved stream definitions.
 ///
+/// Build the stream dispatcher if any streams are configured.
+fn build_stream_dispatcher(
+    streams: &[toml_config::ResolvedStream],
+) -> Option<Arc<stream::StreamDispatcher>> {
+    if streams.is_empty() {
+        return None;
+    }
+    let sinks = build_stream_sinks(streams);
+    info!(streams = sinks.len(), "configured stream sinks");
+    Some(Arc::new(stream::StreamDispatcher::new(sinks, 256)))
+}
+
 /// Returns `Vec<(sink, backfill)>` for the `StreamDispatcher`.
 fn build_stream_sinks(
     streams: &[toml_config::ResolvedStream],

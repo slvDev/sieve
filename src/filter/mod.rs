@@ -36,7 +36,7 @@ pub struct BloomFilter {
 impl BloomFilter {
     /// Create a new bloom filter with the given contract addresses.
     #[must_use]
-    pub fn new(addresses: Vec<Address>) -> Self {
+    pub const fn new(addresses: Vec<Address>) -> Self {
         Self { addresses }
     }
 
