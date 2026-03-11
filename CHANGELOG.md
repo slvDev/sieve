@@ -2,7 +2,22 @@
 
 ## [Unreleased]
 
-- Added `--version` / `-V` flag to CLI
+## [0.1.3] - 2026-03-11
+
+### Added
+
+- `--version` / `-V` flag to CLI
+- `sieve init` now creates a working USDC Transfer config with ERC20 ABI (plug and play)
+- `sieve init --docker` generates a docker-compose.yml with PostgreSQL and healthcheck
+- Multi-platform Docker images (linux/amd64 + linux/arm64)
+
+### Changed
+
+- `sieve init` no longer creates docker-compose.yml by default (use `--docker`)
+
+### Fixed
+
+- Release workflow: filter artifacts to skip Docker buildx cache metadata
 
 ## [0.1.2] - 2026-03-11
 
