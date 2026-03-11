@@ -38,8 +38,12 @@ pub struct Cli {
 /// Utility subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Scaffold a new Sieve project (creates sieve.toml and abis/ directory).
-    Init,
+    /// Scaffold a new Sieve project (creates sieve.toml and abis/erc20.json).
+    Init {
+        /// Also generate a docker-compose.yml for running Sieve with PostgreSQL.
+        #[arg(long)]
+        docker: bool,
+    },
     /// Print the SQL DDL that Sieve would generate from the config.
     Schema,
     /// Drop all tables and recreate them (like --fresh without starting the indexer).
@@ -156,7 +160,14 @@ mod tests {
     #[test]
     fn parse_init_subcommand() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["sieve", "init"])?;
-        assert!(matches!(cli.command, Some(Command::Init)));
+        assert!(matches!(cli.command, Some(Command::Init { docker: false })));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_init_with_docker_flag() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "init", "--docker"])?;
+        assert!(matches!(cli.command, Some(Command::Init { docker: true })));
         Ok(())
     }
 

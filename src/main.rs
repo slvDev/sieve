@@ -49,7 +49,7 @@ async fn main() -> eyre::Result<()> {
     // Route subcommands
     if let Some(ref command) = cli.command {
         return match command {
-            cli::Command::Init => cmd_init(&cli),
+            cli::Command::Init { docker } => cmd_init(&cli, *docker),
             cli::Command::Schema => cmd_schema(&cli),
             cli::Command::Reset => cmd_reset(&cli).await,
             cli::Command::AddContract {
@@ -337,7 +337,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 ///
 /// Returns an error if the config file already exists or file I/O fails.
 #[expect(clippy::print_stdout, reason = "CLI output for init command")]
-fn cmd_init(cli: &cli::Cli) -> eyre::Result<()> {
+fn cmd_init(cli: &cli::Cli, docker: bool) -> eyre::Result<()> {
     let config_path = Path::new(&cli.config);
     if config_path.exists() {
         return Err(eyre::eyre!("{} already exists", cli.config));
@@ -349,25 +349,61 @@ fn cmd_init(cli: &cli::Cli) -> eyre::Result<()> {
     let template = r#"[database]
 url = "postgres://postgres:sieve@localhost:5432/sieve"
 
-# [[contracts]]
-# name = "MyContract"
-# address = "0x..."
-# abi = "abis/my_contract.json"
-# start_block = 21_000_000
-#
-# [[contracts.events]]
-# name = "Transfer"
-# table = "my_transfers"
-# context = ["block_timestamp", "tx_from"]
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21_000_000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+context = ["block_timestamp", "tx_from"]
+columns = [
+  { param = "from",  name = "from_address", type = "text" },
+  { param = "to",    name = "to_address",   type = "text" },
+  { param = "value", name = "value",        type = "numeric" },
+]
 "#;
 
     std::fs::write(config_path, template)
         .map_err(|e| eyre::eyre!("failed to write {}: {e}", cli.config))?;
 
-    let compose_path = Path::new("docker-compose.yml");
-    if !compose_path.exists() {
-        let compose = r#"services:
-  postgres:
+    // Write minimal ERC20 ABI (Transfer + Approval events)
+    let abi_path = Path::new("abis/erc20.json");
+    if !abi_path.exists() {
+        let erc20_abi = r#"[
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "name": "from", "type": "address" },
+      { "indexed": true, "name": "to", "type": "address" },
+      { "indexed": false, "name": "value", "type": "uint256" }
+    ],
+    "name": "Transfer",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "name": "owner", "type": "address" },
+      { "indexed": true, "name": "spender", "type": "address" },
+      { "indexed": false, "name": "value", "type": "uint256" }
+    ],
+    "name": "Approval",
+    "type": "event"
+  }
+]
+"#;
+        std::fs::write(abi_path, erc20_abi)
+            .map_err(|e| eyre::eyre!("failed to write abis/erc20.json: {e}"))?;
+    }
+
+    if docker {
+        let compose_path = Path::new("docker-compose.yml");
+        if !compose_path.exists() {
+            let compose = r#"services:
+  db:
     image: postgres:16
     environment:
       POSTGRES_PASSWORD: sieve
@@ -376,6 +412,11 @@ url = "postgres://postgres:sieve@localhost:5432/sieve"
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sieve"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   sieve:
     image: ghcr.io/slvdev/sieve:latest
@@ -384,26 +425,26 @@ url = "postgres://postgres:sieve@localhost:5432/sieve"
       - "30303:30303"
       - "30303:30303/udp"
     depends_on:
-      - postgres
-    command:
-      - "--config"
-      - "/app/sieve.toml"
-      - "--database-url"
-      - "postgres://postgres:sieve@postgres:5432/sieve"
-      - "--api-port"
-      - "4000"
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:sieve@db:5432/sieve
+    command: ["--api-port", "4000"]
     volumes:
       - ./sieve.toml:/app/sieve.toml:ro
       - ./abis:/app/abis:ro
+    restart: unless-stopped
 
 volumes:
   pgdata:
 "#;
-        std::fs::write(compose_path, compose)
-            .map_err(|e| eyre::eyre!("failed to write docker-compose.yml: {e}"))?;
+            std::fs::write(compose_path, compose)
+                .map_err(|e| eyre::eyre!("failed to write docker-compose.yml: {e}"))?;
+        }
+        println!("created {}, abis/erc20.json, and docker-compose.yml", cli.config);
+    } else {
+        println!("created {} and abis/erc20.json", cli.config);
     }
-
-    println!("created {}, abis/, and docker-compose.yml", cli.config);
     Ok(())
 }
 
