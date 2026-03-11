@@ -8,21 +8,28 @@ services:
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sieve"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   sieve:
-    build: .
+    image: ghcr.io/slvdev/sieve:latest
     ports:
       - "4000:4000"
       - "30303:30303"
       - "30303:30303/udp"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://postgres:sieve@db:5432/sieve
-    command: ["--config", "/app/sieve.toml", "--api-port", "4000"]
+    command: ["--api-port", "4000"]
     volumes:
       - ./sieve.toml:/app/sieve.toml:ro
       - ./abis:/app/abis:ro
+    restart: unless-stopped
 
 volumes:
   pgdata:
