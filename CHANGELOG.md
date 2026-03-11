@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-03-11
+
+### Changed
+
+- Docker images built from pre-compiled binaries instead of compiling in CI (~30s vs 40+ min)
+
 ## [0.1.3] - 2026-03-11
 
 ### Added
