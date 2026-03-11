@@ -414,6 +414,16 @@ Sieve syncs block headers and receipts over Ethereum's devp2p protocol, filters 
 - **Follow mode** — after historical sync, follows the chain head in real-time
 - **Graceful shutdown** — Ctrl+C stops cleanly, progress is saved
 
+## FAQ
+
+**Can I filter by non-indexed event parameters (e.g., an address in the log data)?**
+
+Not currently. Sieve filters at sync time using Ethereum log topics (topic0–topic3), which only contain indexed parameters. Non-indexed parameters are decoded and stored in Postgres, but can't be filtered before insertion. You can filter them after the fact using SQL or the GraphQL API. A post-decode value filter is on the roadmap.
+
+**What happens if two contracts emit events with the same name but different parameters?**
+
+No collision. Topic0 is the keccak256 hash of the full event signature including parameter types — `Transfer(address,address,uint256)` and `Transfer(address,address,uint256,uint256)` produce different topic0 hashes. Sieve also filters by contract address first, so even identical events on different contracts are fully isolated. If you see decode warnings, it's likely a mismatched ABI (e.g., a proxy contract forwarding events with a different signature than the ABI specifies).
+
 ## Acknowledgments
 
 Sieve's P2P sync engine is built on [SHiNode](https://github.com/vicnaum/shinode), a high-performance Ethereum node that proved 1000+ blocks/sec sync over devp2p. The networking layer uses [Reth](https://github.com/paradigmxyz/reth) crates for Ethereum P2P protocol support.
