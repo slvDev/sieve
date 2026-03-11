@@ -43,10 +43,12 @@ Run `sieveup` anytime to update to the latest version.
 ### 2. Configure
 
 ```bash
-sieve init                        # creates sieve.toml and abis/
-sieve add-contract 0xA0b8... \    # fetch ABI from Etherscan, add to config
+sieve init                        # creates sieve.toml + abis/erc20.json (USDC Transfer, ready to run)
+sieve add-contract 0xA0b8... \    # or fetch any contract ABI from Etherscan
   --etherscan-api-key $KEY
 ```
+
+`sieve init` creates a working USDC Transfer config out of the box — plug and play. Add `--docker` to also generate a `docker-compose.yml` with PostgreSQL.
 
 Or write the TOML yourself:
 
@@ -289,7 +291,8 @@ Auto-generated from your TOML config. Every table gets:
 
 ```
 sieve [OPTIONS]                Run the indexer
-sieve init                     Scaffold a new project (sieve.toml + abis/)
+sieve init                     Scaffold a new project (sieve.toml + abis/erc20.json)
+sieve init --docker            Same + docker-compose.yml with PostgreSQL
 sieve schema                   Print generated SQL DDL
 sieve reset                    Drop and recreate all tables
 sieve inspect                  Dry-run: show tables, columns, and filters
@@ -303,6 +306,7 @@ Options:
   --database-url <URL>    PostgreSQL URL (or DATABASE_URL env var)
   --api-port <PORT>       Enable GraphQL API on this port
   --fresh                 Drop and recreate all tables before indexing
+  -V, --version           Print version
 ```
 
 ### API Endpoints
@@ -361,11 +365,11 @@ sieve peers
 ### Docker Compose
 
 ```bash
-cp sieve.example.toml sieve.toml   # edit for your contracts
-docker compose up -d
+sieve init --docker               # creates sieve.toml, abis/, and docker-compose.yml
+docker compose up -d              # starts PostgreSQL + Sieve
 ```
 
-Starts PostgreSQL and Sieve with GraphQL API on port 4000.
+Starts PostgreSQL and Sieve with GraphQL API on port 4000. Edit `sieve.toml` for your contracts, or use the default USDC Transfer config.
 
 ### Manual build
 
@@ -376,7 +380,7 @@ docker run \
   -v ./sieve.toml:/app/sieve.toml:ro \
   -v ./abis:/app/abis:ro \
   -p 4000:4000 -p 30303:30303 -p 30303:30303/udp \
-  sieve --config /app/sieve.toml --database-url postgres://... --api-port 4000
+  sieve --database-url postgres://... --api-port 4000
 ```
 
 Config and ABIs are mounted as volumes, not baked into the image. One image works for dev, staging, and production.
