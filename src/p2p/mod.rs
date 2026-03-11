@@ -43,7 +43,6 @@ const MAX_INBOUND: usize = 200;
 const MAX_CONCURRENT_DIALS: usize = 200;
 const PEER_REFILL_INTERVAL_MS: u64 = 500;
 const MAX_HEADERS_PER_REQUEST: usize = 1024;
-
 // ── NetworkPeer ──────────────────────────────────────────────────────
 
 /// Active peer session information used for requests.
@@ -255,7 +254,6 @@ pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
 
     let net_config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
         .mainnet_boot_nodes()
-        .with_unused_ports()
         .peer_config(peers_config)
         .disable_tx_gossip(true)
         .block_import(Box::new(ProofOfStakeBlockImport::default()))
