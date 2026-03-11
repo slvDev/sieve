@@ -1,12 +1,9 @@
-target/
-shinode/
 .git/
+.github/
 .idea/
 .vscode/
 .DS_Store
+*.md
 *.swp
-CLAUDE.md
-DEVPLAN.md
-COMPETITORS.md
-TODO.md
-context.md
+target/
+abis/
