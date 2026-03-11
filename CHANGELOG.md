@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added `--version` / `-V` flag to CLI
+
 ## [0.1.2] - 2026-03-11
 
 ### Fixed

@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 /// Ethereum event indexer over P2P.
 #[derive(Debug, Parser)]
-#[command(name = "sieve", about = "Ethereum event indexer over P2P")]
+#[command(name = "sieve", version, about = "Ethereum event indexer over P2P")]
 pub struct Cli {
     /// Path to the TOML config file.
     #[arg(long, default_value = "sieve.toml", global = true)]
