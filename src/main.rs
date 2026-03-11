@@ -400,9 +400,23 @@ columns = [
     }
 
     if docker {
-        let compose_path = Path::new("docker-compose.yml");
-        if !compose_path.exists() {
-            let compose = r#"services:
+        write_docker_compose()?;
+        println!(
+            "created {}, abis/erc20.json, and docker-compose.yml",
+            cli.config
+        );
+    } else {
+        println!("created {} and abis/erc20.json", cli.config);
+    }
+    Ok(())
+}
+
+fn write_docker_compose() -> eyre::Result<()> {
+    let compose_path = Path::new("docker-compose.yml");
+    if compose_path.exists() {
+        return Ok(());
+    }
+    let compose = r#"services:
   db:
     image: postgres:16
     environment:
@@ -438,14 +452,8 @@ columns = [
 volumes:
   pgdata:
 "#;
-            std::fs::write(compose_path, compose)
-                .map_err(|e| eyre::eyre!("failed to write docker-compose.yml: {e}"))?;
-        }
-        println!("created {}, abis/erc20.json, and docker-compose.yml", cli.config);
-    } else {
-        println!("created {} and abis/erc20.json", cli.config);
-    }
-    Ok(())
+    std::fs::write(compose_path, compose)
+        .map_err(|e| eyre::eyre!("failed to write docker-compose.yml: {e}"))
 }
 
 /// Print the SQL DDL that Sieve would generate from the config.
