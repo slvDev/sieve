@@ -125,6 +125,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: sieve-*
       - name: Generate checksums
         run: |
           cd artifacts
