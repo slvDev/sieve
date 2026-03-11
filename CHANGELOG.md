@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-03-11
+
+### Fixed
+
+- Use default P2P port 30303 instead of random ephemeral ports (enables inbound peer connections)
+
+### Changed
+
+- Docker builds use cargo-chef for cached dependency compilation (~2-5 min rebuilds vs 20-25 min)
+- docker-compose.yml uses pre-built GHCR image instead of building from source
+- Added health check and restart policy to docker-compose.yml
+
 ## [0.1.1] - 2026-03-11
 
 ### Fixed
