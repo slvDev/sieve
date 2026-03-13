@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Follow-mode peer eviction: `mark_peer_success` was dead code, causing all peers to be evicted after 120s idle at the tip (peers=0 loop)
+- Head probe responses now refresh peer liveness, preventing eviction during idle periods
+
 ## [0.1.4] - 2026-03-11
 
 ### Changed

@@ -164,7 +164,6 @@ impl PeerPool {
     }
 
     /// Update last-success timestamp for a peer.
-    #[expect(dead_code, reason = "called from sync engine on successful fetches")]
     pub fn mark_peer_success(&self, peer_id: PeerId) {
         let mut peers = self.peers.write();
         if let Some(peer) = peers.iter_mut().find(|p| p.peer_id == peer_id) {
@@ -503,6 +502,7 @@ pub async fn discover_head_p2p(
         let peer = &peers[(start_idx + offset) % len];
         match request_headers_batch(peer, start, probe_limit).await {
             Ok(headers) => {
+                pool.mark_peer_success(peer.peer_id);
                 if let Some(last) = headers.last() {
                     best = best.max(last.number);
                 }

@@ -192,6 +192,7 @@ async fn handle_fetch_success(
         if let Some(&max_block) = completed.iter().max() {
             ctx.pool.update_peer_head(peer.peer_id, max_block);
         }
+        ctx.pool.mark_peer_success(peer.peer_id);
     }
 
     let fetched_count = payloads.len();
