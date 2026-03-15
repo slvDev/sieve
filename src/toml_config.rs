@@ -19,6 +19,8 @@ use tracing::info;
 pub struct SieveConfig {
     /// Optional database configuration.
     pub database: Option<DatabaseConfig>,
+    /// Optional API configuration.
+    pub api: Option<ApiConfig>,
     /// Contracts to index.
     pub contracts: Vec<TomlContract>,
     /// Native ETH transfer definitions.
@@ -34,6 +36,13 @@ pub struct SieveConfig {
 pub struct DatabaseConfig {
     /// PostgreSQL connection URL.
     pub url: Option<String>,
+}
+
+/// API section.
+#[derive(Debug, Deserialize)]
+pub struct ApiConfig {
+    /// Port for the GraphQL API server (default: 4000).
+    pub port: Option<u16>,
 }
 
 /// A contract definition from TOML.

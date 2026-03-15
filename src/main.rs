@@ -108,7 +108,7 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
             &cli.config,
             &startup.database_url,
             &table_names,
-            cli.api_port,
+            startup.api_port,
         );
     }
 
@@ -133,7 +133,7 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     let metrics = Arc::new(metrics::SieveMetrics::new());
 
     // GraphQL API (must be built before resolved_transfers/calls are consumed)
-    maybe_spawn_api(cli, &startup, &db, &metrics, &stop_rx)?;
+    maybe_spawn_api(startup.api_port, &startup, &db, &metrics, &stop_rx)?;
 
     let start_block = startup.start_block;
     let ctx = build_sync_context(cli, startup, &db, &metrics, stop_rx).await?;
@@ -274,6 +274,7 @@ async fn build_sync_context(
 #[derive(Debug)]
 struct StartupConfig {
     database_url: String,
+    api_port: Option<u16>,
     index_config: config::IndexConfig,
     resolved_events: Vec<toml_config::ResolvedEvent>,
     factories: Vec<toml_config::ResolvedFactory>,
@@ -330,6 +331,11 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
     let startup = load_resolved_config(cli)?;
     let database_url = resolve_database_url(cli, &startup.sieve_config)?;
 
+    // Resolve API port: CLI > TOML. None = API disabled.
+    let api_port = cli
+        .api_port
+        .or_else(|| startup.sieve_config.api.as_ref().and_then(|a| a.port));
+
     // Compute effective start_block: CLI override or minimum across contracts, factories, and transfers
     let start_block = BlockNumber::new(cli.start_block.unwrap_or_else(|| {
         let contract_min = startup
@@ -358,6 +364,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 
     Ok(StartupConfig {
         database_url,
+        api_port,
         index_config: startup.resolved.index_config,
         resolved_events: startup.resolved.resolved_events,
         factories: startup.resolved.factories,
@@ -387,6 +394,9 @@ fn cmd_init(cli: &cli::Cli, docker: bool) -> eyre::Result<()> {
 
     let template = r#"[database]
 url = "postgres://postgres:sieve@localhost:5432/sieve"
+
+[api]
+port = 4000  # omit [api] section to disable GraphQL
 
 [[contracts]]
 name = "USDC"
@@ -482,7 +492,6 @@ fn write_docker_compose() -> eyre::Result<()> {
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://postgres:sieve@db:5432/sieve
-    command: ["--api-port", "4000"]
     volumes:
       - ./sieve.toml:/app/sieve.toml:ro
       - ./abis:/app/abis:ro
@@ -1035,17 +1044,15 @@ async fn shutdown_handler(stop_tx: watch::Sender<bool>, verbose: bool) {
     std::process::exit(130);
 }
 
-/// Build the event table map: `"contract:event"` → `(table_name, event_name)`.
-///
-/// Spawn the GraphQL API server if `--api-port` is set.
+/// Spawn the GraphQL API server if configured.
 fn maybe_spawn_api(
-    cli: &cli::Cli,
+    api_port: Option<u16>,
     startup: &StartupConfig,
     db: &Arc<db::Database>,
     metrics: &Arc<metrics::SieveMetrics>,
     stop_rx: &watch::Receiver<bool>,
 ) -> eyre::Result<()> {
-    let Some(api_port) = cli.api_port else {
+    let Some(port) = api_port else {
         return Ok(());
     };
     let schema = api::build_schema(
@@ -1057,7 +1064,7 @@ fn maybe_spawn_api(
     let api_stop = stop_rx.clone();
     let api_metrics = Arc::clone(metrics);
     tokio::spawn(async move {
-        if let Err(e) = api::run_api_server(api_port, schema, api_metrics, api_stop).await {
+        if let Err(e) = api::run_api_server(port, schema, api_metrics, api_stop).await {
             tracing::error!(error = %e, "API server error");
         }
     });

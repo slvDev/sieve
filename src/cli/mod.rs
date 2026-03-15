@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(long)]
     pub end_block: Option<u64>,
 
-    /// Port for the GraphQL API server. Omit to disable.
+    /// Override the GraphQL API port (default: 4000, configurable in TOML).
     #[arg(long)]
     pub api_port: Option<u16>,
 

@@ -6,9 +6,11 @@
 
 - Pretty terminal UI: startup banner, animated spinners, progress bar with ETA, follow status with block age (suppressed with `--verbose`)
 - `--verbose` / `-v` flag to use tracing logs instead of pretty UI
+- `[api].port` TOML config for GraphQL API (omit to disable, `--api-port` overrides)
 
 ### Fixed
 
+- GraphQL API now serves on `/graphql` path (was only `/`)
 - Follow-mode peer eviction: `mark_peer_success` was dead code, causing all peers to be evicted after 120s idle at the tip (peers=0 loop)
 - Head probe responses now refresh peer liveness, preventing eviction during idle periods
 

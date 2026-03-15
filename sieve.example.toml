@@ -8,6 +8,9 @@
 [database]
 url = "postgres://postgres:sieve@localhost:5432/sieve"  # or omit and set DATABASE_URL
 
+[api]
+port = 4000  # GraphQL API port (default: 4000, override with --api-port)
+
 [[contracts]]
 name = "USDC"
 address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"

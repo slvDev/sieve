@@ -56,6 +56,7 @@ pub async fn run_api_server(
 
     let app = Router::new()
         .route("/", get(graphiql_handler).post(graphql_handler))
+        .route("/graphql", get(graphiql_handler).post(graphql_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/ready", get(ready_handler))
@@ -83,7 +84,7 @@ async fn graphql_handler(State(state): State<ApiState>, req: GraphQLRequest) -> 
 async fn graphiql_handler() -> impl IntoResponse {
     Html(
         async_graphql::http::GraphiQLSource::build()
-            .endpoint("/")
+            .endpoint("/graphql")
             .finish(),
     )
 }
