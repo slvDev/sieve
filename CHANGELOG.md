@@ -13,6 +13,7 @@
 ### Changed
 
 - **Breaking:** all sensitive URLs removed from TOML — use `.env` file instead (`DATABASE_URL`, `WEBHOOK_URL`, `RABBITMQ_URL`)
+- `--fresh` log downgraded from warn to info (hidden in pretty mode, visible with `--verbose`)
 
 ### Fixed
 

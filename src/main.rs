@@ -981,7 +981,7 @@ async fn run_indexer(
 async fn setup_database(cli: &cli::Cli, startup: &StartupConfig) -> eyre::Result<db::Database> {
     let db = db::Database::connect(&startup.database_url).await?;
     if cli.fresh {
-        warn!("--fresh: dropping all tables");
+        info!("--fresh: dropping all tables");
         db::drop_all_tables(
             &db,
             &startup.resolved_events,
