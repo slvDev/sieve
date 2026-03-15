@@ -33,6 +33,10 @@ pub struct Cli {
     /// Drop and recreate all tables before indexing. Use to start fresh.
     #[arg(long)]
     pub fresh: bool,
+
+    /// Enable verbose tracing output (default: pretty UI).
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
 }
 
 /// Utility subcommands.
@@ -154,6 +158,27 @@ mod tests {
     fn fresh_flag_parsed() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["sieve", "--fresh"])?;
         assert!(cli.fresh);
+        Ok(())
+    }
+
+    #[test]
+    fn verbose_defaults_to_false() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve"])?;
+        assert!(!cli.verbose);
+        Ok(())
+    }
+
+    #[test]
+    fn verbose_short_flag_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "-v"])?;
+        assert!(cli.verbose);
+        Ok(())
+    }
+
+    #[test]
+    fn verbose_long_flag_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "--verbose"])?;
+        assert!(cli.verbose);
         Ok(())
     }
 

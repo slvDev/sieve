@@ -5,6 +5,7 @@
 ### Added
 
 - Pretty terminal UI: startup banner, animated spinners, progress bar with ETA, follow status with block age (suppressed with `--verbose`)
+- `--verbose` / `-v` flag to use tracing logs instead of pretty UI
 
 ### Fixed
 
