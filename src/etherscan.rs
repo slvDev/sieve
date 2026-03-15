@@ -47,6 +47,59 @@ pub async fn fetch_contract_info(address: &str, api_key: &str) -> eyre::Result<C
     })
 }
 
+/// Fetch the block number at which a contract was deployed.
+///
+/// Uses the Etherscan V2 `getcontractcreation` endpoint.
+/// Returns `None` if the creation info is unavailable.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP request fails or the response cannot be parsed.
+pub async fn fetch_creation_block(address: &str, api_key: &str) -> eyre::Result<Option<u64>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+
+    let url = format!(
+        "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getcontractcreation&contractaddresses={address}&apikey={api_key}"
+    );
+
+    let resp: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| eyre::eyre!("etherscan request failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| eyre::eyre!("etherscan response parse failed: {e}"))?;
+
+    parse_creation_response(&resp)
+}
+
+/// Parse the Etherscan `getcontractcreation` JSON response.
+fn parse_creation_response(resp: &serde_json::Value) -> eyre::Result<Option<u64>> {
+    let status = resp["status"].as_str().unwrap_or("0");
+    if status != "1" {
+        return Ok(None);
+    }
+
+    let block_str = resp["result"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|r| r["blockNumber"].as_str());
+
+    match block_str {
+        Some(s) => {
+            let block = s
+                .parse::<u64>()
+                .map_err(|e| eyre::eyre!("failed to parse creation block number: {e}"))?;
+            Ok(Some(block))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Fetch raw source info for a single address.
 ///
 /// Returns `(contract_name, abi_json, implementation_address)`.
@@ -194,6 +247,41 @@ mod tests {
             format!("{result:?}").contains("NOTOK"),
             "error should contain API message"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_creation_block() -> eyre::Result<()> {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "status": "1",
+                "message": "OK",
+                "result": [{
+                    "contractAddress": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                    "contractCreator": "0x95ba4cf87d6723ad9c0db21737d862be44a680de",
+                    "txHash": "0x2f1c5c2b44f771e942a8506148e256f94f1a464babc938ae0690c6e34cd79190",
+                    "blockNumber": "6082465"
+                }]
+            }"#,
+        )?;
+
+        let block = parse_creation_response(&json)?;
+        assert_eq!(block, Some(6_082_465));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_creation_block_not_found() -> eyre::Result<()> {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "status": "0",
+                "message": "No data found",
+                "result": []
+            }"#,
+        )?;
+
+        let block = parse_creation_response(&json)?;
+        assert_eq!(block, None);
         Ok(())
     }
 }

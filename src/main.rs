@@ -621,6 +621,14 @@ async fn cmd_add_contract(
 
     let info = etherscan::fetch_contract_info(&checksummed, api_key).await?;
 
+    // Fetch creation block if not provided via --start-block
+    let start_block = match start_block {
+        Some(b) => Some(b),
+        None => etherscan::fetch_creation_block(&checksummed, api_key)
+            .await
+            .unwrap_or(None),
+    };
+
     let contract_name = name_override.map_or_else(
         || {
             if info.name.is_empty() {
@@ -666,15 +674,15 @@ async fn cmd_add_contract(
     file.write_all(toml_block.as_bytes())
         .map_err(|e| eyre::eyre!("failed to write to {}: {e}", cli.config))?;
 
-    println!(
-        "added {contract_name} ({} events) to {}",
-        events.len(),
-        cli.config
-    );
-    println!("  abi: {abi_path}");
     if info.is_proxy {
-        println!("  note: proxy detected — using implementation ABI");
+        println!("  \u{2713} Proxy detected \u{2192} implementation {}", info.name);
     }
+    let block_info = start_block.map_or_else(String::new, |b| format!(", start_block={b}"));
+    println!(
+        "  \u{2713} Added {contract_name} to {}\n    {} events{block_info}",
+        cli.config,
+        events.len(),
+    );
     Ok(())
 }
 

@@ -9,6 +9,7 @@
 - `[api].port` TOML config for GraphQL API (omit to disable, `--api-port` overrides)
 - `.env` file support via `dotenvy` — `DATABASE_URL` loaded automatically
 - `sieve init` now creates `.env` with default database URL
+- `add-contract` auto-fetches deploy block from Etherscan as `start_block` (override with `--start-block`)
 
 ### Changed
 
