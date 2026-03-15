@@ -816,7 +816,15 @@ async fn consume_payloads(
             .await;
         }
 
-        log_sync_progress(&stats, &mut last_log, total_blocks, &pool, started_at, verbose, &stop_rx);
+        log_sync_progress(
+            &stats,
+            &mut last_log,
+            total_blocks,
+            &pool,
+            started_at,
+            verbose,
+            &stop_rx,
+        );
     }
 
     stats
@@ -1154,9 +1162,10 @@ fn update_batch_stats(
         if outcome.block_number > *max_indexed_block {
             *max_indexed_block = outcome.block_number;
             metrics.indexed_block.set(outcome.block_number as i64);
-            metrics
-                .last_block_timestamp
-                .store(outcome.block_timestamp, std::sync::atomic::Ordering::Relaxed);
+            metrics.last_block_timestamp.store(
+                outcome.block_timestamp,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 }

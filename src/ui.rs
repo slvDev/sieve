@@ -233,7 +233,10 @@ fn format_block_age(block_timestamp: u64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let age = now.saturating_sub(block_timestamp);
-    format!(" {} ago | ", format_duration(std::time::Duration::from_secs(age)))
+    format!(
+        " {} ago | ",
+        format_duration(std::time::Duration::from_secs(age))
+    )
 }
 
 /// Pad a label to a fixed width and dim it.

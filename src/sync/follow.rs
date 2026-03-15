@@ -170,9 +170,7 @@ async fn run_follow_epoch(
     spinner_stop: &mut Option<watch::Sender<bool>>,
 ) -> eyre::Result<bool> {
     match discover_gap(ctx).await? {
-        EpochAction::Wait => {
-            Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await)
-        }
+        EpochAction::Wait => Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await),
         EpochAction::Reorg => Ok(false),
         EpochAction::Sync { next_block, head } => {
             // Stop discovering spinner before sync starts

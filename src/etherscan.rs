@@ -32,8 +32,7 @@ pub async fn fetch_contract_info(address: &str, api_key: &str) -> eyre::Result<C
 
     // If proxy, fetch implementation ABI and use implementation name
     if !implementation.is_empty() {
-        let (impl_name, impl_abi, _) =
-            fetch_source_code(&client, &implementation, api_key).await?;
+        let (impl_name, impl_abi, _) = fetch_source_code(&client, &implementation, api_key).await?;
         return Ok(ContractInfo {
             name: impl_name,
             abi_json: impl_abi,

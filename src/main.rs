@@ -107,7 +107,12 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
             .resolved_events
             .iter()
             .map(|e| e.table_name.as_str())
-            .chain(startup.resolved_transfers.iter().map(|t| t.table_name.as_str()))
+            .chain(
+                startup
+                    .resolved_transfers
+                    .iter()
+                    .map(|t| t.table_name.as_str()),
+            )
             .chain(startup.resolved_calls.iter().map(|c| c.table_name.as_str()))
             .collect();
         ui::print_banner(
@@ -485,7 +490,10 @@ columns = [
         println!("  {check} docker-compose.yml");
         println!("\n  Run {} to start", "docker compose up".green());
     } else {
-        println!("\n  Run {} to start indexing USDC transfers", "sieve".green());
+        println!(
+            "\n  Run {} to start indexing USDC transfers",
+            "sieve".green()
+        );
     }
     Ok(())
 }
@@ -651,8 +659,11 @@ async fn cmd_add_contract(
         let mut spinner = ui::Spinner::new();
         loop {
             let mut stderr = std::io::stderr();
-            let _ =
-                write!(stderr, "\x1b[2K\r  {} Fetching ABI from Etherscan...", spinner.frame());
+            let _ = write!(
+                stderr,
+                "\x1b[2K\r  {} Fetching ABI from Etherscan...",
+                spinner.frame()
+            );
             stderr.flush().ok();
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_millis(80)) => {}
@@ -723,7 +734,10 @@ async fn cmd_add_contract(
 
     let check = "\u{2713}".green();
     if info.is_proxy {
-        println!("  {check} Proxy detected \u{2192} implementation {}", info.name);
+        println!(
+            "  {check} Proxy detected \u{2192} implementation {}",
+            info.name
+        );
     }
     let block_info = start_block.map_or_else(String::new, |b| format!(", start_block={b}"));
     println!(
