@@ -19,6 +19,8 @@ use tracing::info;
 pub struct SieveConfig {
     /// Optional API configuration.
     pub api: Option<ApiConfig>,
+    /// Optional P2P configuration.
+    pub p2p: Option<P2pConfig>,
     /// Contracts to index.
     pub contracts: Vec<TomlContract>,
     /// Native ETH transfer definitions.
@@ -33,6 +35,13 @@ pub struct SieveConfig {
 #[derive(Debug, Deserialize)]
 pub struct ApiConfig {
     /// Port for the GraphQL API server (default: 4000).
+    pub port: Option<u16>,
+}
+
+/// P2P section.
+#[derive(Debug, Deserialize)]
+pub struct P2pConfig {
+    /// Port for the P2P listener (default: 30303).
     pub port: Option<u16>,
 }
 

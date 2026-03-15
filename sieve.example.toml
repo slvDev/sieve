@@ -8,6 +8,9 @@
 [api]
 port = 4000  # omit [api] section to disable GraphQL
 
+# [p2p]
+# port = 30303  # default; change to run multiple instances
+
 [[contracts]]
 name = "USDC"
 address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"

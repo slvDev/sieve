@@ -243,7 +243,7 @@ pub struct NetworkSession {
 ///
 /// Returns an error if the network fails to start or no peers connect
 /// within the configured timeout.
-pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
+pub async fn connect_mainnet_peers(p2p_port: Option<u16>) -> Result<NetworkSession> {
     let secret_key = rng_secret_key();
     let peers_config = PeersConfig::default()
         .with_max_outbound(MAX_OUTBOUND)
@@ -251,12 +251,18 @@ pub async fn connect_mainnet_peers() -> Result<NetworkSession> {
         .with_max_concurrent_dials(MAX_CONCURRENT_DIALS)
         .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS));
 
-    let net_config = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
+    let mut builder = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
         .mainnet_boot_nodes()
         .peer_config(peers_config)
         .disable_tx_gossip(true)
-        .block_import(Box::new(ProofOfStakeBlockImport::default()))
-        .build_with_noop_provider(MAINNET.clone());
+        .block_import(Box::new(ProofOfStakeBlockImport::default()));
+
+    if let Some(port) = p2p_port {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        builder = builder.listener_addr(addr).discovery_addr(addr);
+    }
+
+    let net_config = builder.build_with_noop_provider(MAINNET.clone());
 
     let handle = net_config
         .start_network()

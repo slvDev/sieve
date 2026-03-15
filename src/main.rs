@@ -229,7 +229,7 @@ async fn build_sync_context(
     let stream_dispatcher = build_stream_dispatcher(&startup.resolved_streams);
 
     let session = if cli.verbose {
-        p2p::connect_mainnet_peers().await?
+        p2p::connect_mainnet_peers(startup.p2p_port).await?
     } else {
         let (done_tx, mut done_rx) = watch::channel(false);
         let spinner_task = tokio::spawn(async move {
@@ -242,7 +242,7 @@ async fn build_sync_context(
                 }
             }
         });
-        let session = p2p::connect_mainnet_peers().await?;
+        let session = p2p::connect_mainnet_peers(startup.p2p_port).await?;
         let _ = done_tx.send(true);
         spinner_task.await.ok();
         ui::clear_line();
@@ -278,6 +278,7 @@ async fn build_sync_context(
 struct StartupConfig {
     database_url: String,
     api_port: Option<u16>,
+    p2p_port: Option<u16>,
     index_config: config::IndexConfig,
     resolved_events: Vec<toml_config::ResolvedEvent>,
     factories: Vec<toml_config::ResolvedFactory>,
@@ -334,6 +335,11 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         .api_port
         .or_else(|| startup.sieve_config.api.as_ref().and_then(|a| a.port));
 
+    // Resolve P2P port: CLI > TOML. None = reth default (30303).
+    let p2p_port = cli
+        .p2p_port
+        .or_else(|| startup.sieve_config.p2p.as_ref().and_then(|p| p.port));
+
     // Compute effective start_block: CLI override or minimum across contracts, factories, and transfers
     let start_block = BlockNumber::new(cli.start_block.unwrap_or_else(|| {
         let contract_min = startup
@@ -363,6 +369,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
     Ok(StartupConfig {
         database_url,
         api_port,
+        p2p_port,
         index_config: startup.resolved.index_config,
         resolved_events: startup.resolved.resolved_events,
         factories: startup.resolved.factories,
@@ -905,7 +912,7 @@ fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
 #[expect(clippy::print_stdout, reason = "CLI output for peers command")]
 async fn cmd_peers() -> eyre::Result<()> {
     println!("Connecting to Ethereum P2P network...");
-    let session = p2p::connect_mainnet_peers().await?;
+    let session = p2p::connect_mainnet_peers(None).await?;
     println!("Startup complete: {} peers connected", session.pool.len());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));

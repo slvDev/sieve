@@ -10,8 +10,8 @@ pub struct Cli {
     #[arg(long, default_value = "sieve.toml", global = true)]
     pub config: String,
 
-    /// PostgreSQL connection URL. Falls back to DATABASE_URL env var, then config file.
-    #[arg(long, env = "DATABASE_URL", global = true)]
+    /// PostgreSQL connection URL (set DATABASE_URL in .env or use --database-url).
+    #[arg(long, env = "DATABASE_URL")]
     pub database_url: Option<String>,
 
     /// Subcommand (init, schema, reset). Omit to run the indexer.
@@ -26,9 +26,13 @@ pub struct Cli {
     #[arg(long)]
     pub end_block: Option<u64>,
 
-    /// Override the GraphQL API port (default: 4000, configurable in TOML).
+    /// Override the GraphQL API port (configurable in TOML).
     #[arg(long)]
     pub api_port: Option<u16>,
+
+    /// Override the P2P listen port (default: 30303, configurable in TOML).
+    #[arg(long)]
+    pub p2p_port: Option<u16>,
 
     /// Drop and recreate all tables before indexing. Use to start fresh.
     #[arg(long)]
