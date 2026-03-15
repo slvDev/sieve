@@ -6865,6 +6865,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "dotenvy",
  "eyre",
  "futures",
  "lapin",

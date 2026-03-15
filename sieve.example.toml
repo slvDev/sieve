@@ -1,15 +1,12 @@
 # sieve.example.toml — example config for indexing USDC events
 #
-# For production, use environment variables for secrets:
-#   DATABASE_URL  — PostgreSQL connection string (overrides [database] url)
-#   WEBHOOK_URL   — webhook endpoint (used when url is omitted from [[streams]])
-#   RABBITMQ_URL  — RabbitMQ connection string (used when url is omitted from [[streams]])
-
-[database]
-url = "postgres://postgres:sieve@localhost:5432/sieve"  # or omit and set DATABASE_URL
+# Sensitive URLs are read from .env (not from this file):
+#   DATABASE_URL  — PostgreSQL connection string
+#   WEBHOOK_URL   — webhook endpoint (required if [[streams]] type = "webhook")
+#   RABBITMQ_URL  — RabbitMQ connection string (required if [[streams]] type = "rabbitmq")
 
 [api]
-port = 4000  # GraphQL API port (default: 4000, override with --api-port)
+port = 4000  # omit [api] section to disable GraphQL
 
 [[contracts]]
 name = "USDC"
@@ -66,21 +63,21 @@ from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
 # ── Webhook notifications ──────────────────────────────────────────────
 # Fires a JSON POST after each block is committed to the database.
 # Payload: { block_number, block_timestamp, tables: [{ name, event, count }] }
+# Set WEBHOOK_URL in .env to configure the endpoint.
 
 # [[streams]]
 # name = "my_webhook"
 # type = "webhook"
-# url = "http://localhost:8080/sieve-events"  # or omit and set WEBHOOK_URL
 # backfill = false   # skip during historical sync
 
 # ── RabbitMQ streaming ────────────────────────────────────────────────
 # Publishes each decoded event as a JSON message to an AMQP exchange.
 # Routing key supports {table} and {event} placeholders.
+# Set RABBITMQ_URL in .env to configure the connection.
 
 # [[streams]]
 # name = "rabbitmq_events"
 # type = "rabbitmq"
-# url = "amqp://guest:guest@rabbitmq:5672/%2f"  # or omit and set RABBITMQ_URL
 # exchange = "sieve_events"
 # routing_key = "{table}.{event}"   # optional, this is the default
 # backfill = false

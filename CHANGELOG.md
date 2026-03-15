@@ -7,6 +7,12 @@
 - Pretty terminal UI: startup banner, animated spinners, progress bar with ETA, follow status with block age (suppressed with `--verbose`)
 - `--verbose` / `-v` flag to use tracing logs instead of pretty UI
 - `[api].port` TOML config for GraphQL API (omit to disable, `--api-port` overrides)
+- `.env` file support via `dotenvy` — `DATABASE_URL` loaded automatically
+- `sieve init` now creates `.env` with default database URL
+
+### Changed
+
+- **Breaking:** all sensitive URLs removed from TOML — use `.env` file instead (`DATABASE_URL`, `WEBHOOK_URL`, `RABBITMQ_URL`)
 
 ### Fixed
 

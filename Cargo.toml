@@ -65,6 +65,9 @@ lapin = "2.5"
 # Terminal UI
 owo-colors = "4"
 
+# Environment
+dotenvy = "0.15"
+
 # Misc
 eyre = "0.6"
 parking_lot = "0.12"

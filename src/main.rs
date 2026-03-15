@@ -38,6 +38,9 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    // Load .env before clap so DATABASE_URL is available via #[arg(env)]
+    dotenvy::dotenv().ok();
+
     let cli = cli::Cli::parse();
 
     let default_level = if cli.verbose { "info" } else { "warn" };
@@ -306,20 +309,15 @@ fn load_resolved_config(cli: &cli::Cli) -> eyre::Result<ResolvedStartup> {
     })
 }
 
-/// Resolve database URL: CLI > env > TOML. Error if none provided.
+/// Resolve database URL from CLI flag or `DATABASE_URL` env var (via `.env`).
 ///
 /// # Errors
 ///
-/// Returns an error if no database URL is available from any source.
-fn resolve_database_url(cli: &cli::Cli, config: &toml_config::SieveConfig) -> eyre::Result<String> {
-    cli.database_url
-        .clone()
-        .or_else(|| config.database.as_ref().and_then(|d| d.url.clone()))
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "no database URL provided. Use --database-url, DATABASE_URL env var, or [database].url in config"
-            )
-        })
+/// Returns an error if no database URL is available.
+fn resolve_database_url(cli: &cli::Cli) -> eyre::Result<String> {
+    cli.database_url.clone().ok_or_else(|| {
+        eyre::eyre!("no database URL provided. Set DATABASE_URL in .env or use --database-url")
+    })
 }
 
 /// Load TOML config, resolve ABI files, and compute startup parameters.
@@ -329,7 +327,7 @@ fn resolve_database_url(cli: &cli::Cli, config: &toml_config::SieveConfig) -> ey
 /// Returns an error if the config file cannot be read, parsed, or resolved.
 fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
     let startup = load_resolved_config(cli)?;
-    let database_url = resolve_database_url(cli, &startup.sieve_config)?;
+    let database_url = resolve_database_url(cli)?;
 
     // Resolve API port: CLI > TOML. None = API disabled.
     let api_port = cli
@@ -392,10 +390,7 @@ fn cmd_init(cli: &cli::Cli, docker: bool) -> eyre::Result<()> {
     std::fs::create_dir_all("abis")
         .map_err(|e| eyre::eyre!("failed to create abis/ directory: {e}"))?;
 
-    let template = r#"[database]
-url = "postgres://postgres:sieve@localhost:5432/sieve"
-
-[api]
+    let template = r#"[api]
 port = 4000  # omit [api] section to disable GraphQL
 
 [[contracts]]
@@ -417,6 +412,16 @@ columns = [
 
     std::fs::write(config_path, template)
         .map_err(|e| eyre::eyre!("failed to write {}: {e}", cli.config))?;
+
+    // Write .env with DATABASE_URL
+    let env_path = Path::new(".env");
+    if !env_path.exists() {
+        std::fs::write(
+            env_path,
+            "DATABASE_URL=postgres://postgres:sieve@localhost:5432/sieve\n",
+        )
+        .map_err(|e| eyre::eyre!("failed to write .env: {e}"))?;
+    }
 
     // Write minimal ERC20 ABI (Transfer + Approval events)
     let abi_path = Path::new("abis/erc20.json");
@@ -451,11 +456,11 @@ columns = [
     if docker {
         write_docker_compose()?;
         println!(
-            "created {}, abis/erc20.json, and docker-compose.yml",
+            "created {}, .env, abis/erc20.json, and docker-compose.yml",
             cli.config
         );
     } else {
-        println!("created {} and abis/erc20.json", cli.config);
+        println!("created {}, .env, and abis/erc20.json", cli.config);
     }
     Ok(())
 }
@@ -560,7 +565,7 @@ fn cmd_schema(cli: &cli::Cli) -> eyre::Result<()> {
 /// Returns an error if the database connection or DDL fails.
 async fn cmd_reset(cli: &cli::Cli) -> eyre::Result<()> {
     let startup = load_resolved_config(cli)?;
-    let database_url = resolve_database_url(cli, &startup.sieve_config)?;
+    let database_url = resolve_database_url(cli)?;
 
     let db = db::Database::connect(&database_url).await?;
     db::drop_all_tables(

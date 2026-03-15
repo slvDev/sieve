@@ -17,8 +17,6 @@ use tracing::info;
 /// Top-level TOML config.
 #[derive(Debug, Deserialize)]
 pub struct SieveConfig {
-    /// Optional database configuration.
-    pub database: Option<DatabaseConfig>,
     /// Optional API configuration.
     pub api: Option<ApiConfig>,
     /// Contracts to index.
@@ -29,13 +27,6 @@ pub struct SieveConfig {
     /// Stream/webhook notification sinks.
     #[serde(default)]
     pub streams: Vec<TomlStream>,
-}
-
-/// Database section.
-#[derive(Debug, Deserialize)]
-pub struct DatabaseConfig {
-    /// PostgreSQL connection URL.
-    pub url: Option<String>,
 }
 
 /// API section.
@@ -163,8 +154,6 @@ pub struct TomlStream {
     /// Stream type ("webhook" or "rabbitmq").
     #[serde(rename = "type")]
     pub stream_type: String,
-    /// URL (webhook endpoint or AMQP connection string).
-    pub url: Option<String>,
     /// Whether to send notifications during historical backfill. Defaults to true.
     #[serde(default = "default_true")]
     pub backfill: bool,
@@ -1035,26 +1024,23 @@ fn parse_address_list(
 /// Returns an error if stream names are duplicated, names fail identifier
 /// validation, types are unknown, or required fields are missing.
 fn resolve_streams(streams: &[TomlStream]) -> eyre::Result<Vec<ResolvedStream>> {
-    let mut resolved = Vec::with_capacity(streams.len());
+    // Pre-pass: validate names and check for duplicates before touching env vars.
     let mut seen_names = HashSet::new();
-
     for s in streams {
         validate_identifier(&s.name, "stream")?;
-
         if !seen_names.insert(s.name.clone()) {
             return Err(eyre::eyre!("duplicate stream name '{}'", s.name));
         }
+    }
 
+    let mut resolved = Vec::with_capacity(streams.len());
+    for s in streams {
         match s.stream_type.as_str() {
             "webhook" => {
-                let url = s
-                    .url
-                    .clone()
-                    .or_else(|| std::env::var("WEBHOOK_URL").ok())
-                    .unwrap_or_default();
+                let url = std::env::var("WEBHOOK_URL").unwrap_or_default();
                 if url.is_empty() {
                     return Err(eyre::eyre!(
-                        "stream '{}' of type 'webhook' requires a 'url'",
+                        "stream '{}' of type 'webhook' requires WEBHOOK_URL env var (set in .env)",
                         s.name
                     ));
                 }
@@ -1068,14 +1054,10 @@ fn resolve_streams(streams: &[TomlStream]) -> eyre::Result<Vec<ResolvedStream>> 
                 });
             }
             "rabbitmq" => {
-                let url = s
-                    .url
-                    .clone()
-                    .or_else(|| std::env::var("RABBITMQ_URL").ok())
-                    .unwrap_or_default();
+                let url = std::env::var("RABBITMQ_URL").unwrap_or_default();
                 if url.is_empty() {
                     return Err(eyre::eyre!(
-                        "stream '{}' of type 'rabbitmq' requires a 'url'",
+                        "stream '{}' of type 'rabbitmq' requires RABBITMQ_URL env var (set in .env)",
                         s.name
                     ));
                 }
@@ -1902,9 +1884,6 @@ table = "usdc_transfers"
 "#;
 
     const FULL_TOML: &str = r#"
-[database]
-url = "postgres://localhost:5432/sieve"
-
 [[contracts]]
 name = "USDC"
 address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -1928,7 +1907,6 @@ table = "usdc_approvals"
     #[test]
     fn parse_minimal_toml() -> eyre::Result<()> {
         let config: SieveConfig = toml::from_str(MINIMAL_TOML)?;
-        assert!(config.database.is_none());
         assert_eq!(config.contracts.len(), 1);
         assert_eq!(config.contracts[0].name, "USDC");
         assert_eq!(config.contracts[0].events.len(), 1);
@@ -1939,11 +1917,6 @@ table = "usdc_approvals"
     #[test]
     fn parse_full_toml() -> eyre::Result<()> {
         let config: SieveConfig = toml::from_str(FULL_TOML)?;
-        assert!(config.database.is_some());
-        assert_eq!(
-            config.database.as_ref().and_then(|d| d.url.as_deref()),
-            Some("postgres://localhost:5432/sieve")
-        );
         assert_eq!(config.contracts[0].events.len(), 2);
 
         let transfer = &config.contracts[0].events[0];
@@ -3013,17 +2986,12 @@ table = "usdc_transfers"
 [[streams]]
 name = "my_webhook"
 type = "webhook"
-url = "http://localhost:8080/events"
 backfill = false
 "#;
         let config: SieveConfig = toml::from_str(toml_str)?;
         assert_eq!(config.streams.len(), 1);
         assert_eq!(config.streams[0].name, "my_webhook");
         assert_eq!(config.streams[0].stream_type, "webhook");
-        assert_eq!(
-            config.streams[0].url.as_deref(),
-            Some("http://localhost:8080/events")
-        );
         assert!(!config.streams[0].backfill);
         Ok(())
     }
@@ -3044,7 +3012,6 @@ table = "usdc_transfers"
 [[streams]]
 name = "my_webhook"
 type = "webhook"
-url = "http://localhost:8080/events"
 "#;
         let config: SieveConfig = toml::from_str(toml_str)?;
         assert!(config.streams[0].backfill);
@@ -3053,11 +3020,11 @@ url = "http://localhost:8080/events"
 
     #[test]
     fn resolve_streams_rejects_duplicate_names() {
+        std::env::set_var("WEBHOOK_URL", "http://localhost:8080");
         let streams = vec![
             TomlStream {
                 name: "dup".to_string(),
                 stream_type: "webhook".to_string(),
-                url: Some("http://a".to_string()),
                 backfill: true,
                 exchange: None,
                 routing_key: None,
@@ -3065,7 +3032,6 @@ url = "http://localhost:8080/events"
             TomlStream {
                 name: "dup".to_string(),
                 stream_type: "webhook".to_string(),
-                url: Some("http://b".to_string()),
                 backfill: true,
                 exchange: None,
                 routing_key: None,
@@ -3074,6 +3040,7 @@ url = "http://localhost:8080/events"
         let result = resolve_streams(&streams);
         assert!(result.is_err());
         assert!(format!("{result:?}").contains("duplicate stream name"));
+        std::env::remove_var("WEBHOOK_URL");
     }
 
     #[test]
@@ -3081,7 +3048,6 @@ url = "http://localhost:8080/events"
         let streams = vec![TomlStream {
             name: "bad".to_string(),
             stream_type: "kafka".to_string(),
-            url: Some("http://a".to_string()),
             backfill: true,
             exchange: None,
             routing_key: None,
@@ -3092,42 +3058,27 @@ url = "http://localhost:8080/events"
     }
 
     #[test]
-    fn resolve_streams_rejects_missing_url() {
+    fn resolve_streams_rejects_missing_webhook_url() {
+        std::env::remove_var("WEBHOOK_URL");
         let streams = vec![TomlStream {
             name: "no_url".to_string(),
             stream_type: "webhook".to_string(),
-            url: None,
             backfill: true,
             exchange: None,
             routing_key: None,
         }];
         let result = resolve_streams(&streams);
         assert!(result.is_err());
-        assert!(format!("{result:?}").contains("requires a 'url'"));
-    }
-
-    #[test]
-    fn resolve_streams_rejects_empty_url() {
-        let streams = vec![TomlStream {
-            name: "empty_url".to_string(),
-            stream_type: "webhook".to_string(),
-            url: Some(String::new()),
-            backfill: true,
-            exchange: None,
-            routing_key: None,
-        }];
-        let result = resolve_streams(&streams);
-        assert!(result.is_err());
-        assert!(format!("{result:?}").contains("requires a 'url'"));
+        assert!(format!("{result:?}").contains("WEBHOOK_URL"));
     }
 
     #[test]
     fn resolve_streams_valid() -> eyre::Result<()> {
+        std::env::set_var("WEBHOOK_URL", "http://localhost:8080");
         let streams = vec![
             TomlStream {
                 name: "hook_a".to_string(),
                 stream_type: "webhook".to_string(),
-                url: Some("http://localhost:8080".to_string()),
                 backfill: true,
                 exchange: None,
                 routing_key: None,
@@ -3135,7 +3086,6 @@ url = "http://localhost:8080/events"
             TomlStream {
                 name: "hook_b".to_string(),
                 stream_type: "webhook".to_string(),
-                url: Some("http://localhost:9090".to_string()),
                 backfill: false,
                 exchange: None,
                 routing_key: None,
@@ -3148,16 +3098,17 @@ url = "http://localhost:8080/events"
         assert!(resolved[0].backfill);
         assert_eq!(resolved[1].name, "hook_b");
         assert!(!resolved[1].backfill);
+        std::env::remove_var("WEBHOOK_URL");
         Ok(())
     }
 
     #[test]
     fn resolve_rabbitmq_stream() -> eyre::Result<()> {
+        std::env::set_var("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2f");
         let rk = ["events.", "{table}"].concat();
         let streams = vec![TomlStream {
             name: "mq".to_string(),
             stream_type: "rabbitmq".to_string(),
-            url: Some("amqp://guest:guest@localhost:5672/%2f".to_string()),
             backfill: false,
             exchange: Some("sieve_events".to_string()),
             routing_key: Some(rk.clone()),
@@ -3167,15 +3118,16 @@ url = "http://localhost:8080/events"
         assert_eq!(resolved[0].stream_type, "rabbitmq");
         assert_eq!(resolved[0].exchange.as_deref(), Some("sieve_events"));
         assert_eq!(resolved[0].routing_key.as_deref(), Some(rk.as_str()));
+        std::env::remove_var("RABBITMQ_URL");
         Ok(())
     }
 
     #[test]
     fn resolve_rabbitmq_missing_exchange() {
+        std::env::set_var("RABBITMQ_URL", "amqp://localhost");
         let streams = vec![TomlStream {
             name: "mq".to_string(),
             stream_type: "rabbitmq".to_string(),
-            url: Some("amqp://localhost".to_string()),
             backfill: true,
             exchange: None,
             routing_key: None,
@@ -3183,29 +3135,30 @@ url = "http://localhost:8080/events"
         let result = resolve_streams(&streams);
         assert!(result.is_err());
         assert!(format!("{result:?}").contains("requires an 'exchange'"));
+        std::env::remove_var("RABBITMQ_URL");
     }
 
     #[test]
     fn resolve_rabbitmq_missing_url() {
+        std::env::remove_var("RABBITMQ_URL");
         let streams = vec![TomlStream {
             name: "mq".to_string(),
             stream_type: "rabbitmq".to_string(),
-            url: None,
             backfill: true,
             exchange: Some("ex".to_string()),
             routing_key: None,
         }];
         let result = resolve_streams(&streams);
         assert!(result.is_err());
-        assert!(format!("{result:?}").contains("requires a 'url'"));
+        assert!(format!("{result:?}").contains("RABBITMQ_URL"));
     }
 
     #[test]
     fn resolve_rabbitmq_default_routing_key() -> eyre::Result<()> {
+        std::env::set_var("RABBITMQ_URL", "amqp://localhost");
         let streams = vec![TomlStream {
             name: "mq".to_string(),
             stream_type: "rabbitmq".to_string(),
-            url: Some("amqp://localhost".to_string()),
             backfill: true,
             exchange: Some("ex".to_string()),
             routing_key: None,
@@ -3213,6 +3166,7 @@ url = "http://localhost:8080/events"
         let resolved = resolve_streams(&streams)?;
         let expected = ["{table}", ".", "{event}"].concat();
         assert_eq!(resolved[0].routing_key.as_deref(), Some(expected.as_str()));
+        std::env::remove_var("RABBITMQ_URL");
         Ok(())
     }
 
