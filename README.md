@@ -13,8 +13,8 @@
 ---
 
 ```bash
-sieve add-contract 0xA0b8...eB48 --etherscan-api-key $KEY
-sieve --api-port 4000
+sieve add-contract 0xA0b8...eB48
+sieve
 ```
 
 Sieve fetches the ABI, creates your tables, syncs the chain over P2P, and serves a GraphQL API. Zero code.
@@ -43,19 +43,17 @@ Run `sieveup` anytime to update to the latest version.
 ### 2. Configure
 
 ```bash
-sieve init                        # creates sieve.toml + abis/erc20.json (USDC Transfer, ready to run)
-sieve add-contract 0xA0b8... \    # or fetch any contract ABI from Etherscan
-  --etherscan-api-key $KEY
+sieve init                        # creates sieve.toml, .env, abis/erc20.json (USDC Transfer, ready to run)
+sieve add-contract 0xA0b8...      # or fetch any contract ABI from Etherscan
 ```
 
 `sieve init` creates a working USDC Transfer config out of the box — plug and play. Add `--docker` to also generate a `docker-compose.yml` with PostgreSQL.
 
+Set `ETHERSCAN_API_KEY` in `.env` for `add-contract` to work.
+
 Or write the TOML yourself:
 
 ```toml
-[database]
-url = "postgres://postgres:sieve@localhost:5432/sieve"
-
 [[contracts]]
 name = "USDC"
 address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -68,12 +66,18 @@ table = "usdc_transfers"
 context = ["block_timestamp", "tx_from"]
 ```
 
+Sensitive URLs go in `.env` (auto-loaded at startup):
+
+```env
+DATABASE_URL=postgres://postgres:sieve@localhost:5432/sieve
+```
+
 Columns are auto-generated from the ABI. Solidity camelCase is converted to snake_case automatically (`_troveId` -> `trove_id`, `amount0Out` -> `amount0_out`). SQL reserved words are handled. You can [override columns](#contracts-and-events) if you want.
 
 ### 3. Run
 
 ```bash
-sieve --api-port 4000
+sieve
 ```
 
 That's it. Sieve backfills from each contract's `start_block`, catches up to the chain head, then follows new blocks in real-time. One command — no separate "historical sync" and "follow mode" steps.
@@ -103,7 +107,7 @@ GraphQL API with built-in GraphiQL explorer:
 }
 ```
 
-Open `http://localhost:4000` for the GraphiQL IDE.
+Open `http://localhost:4000/graphql` for the GraphiQL IDE.
 
 ## What Sieve Can Index
 
@@ -219,9 +223,10 @@ HTTP POST after each block is committed. Useful for triggering downstream pipeli
 [[streams]]
 name = "my_webhook"
 type = "webhook"
-url = "http://localhost:8080/sieve-events"  # or omit and set WEBHOOK_URL env var
 backfill = false   # skip during historical sync (default: true)
 ```
+
+Set `WEBHOOK_URL` in `.env`.
 
 Payload:
 
@@ -244,11 +249,12 @@ Per-event JSON messages to an AMQP exchange with configurable routing keys.
 [[streams]]
 name = "rabbitmq_events"
 type = "rabbitmq"
-url = "amqp://guest:guest@rabbitmq:5672/%2f"  # or omit and set RABBITMQ_URL env var
 exchange = "sieve_events"
 routing_key = "{table}.{event}"   # optional, default
 backfill = false
 ```
+
+Set `RABBITMQ_URL` in `.env`.
 
 Message payload (one per event):
 
@@ -291,7 +297,7 @@ Auto-generated from your TOML config. Every table gets:
 
 ```
 sieve [OPTIONS]                Run the indexer
-sieve init                     Scaffold a new project (sieve.toml + abis/erc20.json)
+sieve init                     Scaffold a new project (sieve.toml, .env, abis/)
 sieve init --docker            Same + docker-compose.yml with PostgreSQL
 sieve schema                   Print generated SQL DDL
 sieve reset                    Drop and recreate all tables
@@ -303,15 +309,17 @@ Options:
   --config <PATH>         Path to TOML config [default: sieve.toml]
   --start-block <NUM>     Override start block
   --end-block <NUM>       Stop at this block (omit for follow mode)
-  --database-url <URL>    PostgreSQL URL (or DATABASE_URL env var)
-  --api-port <PORT>       Enable GraphQL API on this port
+  --database-url <URL>    PostgreSQL URL (or DATABASE_URL in .env)
+  --api-port <PORT>       Override GraphQL API port (configurable in TOML)
+  --p2p-port <PORT>       Override P2P listen port [default: 30303]
   --fresh                 Drop and recreate all tables before indexing
+  -v, --verbose           Use tracing logs instead of pretty UI
   -V, --version           Print version
 ```
 
 ### API Endpoints
 
-When running with `--api-port`:
+When API is enabled (`[api] port` in TOML or `--api-port`):
 
 | Endpoint   | Description                     |
 | ---------- | ------------------------------- |
@@ -323,23 +331,23 @@ When running with `--api-port`:
 
 ### Environment Variables
 
-| Variable       | Purpose                   | Overridden by                                     |
-| -------------- | ------------------------- | ------------------------------------------------- |
-| `DATABASE_URL` | PostgreSQL connection URL | `--database-url` flag or `[database] url` in TOML |
-| `WEBHOOK_URL`  | Webhook endpoint URL      | `url` field in `[[streams]]` TOML section         |
-| `RABBITMQ_URL` | RabbitMQ connection URL   | `url` field in `[[streams]]` TOML section         |
+All sensitive URLs live in `.env` (auto-loaded at startup via `dotenvy`). Never in TOML.
 
-For production deployments, set secrets as environment variables instead of baking them into config files.
+| Variable             | Purpose                   | Override          |
+| -------------------- | ------------------------- | ----------------- |
+| `DATABASE_URL`       | PostgreSQL connection URL | `--database-url`  |
+| `WEBHOOK_URL`        | Webhook endpoint URL      | —                 |
+| `RABBITMQ_URL`       | RabbitMQ connection URL   | —                 |
+| `ETHERSCAN_API_KEY`  | Etherscan API key         | `--etherscan-api-key` |
 
 ### `sieve add-contract`
 
-Fetches a verified ABI from Etherscan, saves it to `abis/`, and appends a `[[contracts]]` block to your config. Auto-detects proxy contracts.
+Fetches a verified ABI from Etherscan, saves it to `abis/`, and appends a `[[contracts]]` block to your config. Auto-detects proxy contracts. Automatically sets `start_block` to the contract's deploy block.
 
 ```bash
-sieve add-contract 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
-  --etherscan-api-key $ETHERSCAN_API_KEY \
-  --name USDC \
-  --start-block 21000000
+sieve add-contract 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+sieve add-contract 0xA0b8... --name USDC              # override name
+sieve add-contract 0xA0b8... --start-block 21000000   # override start block
 ```
 
 ### `sieve inspect`
@@ -365,11 +373,11 @@ sieve peers
 ### Docker Compose
 
 ```bash
-sieve init --docker               # creates sieve.toml, abis/, and docker-compose.yml
+sieve init --docker               # creates sieve.toml, .env, abis/, and docker-compose.yml
 docker compose up -d              # starts PostgreSQL + Sieve
 ```
 
-Starts PostgreSQL and Sieve with GraphQL API on port 4000. Edit `sieve.toml` for your contracts, or use the default USDC Transfer config.
+Starts PostgreSQL and Sieve with GraphQL API on port 4000. Credentials come from `.env` (auto-loaded by Docker Compose). Edit `sieve.toml` for your contracts, or use the default USDC Transfer config.
 
 ### Manual build
 
@@ -427,6 +435,10 @@ Not currently. Sieve filters at sync time using Ethereum log topics (topic0–to
 **What happens if two contracts emit events with the same name but different parameters?**
 
 No collision. Topic0 is the keccak256 hash of the full event signature including parameter types — `Transfer(address,address,uint256)` and `Transfer(address,address,uint256,uint256)` produce different topic0 hashes. Sieve also filters by contract address first, so even identical events on different contracts are fully isolated. If you see decode warnings, it's likely a mismatched ABI (e.g., a proxy contract forwarding events with a different signature than the ABI specifies).
+
+**Can I run multiple Sieve instances on the same machine?**
+
+Yes. Each instance needs its own P2P port, database, and config. Use `--p2p-port` or `[p2p] port` in TOML to avoid port conflicts. Speed is not affected — Sieve discovers peers outbound.
 
 ## Acknowledgments
 
