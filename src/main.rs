@@ -43,6 +43,10 @@ async fn main() -> eyre::Result<()> {
 
     let cli = cli::Cli::parse();
 
+    if cli.explain {
+        return print_explain();
+    }
+
     let default_level = if cli.verbose { "info" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -308,6 +312,13 @@ fn load_resolved_config(cli: &cli::Cli) -> eyre::Result<ResolvedStartup> {
         sieve_config,
         resolved,
     })
+}
+
+#[expect(clippy::print_stdout, reason = "CLI output for --explain")]
+fn print_explain() -> eyre::Result<()> {
+    println!("Ethereum event indexer. Connects directly to P2P.");
+    println!("No RPC provider. No API keys. No rate limits. No bills.");
+    Ok(())
 }
 
 /// Resolve database URL from CLI flag or `DATABASE_URL` env var (via `.env`).

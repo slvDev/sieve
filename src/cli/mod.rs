@@ -41,6 +41,10 @@ pub struct Cli {
     /// Enable verbose tracing output (default: pretty UI).
     #[arg(short = 'v', long)]
     pub verbose: bool,
+
+    /// Explain what Sieve is.
+    #[arg(long, hide = true)]
+    pub explain: bool,
 }
 
 /// Utility subcommands.
