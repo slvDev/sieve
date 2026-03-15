@@ -61,6 +61,8 @@ pub struct SyncContext {
     pub bloom_filter: Option<Arc<BloomFilter>>,
     /// Global observed head from follow-mode head tracker (overrides per-peer head_cap).
     pub head_seen_rx: Option<watch::Receiver<u64>>,
+    /// Whether to use verbose tracing output (vs pretty UI).
+    pub verbose: bool,
 }
 
 /// Full payload for a block: header, body, receipts.

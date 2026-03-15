@@ -198,12 +198,17 @@ pub async fn run_sync(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.handlers),
         Arc::clone(&ctx.metrics),
+        Arc::clone(&ctx.pool),
         Arc::clone(&ctx.transfer_handlers),
         Arc::clone(&ctx.call_handlers),
         Arc::clone(&ctx.event_table_map),
         ctx.stream_dispatcher.clone(),
         ctx.is_backfill,
         Arc::clone(&ctx.receipt_tables),
+        total_blocks,
+        started,
+        ctx.verbose,
+        ctx.stop_rx.clone(),
     ));
 
     // Main fetch loop
@@ -725,12 +730,17 @@ async fn consume_payloads(
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
     metrics: Arc<SieveMetrics>,
+    pool: Arc<PeerPool>,
     transfer_handlers: Arc<TransferRegistry>,
     call_handlers: Arc<CallRegistry>,
     event_table_map: Arc<HashMap<String, (String, String)>>,
     stream_dispatcher: Option<Arc<crate::stream::StreamDispatcher>>,
     is_backfill: bool,
     receipt_tables: Arc<HashSet<String>>,
+    total_blocks: u64,
+    started_at: Instant,
+    verbose: bool,
+    stop_rx: watch::Receiver<bool>,
 ) -> ConsumerStats {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
@@ -806,7 +816,7 @@ async fn consume_payloads(
             .await;
         }
 
-        log_sync_progress(&stats, &mut last_log);
+        log_sync_progress(&stats, &mut last_log, total_blocks, &pool, started_at, verbose, &stop_rx);
     }
 
     stats
@@ -828,8 +838,19 @@ struct ProcessContext<'a> {
 }
 
 /// Log sync progress every 2 seconds.
-fn log_sync_progress(stats: &ConsumerStats, last_log: &mut Instant) {
-    if last_log.elapsed() >= Duration::from_secs(2) {
+fn log_sync_progress(
+    stats: &ConsumerStats,
+    last_log: &mut Instant,
+    total_blocks: u64,
+    pool: &PeerPool,
+    started_at: Instant,
+    verbose: bool,
+    stop_rx: &watch::Receiver<bool>,
+) {
+    if *stop_rx.borrow() || last_log.elapsed() < Duration::from_secs(2) {
+        return;
+    }
+    if verbose {
         info!(
             blocks_fetched = stats.blocks_fetched,
             total_receipts = stats.total_receipts,
@@ -840,8 +861,10 @@ fn log_sync_progress(stats: &ConsumerStats, last_log: &mut Instant) {
             calls_stored = stats.calls_stored,
             "sync progress"
         );
-        *last_log = Instant::now();
+    } else {
+        crate::ui::print_sync_progress(stats.blocks_fetched, total_blocks, pool.len(), started_at);
     }
+    *last_log = Instant::now();
 }
 
 /// Compute the sealed hash for a block header.
@@ -1131,6 +1154,9 @@ fn update_batch_stats(
         if outcome.block_number > *max_indexed_block {
             *max_indexed_block = outcome.block_number;
             metrics.indexed_block.set(outcome.block_number as i64);
+            metrics
+                .last_block_timestamp
+                .store(outcome.block_timestamp, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

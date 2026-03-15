@@ -25,6 +25,7 @@ mod sync;
 mod test_utils;
 mod toml_config;
 mod types;
+mod ui;
 
 use types::BlockNumber;
 
@@ -37,14 +38,15 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    let cli = cli::Cli::parse();
+
+    let default_level = if cli.verbose { "info" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
-
-    let cli = cli::Cli::parse();
 
     // Route subcommands
     if let Some(ref command) = cli.command {
@@ -93,6 +95,23 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
         }
     }
 
+    if !cli.verbose {
+        let table_names: Vec<&str> = startup
+            .resolved_events
+            .iter()
+            .map(|e| e.table_name.as_str())
+            .chain(startup.resolved_transfers.iter().map(|t| t.table_name.as_str()))
+            .chain(startup.resolved_calls.iter().map(|c| c.table_name.as_str()))
+            .collect();
+        ui::print_banner(
+            env!("CARGO_PKG_VERSION"),
+            &cli.config,
+            &startup.database_url,
+            &table_names,
+            cli.api_port,
+        );
+    }
+
     info!(
         start_block = startup.start_block.as_u64(),
         end_block = cli.end_block,
@@ -106,7 +125,7 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
 
     // Graceful shutdown signal
     let (stop_tx, stop_rx) = watch::channel(false);
-    tokio::spawn(shutdown_handler(stop_tx));
+    tokio::spawn(shutdown_handler(stop_tx, cli.verbose));
 
     let db = Arc::new(setup_database(cli, &startup).await?);
 
@@ -206,7 +225,26 @@ async fn build_sync_context(
 
     let stream_dispatcher = build_stream_dispatcher(&startup.resolved_streams);
 
-    let session = p2p::connect_mainnet_peers().await?;
+    let session = if cli.verbose {
+        p2p::connect_mainnet_peers().await?
+    } else {
+        let (done_tx, mut done_rx) = watch::channel(false);
+        let spinner_task = tokio::spawn(async move {
+            let mut spinner = ui::Spinner::new();
+            loop {
+                ui::print_connecting(spinner.frame());
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_millis(80)) => {}
+                    _ = done_rx.changed() => break,
+                }
+            }
+        });
+        let session = p2p::connect_mainnet_peers().await?;
+        let _ = done_tx.send(true);
+        spinner_task.await.ok();
+        ui::clear_line();
+        session
+    };
     info!(
         peers = session.pool.len(),
         "connected to ethereum p2p network"
@@ -228,6 +266,7 @@ async fn build_sync_context(
         receipt_tables,
         bloom_filter,
         head_seen_rx: None,
+        verbose: cli.verbose,
     })
 }
 
@@ -874,11 +913,15 @@ async fn run_indexer(
     start_block: BlockNumber,
     ctx: sync::SyncContext,
 ) -> eyre::Result<()> {
+    let verbose = ctx.verbose;
     if let Some(end_block_raw) = cli.end_block {
         let end_block = BlockNumber::new(end_block_raw);
         let effective_start = resolve_effective_start(&ctx.db, start_block, end_block).await?;
 
         if effective_start > end_block {
+            if !verbose {
+                ui::print_info("already indexed, nothing to do");
+            }
             info!("nothing to index");
             ctx.metrics
                 .is_ready
@@ -893,6 +936,10 @@ async fn run_indexer(
         metrics
             .is_ready
             .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        if !verbose {
+            ui::print_sync_complete(&outcome);
+        }
 
         info!(
             blocks = outcome.blocks_fetched,
@@ -973,9 +1020,12 @@ async fn resolve_effective_start(
 /// First signal: set the stop flag so all loops drain gracefully.
 /// Second signal: hard exit (for impatient users).
 #[expect(clippy::exit, reason = "second Ctrl+C requires immediate hard exit")]
-async fn shutdown_handler(stop_tx: watch::Sender<bool>) {
+async fn shutdown_handler(stop_tx: watch::Sender<bool>, verbose: bool) {
     // First Ctrl+C → graceful shutdown
     tokio::signal::ctrl_c().await.ok();
+    if !verbose {
+        ui::clear_line();
+    }
     warn!("shutdown signal received; stopping after draining");
     let _ = stop_tx.send(true);
 

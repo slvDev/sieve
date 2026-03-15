@@ -39,6 +39,7 @@ struct FollowContext {
     receipt_tables: Arc<std::collections::HashSet<String>>,
     bloom_filter: Option<Arc<crate::filter::BloomFilter>>,
     head_seen_rx: watch::Receiver<u64>,
+    verbose: bool,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -80,9 +81,18 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
         receipt_tables: ctx.receipt_tables,
         bloom_filter: ctx.bloom_filter,
         head_seen_rx,
+        verbose: ctx.verbose,
     };
 
     let mut last_heartbeat = Instant::now();
+    let mut phase = FollowPhase::Discovering;
+
+    // Background spinner for the discovering phase (80ms tick)
+    let mut spinner_stop = if fctx.verbose {
+        None
+    } else {
+        Some(spawn_discovering_spinner(Arc::clone(&fctx.pool)))
+    };
 
     while !is_stopped(&fctx.stop_rx) {
         let evicted = fctx.pool.evict_stale(Duration::from_secs(120));
@@ -90,13 +100,10 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
             info!(evicted, peers = fctx.pool.len(), "evicted stale peers");
         }
         if last_heartbeat.elapsed() >= Duration::from_secs(30) {
-            info!(
-                peers = fctx.pool.len(),
-                "follow mode: waiting for new blocks"
-            );
+            print_heartbeat(&fctx, &phase).await?;
             last_heartbeat = Instant::now();
         }
-        if run_follow_epoch(&fctx).await? {
+        if run_follow_epoch(&fctx, &mut phase, &mut spinner_stop).await? {
             break;
         }
     }
@@ -105,13 +112,77 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
     Ok(())
 }
 
+/// Spawn a background task that animates the "discovering" spinner at 80ms.
+///
+/// Returns the sender to stop the spinner (send `true` to cancel).
+fn spawn_discovering_spinner(pool: Arc<PeerPool>) -> watch::Sender<bool> {
+    let (tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let mut spinner = crate::ui::Spinner::new();
+        loop {
+            crate::ui::print_discovering(pool.len(), spinner.frame());
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(80)) => {}
+                _ = rx.changed() => break,
+            }
+        }
+        crate::ui::clear_line();
+    });
+    tx
+}
+
+/// Print the periodic heartbeat based on current phase.
+async fn print_heartbeat(ctx: &FollowContext, phase: &FollowPhase) -> eyre::Result<()> {
+    match phase {
+        FollowPhase::Discovering => {
+            // Spinner background task handles pretty output
+            if ctx.verbose {
+                info!(peers = ctx.pool.len(), "discovering chain head");
+            }
+        }
+        FollowPhase::Following => {
+            if ctx.verbose {
+                info!(
+                    peers = ctx.pool.len(),
+                    "follow mode: waiting for new blocks"
+                );
+            } else {
+                let checkpoint = ctx
+                    .db
+                    .last_checkpoint()
+                    .await?
+                    .map_or(ctx.start_block.as_u64(), BlockNumber::as_u64);
+                let ts = ctx
+                    .metrics
+                    .last_block_timestamp
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                crate::ui::print_follow_status(checkpoint, ctx.pool.len(), ts, None);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run a single follow epoch. Returns `true` if the loop should exit.
-async fn run_follow_epoch(ctx: &FollowContext) -> eyre::Result<bool> {
+async fn run_follow_epoch(
+    ctx: &FollowContext,
+    phase: &mut FollowPhase,
+    spinner_stop: &mut Option<watch::Sender<bool>>,
+) -> eyre::Result<bool> {
     match discover_gap(ctx).await? {
-        EpochAction::Wait => Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await),
+        EpochAction::Wait => {
+            Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await)
+        }
         EpochAction::Reorg => Ok(false),
         EpochAction::Sync { next_block, head } => {
+            // Stop discovering spinner before sync starts
+            if let Some(tx) = spinner_stop.take() {
+                let _ = tx.send(true);
+                // Brief yield to let spinner task clear the line
+                tokio::task::yield_now().await;
+            }
             let gap = sync_epoch(ctx, next_block, head).await?;
+            *phase = FollowPhase::Following;
             if gap <= 2 {
                 ctx.metrics.is_ready.store(true, Ordering::Relaxed);
             }
@@ -139,6 +210,14 @@ enum EpochAction {
     Reorg,
     /// New blocks available — sync from `next_block` to `head`.
     Sync { next_block: u64, head: u64 },
+}
+
+/// Follow loop phase for pretty UI.
+enum FollowPhase {
+    /// Still trying to discover the chain head from peers.
+    Discovering,
+    /// Caught up to tip, waiting for new blocks.
+    Following,
 }
 
 /// Discover the current chain head and determine the epoch action.
@@ -215,6 +294,7 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
         receipt_tables: Arc::clone(&ctx.receipt_tables),
         bloom_filter: ctx.bloom_filter.clone(),
         head_seen_rx: Some(ctx.head_seen_rx.clone()),
+        verbose: ctx.verbose,
     };
 
     let outcome = run_sync(
@@ -224,12 +304,22 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
     )
     .await?;
 
-    info!(
-        blocks = outcome.blocks_fetched,
-        events_stored = outcome.events_stored,
-        elapsed_ms = outcome.elapsed.as_millis() as u64,
-        "follow epoch complete"
-    );
+    if !is_stopped(&ctx.stop_rx) {
+        if ctx.verbose {
+            info!(
+                blocks = outcome.blocks_fetched,
+                events_stored = outcome.events_stored,
+                elapsed_ms = outcome.elapsed.as_millis() as u64,
+                "follow epoch complete"
+            );
+        } else {
+            let ts = ctx
+                .metrics
+                .last_block_timestamp
+                .load(std::sync::atomic::Ordering::Relaxed);
+            crate::ui::print_follow_status(head, ctx.pool.len(), ts, None);
+        }
+    }
 
     Ok(gap)
 }

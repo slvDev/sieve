@@ -8,7 +8,7 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 /// Central metrics for the Sieve indexer.
 pub struct SieveMetrics {
@@ -40,6 +40,9 @@ pub struct SieveMetrics {
 
     /// Readiness flag — `true` when caught up to chain head.
     pub is_ready: AtomicBool,
+
+    /// Timestamp of the latest indexed block (unix seconds, for UI "Xs ago").
+    pub last_block_timestamp: AtomicU64,
 }
 
 impl SieveMetrics {
@@ -123,6 +126,7 @@ impl SieveMetrics {
             active_fetches,
             pending_blocks,
             is_ready: AtomicBool::new(false),
+            last_block_timestamp: AtomicU64::new(0),
         }
     }
 

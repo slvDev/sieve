@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Pretty terminal UI: startup banner, animated spinners, progress bar with ETA, follow status with block age (suppressed with `--verbose`)
+
 ### Fixed
 
 - Follow-mode peer eviction: `mark_peer_success` was dead code, causing all peers to be evicted after 120s idle at the tip (peers=0 loop)
