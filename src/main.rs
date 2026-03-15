@@ -400,6 +400,8 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
 /// Returns an error if the config file already exists or file I/O fails.
 #[expect(clippy::print_stdout, reason = "CLI output for init command")]
 fn cmd_init(cli: &cli::Cli, docker: bool) -> eyre::Result<()> {
+    use owo_colors::OwoColorize;
+
     let config_path = Path::new(&cli.config);
     if config_path.exists() {
         return Err(eyre::eyre!("{} already exists", cli.config));
@@ -431,14 +433,20 @@ columns = [
     std::fs::write(config_path, template)
         .map_err(|e| eyre::eyre!("failed to write {}: {e}", cli.config))?;
 
-    // Write .env with DATABASE_URL
+    let check = "\u{2713}".green();
+    println!("\n  {check} {}", cli.config);
+
+    // Write .env with DATABASE_URL (and POSTGRES_PASSWORD for docker mode)
     let env_path = Path::new(".env");
     if !env_path.exists() {
-        std::fs::write(
-            env_path,
-            "DATABASE_URL=postgres://postgres:sieve@localhost:5432/sieve\n",
-        )
-        .map_err(|e| eyre::eyre!("failed to write .env: {e}"))?;
+        let env_content = if docker {
+            "DATABASE_URL=postgres://postgres:sieve@db:5432/sieve\nPOSTGRES_PASSWORD=sieve\n"
+        } else {
+            "DATABASE_URL=postgres://postgres:sieve@localhost:5432/sieve\n"
+        };
+        std::fs::write(env_path, env_content)
+            .map_err(|e| eyre::eyre!("failed to write .env: {e}"))?;
+        println!("  {check} .env");
     }
 
     // Write minimal ERC20 ABI (Transfer + Approval events)
@@ -469,16 +477,15 @@ columns = [
 "#;
         std::fs::write(abi_path, erc20_abi)
             .map_err(|e| eyre::eyre!("failed to write abis/erc20.json: {e}"))?;
+        println!("  {check} abis/erc20.json");
     }
 
     if docker {
         write_docker_compose()?;
-        println!(
-            "created {}, .env, abis/erc20.json, and docker-compose.yml",
-            cli.config
-        );
+        println!("  {check} docker-compose.yml");
+        println!("\n  Run {} to start", "docker compose up".green());
     } else {
-        println!("created {}, .env, and abis/erc20.json", cli.config);
+        println!("\n  Run {} to start indexing USDC transfers", "sieve".green());
     }
     Ok(())
 }
@@ -492,7 +499,7 @@ fn write_docker_compose() -> eyre::Result<()> {
   db:
     image: postgres:16
     environment:
-      POSTGRES_PASSWORD: sieve
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: sieve
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -514,7 +521,7 @@ fn write_docker_compose() -> eyre::Result<()> {
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://postgres:sieve@db:5432/sieve
+      DATABASE_URL: ${DATABASE_URL}
     volumes:
       - ./sieve.toml:/app/sieve.toml:ro
       - ./abis:/app/abis:ro
