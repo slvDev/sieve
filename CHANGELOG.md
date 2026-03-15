@@ -10,6 +10,7 @@
 - `.env` file support via `dotenvy` — `DATABASE_URL` loaded automatically
 - `sieve init` now creates `.env` with default database URL
 - `add-contract` auto-fetches deploy block from Etherscan as `start_block` (override with `--start-block`)
+- `add-contract` spinner and green checkmarks for progress feedback
 - `[p2p].port` TOML config and `--p2p-port` CLI flag to override default 30303
 
 ### Changed

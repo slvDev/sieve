@@ -616,6 +616,7 @@ async fn cmd_add_contract(
     start_block: Option<u64>,
     api_key: Option<&str>,
 ) -> eyre::Result<()> {
+    use owo_colors::OwoColorize;
     use std::io::Write as _;
 
     let parsed: alloy_primitives::Address = address
@@ -637,6 +638,22 @@ async fn cmd_add_contract(
         ));
     }
 
+    // Spinner while fetching from Etherscan
+    let (done_tx, mut done_rx) = watch::channel(false);
+    let spinner_task = tokio::spawn(async move {
+        let mut spinner = ui::Spinner::new();
+        loop {
+            let mut stderr = std::io::stderr();
+            let _ =
+                write!(stderr, "\x1b[2K\r  {} Fetching ABI from Etherscan...", spinner.frame());
+            stderr.flush().ok();
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(80)) => {}
+                _ = done_rx.changed() => break,
+            }
+        }
+    });
+
     let info = etherscan::fetch_contract_info(&checksummed, api_key).await?;
 
     // Fetch creation block if not provided via --start-block
@@ -646,6 +663,11 @@ async fn cmd_add_contract(
             .await
             .unwrap_or(None),
     };
+
+    let _ = done_tx.send(true);
+    spinner_task.await.ok();
+    ui::clear_line();
+    println!("  {} Fetching ABI from Etherscan...", "\u{2713}".green());
 
     let contract_name = name_override.map_or_else(
         || {
@@ -692,12 +714,13 @@ async fn cmd_add_contract(
     file.write_all(toml_block.as_bytes())
         .map_err(|e| eyre::eyre!("failed to write to {}: {e}", cli.config))?;
 
+    let check = "\u{2713}".green();
     if info.is_proxy {
-        println!("  \u{2713} Proxy detected \u{2192} implementation {}", info.name);
+        println!("  {check} Proxy detected \u{2192} implementation {}", info.name);
     }
     let block_info = start_block.map_or_else(String::new, |b| format!(", start_block={b}"));
     println!(
-        "  \u{2713} Added {contract_name} to {}\n    {} events{block_info}",
+        "  {check} Added {contract_name} to {}\n    {} events{block_info}",
         cli.config,
         events.len(),
     );
