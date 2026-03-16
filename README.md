@@ -93,8 +93,8 @@ GraphQL API with built-in GraphiQL explorer:
       OR: [{ from_address: "0xAbc..." }, { to_address: "0xAbc..." }]
       value_gte: "1000000000"
     }
-    order_by: block_number
-    order_direction: desc
+    orderBy: block_number
+    orderDirection: desc
     first: 50
   ) {
     block_number
@@ -195,7 +195,7 @@ start_block = 12_369_621
 [contracts.factory]
 address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 event = "PoolCreated"
-parameter = "pool"
+param = "pool"
 ```
 
 ### Receipt Context Fields
@@ -288,10 +288,10 @@ Both webhook and RabbitMQ streams can run simultaneously. Both are best-effort -
 
 Auto-generated from your TOML config. Every table gets:
 
-- **Filter operators** -- `_eq`, `_ne`, `_gt`, `_gte`, `_lt`, `_lte`, `_in`, `_not_in`, `_contains`, `_starts_with`, `_ends_with`
+- **Filter operators** -- `_eq`, `_ne`, `_gt`, `_gte`, `_lt`, `_lte`, `_in`, `_not_in`, `_contains`, `_starts_with`
 - **Composition** -- `AND` / `OR` for complex filter logic
 - **Pagination** -- cursor-based (`first`/`after`) and offset-based (`first`/`skip`)
-- **Sorting** -- `order_by` + `order_direction`
+- **Sorting** -- `orderBy` + `orderDirection`
 
 ## CLI
 
