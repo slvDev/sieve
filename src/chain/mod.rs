@@ -31,6 +31,24 @@ pub enum ChainKind {
 }
 
 impl ChainKind {
+    /// Canonical chain name (matches the corresponding [`ChainTypes::NAME`]).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Mainnet => EthereumChain::NAME,
+            Self::Base => BaseChain::NAME,
+        }
+    }
+
+    /// Genesis hash of the selected chain.
+    #[must_use]
+    pub fn genesis_hash(self) -> B256 {
+        match self {
+            Self::Mainnet => EthereumChain::chain_spec().genesis_hash(),
+            Self::Base => BaseChain::chain_spec().genesis_hash(),
+        }
+    }
+
     /// Parse a chain name from config.
     ///
     /// # Errors

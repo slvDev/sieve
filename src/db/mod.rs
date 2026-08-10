@@ -430,6 +430,7 @@ pub async fn drop_all_tables(
         "_sieve_factory_children",
         "_sieve_block_hashes",
         "_sieve_checkpoints",
+        "_sieve_chain",
         "_sqlx_migrations",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
@@ -468,6 +469,14 @@ CREATE TABLE IF NOT EXISTS _sieve_factory_children (
     UNIQUE (child_address)
 )";
 
+/// DDL for the `_sieve_chain` table (single-row chain identity).
+pub const CHAIN_IDENTITY_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _sieve_chain (
+    id SMALLINT PRIMARY KEY DEFAULT 1,
+    chain TEXT NOT NULL,
+    genesis_hash BYTEA NOT NULL
+)";
+
 /// Create sieve-internal tables at runtime.
 ///
 /// Uses `CREATE TABLE IF NOT EXISTS` so it is safe to call on every startup.
@@ -496,7 +505,91 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
         .await
         .wrap_err("failed to create _sieve_factory_children")?;
 
+    sqlx::raw_sql(&format!("{CHAIN_IDENTITY_DDL};"))
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to create _sieve_chain")?;
+
     info!("internal tables ready");
+    Ok(())
+}
+
+/// Chain that databases created before chain tracking are assumed to hold.
+///
+/// Sieve only supported Ethereum mainnet before the `_sieve_chain` table
+/// existed, so a database with prior sieve state but no identity row must
+/// be mainnet.
+const LEGACY_CHAIN: &str = "mainnet";
+
+/// Check whether the database holds sieve state from earlier runs:
+/// an advanced checkpoint or any stored block hashes. (The checkpoint and
+/// block hashes are written atomically with indexed data, so a zero
+/// checkpoint with no hashes means nothing was ever indexed.)
+async fn has_prior_sieve_state(db: &Database) -> eyre::Result<bool> {
+    let checkpoint: Option<i64> =
+        sqlx::query_scalar("SELECT block_number FROM _sieve_checkpoints WHERE id = 1")
+            .fetch_optional(db.pool())
+            .await
+            .wrap_err("failed to read checkpoint for chain identity")?;
+    if checkpoint.unwrap_or(0) > 0 {
+        return Ok(true);
+    }
+    let has_hashes: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM _sieve_block_hashes)")
+        .fetch_one(db.pool())
+        .await
+        .wrap_err("failed to check block hashes for chain identity")?;
+    Ok(has_hashes)
+}
+
+/// Bind this database to a chain identity, or verify an existing binding.
+///
+/// The first run stores `(chain, genesis_hash)`; every later run must match
+/// it. This prevents mixing indexed state from different chains when the
+/// same database URL is reused with a changed `chain` config.
+///
+/// A database that predates chain tracking (has sieve state but no identity
+/// row) is treated as [`LEGACY_CHAIN`]: it binds normally under a mainnet
+/// config and is refused for any other chain.
+///
+/// # Errors
+///
+/// Returns an error if the stored identity differs from the given one, if
+/// a legacy database is reused for a non-mainnet chain, or on query failure.
+pub async fn ensure_chain_identity(db: &Database, chain: &str, genesis: B256) -> eyre::Result<()> {
+    let row = sqlx::query("SELECT chain, genesis_hash FROM _sieve_chain WHERE id = 1")
+        .fetch_optional(db.pool())
+        .await
+        .wrap_err("failed to read chain identity")?;
+
+    let Some(row) = row else {
+        if chain != LEGACY_CHAIN && has_prior_sieve_state(db).await? {
+            return Err(eyre::eyre!(
+                "this database contains sieve state from before chain tracking; such databases \
+                 are Ethereum {LEGACY_CHAIN}, but the config selects chain \"{chain}\"; use a \
+                 separate database or run `sieve reset` to wipe it"
+            ));
+        }
+        sqlx::query("INSERT INTO _sieve_chain (id, chain, genesis_hash) VALUES (1, $1, $2)")
+            .bind(chain)
+            .bind(genesis.as_slice())
+            .execute(db.pool())
+            .await
+            .wrap_err("failed to store chain identity")?;
+        info!(chain, genesis = %genesis, "bound database to chain");
+        return Ok(());
+    };
+
+    let stored_chain: String = row.try_get("chain")?;
+    let stored_genesis: Vec<u8> = row.try_get("genesis_hash")?;
+
+    if stored_chain != chain || stored_genesis != genesis.as_slice() {
+        let stored_genesis_hex = alloy_primitives::hex::encode(&stored_genesis);
+        return Err(eyre::eyre!(
+            "database is bound to chain \"{stored_chain}\" (genesis 0x{stored_genesis_hex}) but \
+             config selects chain \"{chain}\" (genesis {genesis}); use a separate database or \
+             run `sieve reset` to wipe it"
+        ));
+    }
     Ok(())
 }
 
@@ -603,6 +696,106 @@ mod tests {
         let db = Database::connect(&url).await?;
         create_internal_tables(&db).await?;
         Ok(db)
+    }
+
+    /// Reset all state the chain-identity logic reads: identity row,
+    /// checkpoint, block hashes.
+    ///
+    /// NOTE: like the other DB tests here, the chain-identity tests mutate
+    /// shared single-row tables — run them with `--test-threads=1`.
+    async fn reset_identity_state(db: &Database) -> eyre::Result<()> {
+        sqlx::query("DELETE FROM _sieve_chain")
+            .execute(db.pool())
+            .await
+            .wrap_err("reset chain failed")?;
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("reset checkpoint failed")?;
+        sqlx::query("DELETE FROM _sieve_block_hashes")
+            .execute(db.pool())
+            .await
+            .wrap_err("reset hashes failed")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn chain_identity_fresh_db_binds_and_verifies() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_identity_state(&db).await?;
+
+        let base_genesis = alloy_primitives::B256::repeat_byte(0x0B);
+        let main_genesis = alloy_primitives::B256::repeat_byte(0x0E);
+
+        // A fresh database binds to base (no legacy state present).
+        ensure_chain_identity(&db, "base", base_genesis).await?;
+
+        // Matching identity passes on subsequent runs.
+        ensure_chain_identity(&db, "base", base_genesis).await?;
+
+        // A different chain is rejected.
+        let result = ensure_chain_identity(&db, "mainnet", main_genesis).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("bound to chain"));
+
+        // Same chain but different genesis is rejected too.
+        let result = ensure_chain_identity(&db, "base", main_genesis).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("bound to chain"));
+
+        reset_identity_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn chain_identity_legacy_db_is_mainnet() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_identity_state(&db).await?;
+
+        // Simulate a pre-chain-tracking database: indexed state exists
+        // (advanced checkpoint) but no identity row.
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 21000000 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("simulate legacy failed")?;
+
+        // Rebinding a legacy database to base must be refused.
+        let result =
+            ensure_chain_identity(&db, "base", alloy_primitives::B256::repeat_byte(0x0B)).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("before chain tracking"));
+
+        // Under a mainnet config the legacy database binds and verifies.
+        let main_genesis = alloy_primitives::B256::repeat_byte(0x0E);
+        ensure_chain_identity(&db, "mainnet", main_genesis).await?;
+        ensure_chain_identity(&db, "mainnet", main_genesis).await?;
+
+        reset_identity_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn chain_identity_legacy_detection_via_block_hashes() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_identity_state(&db).await?;
+
+        // Legacy state can also be just stored block hashes (checkpoint 0).
+        let mut tx = db.begin().await?;
+        store_block_hash(
+            &mut tx,
+            BlockNumber::new(77),
+            alloy_primitives::B256::repeat_byte(0x77).as_slice(),
+        )
+        .await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        let result =
+            ensure_chain_identity(&db, "base", alloy_primitives::B256::repeat_byte(0x0B)).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("before chain tracking"));
+
+        reset_identity_state(&db).await
     }
 
     #[tokio::test]

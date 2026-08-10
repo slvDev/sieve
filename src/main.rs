@@ -159,9 +159,11 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
                     .await?;
             run_indexer(cli, start_block, ctx).await
         }
-        chain::ChainKind::Base => Err(eyre::eyre!(
-            "chain = \"base\" indexing is not enabled yet (requires the chain-identity guard)"
-        )),
+        chain::ChainKind::Base => {
+            let ctx = build_sync_context::<chain::BaseChain>(cli, startup, &db, &metrics, stop_rx)
+                .await?;
+            run_indexer(cli, start_block, ctx).await
+        }
     }
 }
 
@@ -1099,6 +1101,10 @@ async fn setup_database(cli: &cli::Cli, startup: &StartupConfig) -> eyre::Result
         .await?;
     }
     db::create_internal_tables(&db).await?;
+    // Bind or verify the chain identity before creating user tables or
+    // serving anything — a chain mismatch must not mutate schema.
+    // (`--fresh` above is the explicit way to switch chains on a reused DB.)
+    db::ensure_chain_identity(&db, startup.chain.name(), startup.chain.genesis_hash()).await?;
     db::create_user_tables(&db, &startup.resolved_events).await?;
     db::create_transfer_tables(&db, &startup.resolved_transfers).await?;
     db::create_call_tables(&db, &startup.resolved_calls).await?;
