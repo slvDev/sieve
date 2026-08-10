@@ -4,6 +4,7 @@
 //! last indexed block against what peers report. If hashes diverge, walk
 //! backward to find the common ancestor, then roll back indexed data.
 
+use crate::chain::ChainTypes;
 use crate::db::Database;
 use crate::p2p::{request_headers_batch, NetworkPeer, PeerPool};
 use crate::types::BlockNumber;
@@ -28,14 +29,14 @@ const QUORUM: usize = 2;
 /// Outcome of the reorg preflight check.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ReorgCheck {
+pub enum ReorgCheck<C: ChainTypes> {
     /// Stored hash matches the network — no reorg.
     NoReorg,
     /// A quorum of peers agreed on a different hash for the last indexed
     /// block. `anchors` are the peers that voted for `expected_tip`; the
     /// ancestor walk must validate against that exact hash.
     ReorgDetected {
-        anchors: Vec<NetworkPeer>,
+        anchors: Vec<NetworkPeer<C>>,
         expected_tip: alloy_primitives::B256,
     },
     /// No peers could be reached — try again next epoch.
@@ -52,11 +53,11 @@ pub enum ReorgCheck {
 /// # Errors
 ///
 /// Returns an error if the DB read fails.
-pub async fn preflight_reorg(
+pub async fn preflight_reorg<C: ChainTypes>(
     db: &Database,
-    pool: &PeerPool,
+    pool: &PeerPool<C>,
     last_indexed: u64,
-) -> Result<ReorgCheck> {
+) -> Result<ReorgCheck<C>> {
     let Some(stored_hash) = db.get_block_hash(BlockNumber::new(last_indexed)).await? else {
         debug!(
             block = last_indexed,
@@ -134,13 +135,14 @@ impl VoteTally {
 
 /// Probe up to [`MAX_PROBE_PEERS`] peers for the header hash at
 /// `block_number` and tally votes until a quorum agrees.
-async fn probe_peers_for_hash(
-    peers: &[NetworkPeer],
+async fn probe_peers_for_hash<C: ChainTypes>(
+    peers: &[NetworkPeer<C>],
     block_number: u64,
     stored_hash: alloy_primitives::B256,
-) -> ReorgCheck {
+) -> ReorgCheck<C> {
     let mut tally = VoteTally::new(QUORUM.min(peers.len()));
-    let mut divergent_anchors: HashMap<alloy_primitives::B256, Vec<NetworkPeer>> = HashMap::new();
+    let mut divergent_anchors: HashMap<alloy_primitives::B256, Vec<NetworkPeer<C>>> =
+        HashMap::new();
     let mut probed = 0usize;
 
     for peer in peers {
@@ -193,7 +195,7 @@ async fn probe_peers_for_hash(
 }
 
 /// Probe a single peer for the header hash at `block_number`.
-async fn probe_single_peer(peer: &NetworkPeer, block_number: u64) -> ProbeResult {
+async fn probe_single_peer<C: ChainTypes>(peer: &NetworkPeer<C>, block_number: u64) -> ProbeResult {
     let headers = match request_headers_batch(peer, block_number, 1).await {
         Ok(h) => h,
         Err(e) => {
@@ -223,9 +225,9 @@ async fn probe_single_peer(peer: &NetworkPeer, block_number: u64) -> ProbeResult
 ///
 /// Returns an error if the reorg exceeds `MAX_REORG_DEPTH` or if the DB
 /// read fails.
-pub async fn find_common_ancestor(
+pub async fn find_common_ancestor<C: ChainTypes>(
     db: &Database,
-    anchors: &[NetworkPeer],
+    anchors: &[NetworkPeer<C>],
     last_indexed: u64,
     expected_tip: alloy_primitives::B256,
 ) -> Result<Option<u64>> {

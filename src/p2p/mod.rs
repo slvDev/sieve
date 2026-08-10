@@ -1,20 +1,21 @@
 //! P2P networking layer.
 //!
-//! Connects to Ethereum mainnet via devp2p, discovers peers, establishes
-//! sessions, and maintains a pool of active peers for future data fetching.
+//! Connects to a chain's devp2p network, discovers peers, establishes
+//! sessions, and maintains a pool of active peers for data fetching.
+//! Generic over [`ChainTypes`] so the same engine serves every supported
+//! chain.
 
-use alloy_consensus::proofs;
+use alloy_consensus::{proofs, BlockBody};
 use alloy_primitives::B256;
 use eyre::{eyre, Result, WrapErr};
 use futures::StreamExt;
 use parking_lot::RwLock;
-use reth_chainspec::MAINNET;
-use reth_eth_wire::{EthNetworkPrimitives, EthVersion};
+use reth_chainspec::EthChainSpec;
+use reth_eth_wire::EthVersion;
 use reth_eth_wire_types::{
     BlockHashOrNumber, GetBlockBodies, GetBlockHeaders, GetReceipts, GetReceipts70,
     HeadersDirection,
 };
-use reth_ethereum_primitives::Receipt;
 use reth_network::config::{rng_secret_key, NetworkConfigBuilder};
 use reth_network::import::ProofOfStakeBlockImport;
 use reth_network::{NetworkHandle, PeersConfig, PeersInfo};
@@ -33,6 +34,7 @@ use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{sleep, timeout, Duration, Instant};
 use tracing::{debug, info};
 
+use crate::chain::ChainTypes;
 use crate::sync::BlockPayload;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
@@ -47,13 +49,26 @@ const MAX_HEADERS_PER_REQUEST: usize = 1024;
 // ── NetworkPeer ──────────────────────────────────────────────────────
 
 /// Active peer session information used for requests.
-#[derive(Clone, Debug)]
-pub struct NetworkPeer {
+#[derive(Debug)]
+pub struct NetworkPeer<C: ChainTypes> {
     pub peer_id: PeerId,
     pub eth_version: EthVersion,
-    pub messages: PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
+    pub messages: PeerRequestSender<PeerRequest<C::Net>>,
     pub head_number: u64,
     pub last_success: Instant,
+}
+
+// Manual Clone: `C` itself need not be `Clone`, and derive would require it.
+impl<C: ChainTypes> Clone for NetworkPeer<C> {
+    fn clone(&self) -> Self {
+        Self {
+            peer_id: self.peer_id,
+            eth_version: self.eth_version,
+            messages: self.messages.clone(),
+            head_number: self.head_number,
+            last_success: self.last_success,
+        }
+    }
 }
 
 // ── P2pStats ─────────────────────────────────────────────────────────
@@ -80,13 +95,13 @@ impl P2pStats {
 
 // ── PeerPool ─────────────────────────────────────────────────────────
 
-/// Thread-safe pool of active Ethereum peers.
+/// Thread-safe pool of active peers.
 #[derive(Debug)]
-pub struct PeerPool {
-    peers: RwLock<Vec<NetworkPeer>>,
+pub struct PeerPool<C: ChainTypes> {
+    peers: RwLock<Vec<NetworkPeer<C>>>,
 }
 
-impl PeerPool {
+impl<C: ChainTypes> PeerPool<C> {
     const fn new() -> Self {
         Self {
             peers: RwLock::new(Vec::new()),
@@ -101,12 +116,12 @@ impl PeerPool {
 
     /// Clone the current list of peers (snapshot in time).
     #[must_use]
-    pub fn snapshot(&self) -> Vec<NetworkPeer> {
+    pub fn snapshot(&self) -> Vec<NetworkPeer<C>> {
         self.peers.read().clone()
     }
 
     /// Add a peer if not already present.
-    fn add_peer(&self, peer: NetworkPeer) {
+    fn add_peer(&self, peer: NetworkPeer<C>) {
         let mut peers = self.peers.write();
         if peers
             .iter()
@@ -218,8 +233,8 @@ pub struct HeaderFetchOutcome {
 
 /// Outcome of a full payload fetch for a peer.
 #[derive(Debug)]
-pub struct PayloadFetchOutcome {
-    pub payloads: Vec<BlockPayload>,
+pub struct PayloadFetchOutcome<C: ChainTypes> {
+    pub payloads: Vec<BlockPayload<C>>,
     pub missing_blocks: Vec<u64>,
     pub bloom_skipped: Vec<u64>,
     pub fetch_stats: FetchStageStats,
@@ -229,25 +244,26 @@ pub struct PayloadFetchOutcome {
 
 /// Keeps the network handle alive and provides access to the peer pool.
 #[derive(Debug)]
-pub struct NetworkSession {
+pub struct NetworkSession<C: ChainTypes> {
     /// Must be held alive to keep the P2P network running.
     #[expect(dead_code, reason = "held alive to keep network running")]
-    pub handle: NetworkHandle<EthNetworkPrimitives>,
-    pub pool: Arc<PeerPool>,
+    pub handle: NetworkHandle<C::Net>,
+    pub pool: Arc<PeerPool<C>>,
     /// Aggregate connection statistics.
     #[expect(dead_code, reason = "populated for future metrics/logging")]
     pub p2p_stats: Arc<P2pStats>,
 }
 
-// ── connect_mainnet_peers ────────────────────────────────────────────
+// ── connect_peers ────────────────────────────────────────────────────
 
-/// Start the devp2p network, discover peers, and wait for initial connections.
+/// Start the devp2p network for chain `C`, discover peers, and wait for
+/// initial connections.
 ///
 /// # Errors
 ///
 /// Returns an error if the network fails to start or no peers connect
 /// within the configured timeout.
-pub async fn connect_mainnet_peers(p2p_port: Option<u16>) -> Result<NetworkSession> {
+pub async fn connect_peers<C: ChainTypes>(p2p_port: Option<u16>) -> Result<NetworkSession<C>> {
     let secret_key = rng_secret_key();
     let peers_config = PeersConfig::default()
         .with_max_outbound(MAX_OUTBOUND)
@@ -255,8 +271,11 @@ pub async fn connect_mainnet_peers(p2p_port: Option<u16>) -> Result<NetworkSessi
         .with_max_concurrent_dials(MAX_CONCURRENT_DIALS)
         .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS));
 
-    let mut builder = NetworkConfigBuilder::<EthNetworkPrimitives>::new(secret_key)
-        .mainnet_boot_nodes()
+    let chain_spec = C::chain_spec();
+    let boot_nodes = chain_spec.bootnodes().unwrap_or_default();
+
+    let mut builder = NetworkConfigBuilder::<C::Net>::new(secret_key)
+        .boot_nodes(boot_nodes)
         .peer_config(peers_config)
         .disable_tx_gossip(true)
         .block_import(Box::new(ProofOfStakeBlockImport::default()));
@@ -266,18 +285,25 @@ pub async fn connect_mainnet_peers(p2p_port: Option<u16>) -> Result<NetworkSessi
         builder = builder.listener_addr(addr).discovery_addr(addr);
     }
 
-    let net_config = builder.build_with_noop_provider(MAINNET.clone());
+    let net_config = builder
+        .build(reth_storage_api::noop::NoopProvider::<C::Spec, C::Primitives>::new(chain_spec));
 
     let handle = net_config
         .start_network()
         .await
         .wrap_err("failed to start p2p network")?;
 
-    let pool = Arc::new(PeerPool::new());
+    let pool = Arc::new(PeerPool::<C>::new());
     let p2p_stats = Arc::new(P2pStats::new());
 
-    spawn_peer_discovery_watcher(handle.clone(), Arc::clone(&p2p_stats));
-    spawn_peer_watcher(handle.clone(), Arc::clone(&pool), Arc::clone(&p2p_stats));
+    let genesis_hash = C::chain_spec().genesis_hash();
+    spawn_peer_discovery_watcher::<C>(handle.clone(), Arc::clone(&p2p_stats));
+    spawn_peer_watcher::<C>(
+        handle.clone(),
+        Arc::clone(&pool),
+        Arc::clone(&p2p_stats),
+        genesis_hash,
+    );
 
     let warmup_started = Instant::now();
     let _connected =
@@ -292,6 +318,7 @@ pub async fn connect_mainnet_peers(p2p_port: Option<u16>) -> Result<NetworkSessi
     }
 
     info!(
+        chain = C::NAME,
         reth_connected = handle.num_connected_peers(),
         pool_peers = pool.len(),
         discovered = p2p_stats.discovered_count.load(Ordering::Relaxed),
@@ -311,10 +338,11 @@ pub async fn connect_mainnet_peers(p2p_port: Option<u16>) -> Result<NetworkSessi
 
 /// Watch for peer session events and update the pool accordingly.
 /// Also probes each new peer's head block number via semaphore-limited tasks.
-fn spawn_peer_watcher(
-    handle: NetworkHandle<EthNetworkPrimitives>,
-    pool: Arc<PeerPool>,
+fn spawn_peer_watcher<C: ChainTypes>(
+    handle: NetworkHandle<C::Net>,
+    pool: Arc<PeerPool<C>>,
     p2p_stats: Arc<P2pStats>,
+    genesis_hash: B256,
 ) {
     tokio::spawn(async move {
         let mut events = handle.event_listener();
@@ -326,7 +354,7 @@ fn spawn_peer_watcher(
                         .sessions_established
                         .fetch_add(1, Ordering::Relaxed);
 
-                    if info.status.genesis != MAINNET.genesis_hash() {
+                    if info.status.genesis != genesis_hash {
                         p2p_stats
                             .genesis_mismatch_count
                             .fetch_add(1, Ordering::Relaxed);
@@ -363,7 +391,9 @@ fn spawn_peer_watcher(
                         let Ok(_permit) = semaphore.acquire_owned().await else {
                             return;
                         };
-                        match request_head_number(peer_id, head_hash, &messages_for_probe).await {
+                        match request_head_number::<C>(peer_id, head_hash, &messages_for_probe)
+                            .await
+                        {
                             Ok(head_number) => {
                                 pool_for_probe.update_peer_head(peer_id, head_number);
                             }
@@ -399,8 +429,8 @@ fn spawn_peer_watcher(
 // ── spawn_peer_discovery_watcher ─────────────────────────────────────
 
 /// Watch discovery events and count discovered peers.
-fn spawn_peer_discovery_watcher(
-    handle: NetworkHandle<EthNetworkPrimitives>,
+fn spawn_peer_discovery_watcher<C: ChainTypes>(
+    handle: NetworkHandle<C::Net>,
     p2p_stats: Arc<P2pStats>,
 ) {
     tokio::spawn(async move {
@@ -434,8 +464,8 @@ fn spawn_peer_discovery_watcher(
 /// # Errors
 ///
 /// Returns an error if the timeout expires and zero peers have connected.
-async fn wait_for_peer_pool(
-    pool: Arc<PeerPool>,
+async fn wait_for_peer_pool<C: ChainTypes>(
+    pool: Arc<PeerPool<C>>,
     target: usize,
     timeout_after: Option<Duration>,
 ) -> Result<usize> {
@@ -480,8 +510,8 @@ static HEAD_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 /// # Errors
 ///
 /// Returns an error only on unexpected failures (not peer timeouts).
-pub async fn discover_head_p2p(
-    pool: &PeerPool,
+pub async fn discover_head_p2p<C: ChainTypes>(
+    pool: &PeerPool<C>,
     baseline: u64,
     probe_peers: usize,
     probe_limit: usize,
@@ -532,23 +562,23 @@ pub async fn discover_head_p2p(
 
 // ── Low-level request functions ──────────────────────────────────────
 
-async fn request_head_number(
+async fn request_head_number<C: ChainTypes>(
     peer_id: PeerId,
     head_hash: B256,
-    messages: &PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
+    messages: &PeerRequestSender<PeerRequest<C::Net>>,
 ) -> Result<u64> {
-    let headers = request_headers_by_hash(peer_id, head_hash, messages).await?;
+    let headers = request_headers_by_hash::<C>(peer_id, head_hash, messages).await?;
     let header = headers
         .first()
         .ok_or_else(|| eyre!("empty header response for head"))?;
     Ok(header.number)
 }
 
-async fn request_headers_by_number(
+async fn request_headers_by_number<C: ChainTypes>(
     peer_id: PeerId,
     start_block: u64,
     limit: usize,
-    messages: &PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
+    messages: &PeerRequestSender<PeerRequest<C::Net>>,
 ) -> Result<Vec<Header>> {
     let request = GetBlockHeaders {
         start_block: BlockHashOrNumber::Number(start_block),
@@ -571,10 +601,10 @@ async fn request_headers_by_number(
     Ok(headers.0)
 }
 
-async fn request_headers_by_hash(
+async fn request_headers_by_hash<C: ChainTypes>(
     peer_id: PeerId,
     hash: B256,
-    messages: &PeerRequestSender<PeerRequest<EthNetworkPrimitives>>,
+    messages: &PeerRequestSender<PeerRequest<C::Net>>,
 ) -> Result<Vec<Header>> {
     let request = GetBlockHeaders {
         start_block: BlockHashOrNumber::Hash(hash),
@@ -597,10 +627,10 @@ async fn request_headers_by_hash(
     Ok(headers.0)
 }
 
-async fn request_bodies(
-    peer: &NetworkPeer,
+async fn request_bodies<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     hashes: &[B256],
-) -> Result<Vec<reth_ethereum_primitives::BlockBody>> {
+) -> Result<Vec<BlockBody<C::SignedTx>>> {
     let request = GetBlockBodies::from(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
@@ -617,7 +647,10 @@ async fn request_bodies(
     Ok(bodies.0)
 }
 
-async fn request_receipts_legacy(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
+async fn request_receipts_legacy<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
+    hashes: &[B256],
+) -> Result<Vec<Vec<C::Receipt>>> {
     let request = GetReceipts(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
@@ -638,7 +671,10 @@ async fn request_receipts_legacy(peer: &NetworkPeer, hashes: &[B256]) -> Result<
         .collect())
 }
 
-async fn request_receipts69(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
+async fn request_receipts69<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
+    hashes: &[B256],
+) -> Result<Vec<Vec<C::Receipt>>> {
     let request = GetReceipts(hashes.to_vec());
     let (tx, rx) = oneshot::channel();
     peer.messages
@@ -655,7 +691,10 @@ async fn request_receipts69(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<V
     Ok(receipts.0)
 }
 
-async fn request_receipts70(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
+async fn request_receipts70<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
+    hashes: &[B256],
+) -> Result<Vec<Vec<C::Receipt>>> {
     let request = GetReceipts70 {
         first_block_receipt_index: 0,
         block_hashes: hashes.to_vec(),
@@ -684,16 +723,16 @@ async fn request_receipts70(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<V
 /// # Errors
 ///
 /// Returns an error if the P2P request times out or the peer disconnects.
-pub async fn request_headers_batch(
-    peer: &NetworkPeer,
+pub async fn request_headers_batch<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     start_block: u64,
     limit: usize,
 ) -> Result<Vec<Header>> {
-    request_headers_by_number(peer.peer_id, start_block, limit, &peer.messages).await
+    request_headers_by_number::<C>(peer.peer_id, start_block, limit, &peer.messages).await
 }
 
-async fn request_headers_chunked_with_stats(
-    peer: &NetworkPeer,
+async fn request_headers_chunked_with_stats<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     start_block: u64,
     count: usize,
 ) -> Result<HeadersChunkedResponse> {
@@ -730,7 +769,10 @@ async fn request_headers_chunked_with_stats(
 /// # Errors
 ///
 /// Returns an error if the P2P request times out or the peer disconnects.
-pub async fn request_receipts(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec<Vec<Receipt>>> {
+pub async fn request_receipts<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
+    hashes: &[B256],
+) -> Result<Vec<Vec<C::Receipt>>> {
     match peer.eth_version {
         EthVersion::Eth70 => request_receipts70(peer, hashes).await,
         EthVersion::Eth69 => request_receipts69(peer, hashes).await,
@@ -738,10 +780,10 @@ pub async fn request_receipts(peer: &NetworkPeer, hashes: &[B256]) -> Result<Vec
     }
 }
 
-async fn request_bodies_chunked_partial_with_stats(
-    peer: &NetworkPeer,
+async fn request_bodies_chunked_partial_with_stats<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     hashes: &[B256],
-) -> Result<ChunkedResponse<reth_ethereum_primitives::BlockBody>> {
+) -> Result<ChunkedResponse<BlockBody<C::SignedTx>>> {
     if hashes.is_empty() {
         return Ok(ChunkedResponse {
             results: Vec::new(),
@@ -749,7 +791,7 @@ async fn request_bodies_chunked_partial_with_stats(
         });
     }
 
-    let mut results: Vec<Option<reth_ethereum_primitives::BlockBody>> = vec![None; hashes.len()];
+    let mut results: Vec<Option<BlockBody<C::SignedTx>>> = vec![None; hashes.len()];
     let mut cursor = 0usize;
     let mut requests = 0u64;
     while cursor < hashes.len() {
@@ -780,10 +822,10 @@ async fn request_bodies_chunked_partial_with_stats(
     Ok(ChunkedResponse { results, requests })
 }
 
-async fn request_receipts_chunked_partial_with_stats(
-    peer: &NetworkPeer,
+async fn request_receipts_chunked_partial_with_stats<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     hashes: &[B256],
-) -> Result<ChunkedResponse<Vec<Receipt>>> {
+) -> Result<ChunkedResponse<Vec<C::Receipt>>> {
     if hashes.is_empty() {
         return Ok(ChunkedResponse {
             results: Vec::new(),
@@ -791,7 +833,7 @@ async fn request_receipts_chunked_partial_with_stats(
         });
     }
 
-    let mut results: Vec<Option<Vec<Receipt>>> = vec![None; hashes.len()];
+    let mut results: Vec<Option<Vec<C::Receipt>>> = vec![None; hashes.len()];
     let mut cursor = 0usize;
     let mut requests = 0u64;
     while cursor < hashes.len() {
@@ -833,8 +875,8 @@ async fn request_receipts_chunked_partial_with_stats(
 ///
 /// Returns an error if the underlying P2P requests fail.
 /// Fetch only headers for a block range from a peer.
-pub async fn fetch_headers_for_peer(
-    peer: &NetworkPeer,
+pub async fn fetch_headers_for_peer<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     range: std::ops::RangeInclusive<u64>,
 ) -> Result<HeaderFetchOutcome> {
     let start = *range.start();
@@ -904,10 +946,10 @@ fn seal_and_verify_continuity(
 /// Recomputes the transaction, ommers, withdrawals, and receipt roots from
 /// the fetched data and compares them to the header commitments. Receipt
 /// blooms are recomputed from logs, never trusted from the peer.
-fn validate_payload(
+fn validate_payload<C: ChainTypes>(
     header: &Header,
-    body: &reth_ethereum_primitives::BlockBody,
-    receipts: &[Receipt],
+    body: &BlockBody<C::SignedTx>,
+    receipts: &[C::Receipt],
 ) -> Result<(), &'static str> {
     if body.transactions.len() != receipts.len() {
         return Err("transaction/receipt count mismatch");
@@ -921,7 +963,7 @@ fn validate_payload(
     if body.calculate_withdrawals_root() != header.withdrawals_root {
         return Err("withdrawals root mismatch");
     }
-    if Receipt::calculate_receipt_root_no_memo(receipts) != header.receipts_root {
+    if C::receipts_root(receipts, header) != header.receipts_root {
         return Err("receipts root mismatch");
     }
     Ok(())
@@ -932,10 +974,10 @@ fn validate_payload(
 /// Headers must already be fetched and sealed; this uses their hashes to
 /// request the corresponding bodies and receipts in parallel, then validates
 /// each payload against the header commitments before returning it.
-pub async fn fetch_payloads_for_headers(
-    peer: &NetworkPeer,
+pub async fn fetch_payloads_for_headers<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     ordered_headers: Vec<SealedHeader>,
-) -> Result<PayloadFetchOutcome> {
+) -> Result<PayloadFetchOutcome<C>> {
     if ordered_headers.is_empty() {
         return Ok(PayloadFetchOutcome {
             payloads: Vec::new(),
@@ -973,7 +1015,8 @@ pub async fn fetch_payloads_for_headers(
 
         match (body, block_receipts) {
             (Some(body), Some(block_receipts)) => {
-                if let Err(reason) = validate_payload(sealed.header(), &body, &block_receipts) {
+                if let Err(reason) = validate_payload::<C>(sealed.header(), &body, &block_receipts)
+                {
                     debug!(
                         peer_id = ?peer.peer_id,
                         block = number,
@@ -1011,10 +1054,10 @@ pub async fn fetch_payloads_for_headers(
 }
 
 /// Fetch full block payloads (headers + bodies + receipts) for a range.
-pub async fn fetch_payloads_for_peer(
-    peer: &NetworkPeer,
+pub async fn fetch_payloads_for_peer<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     range: std::ops::RangeInclusive<u64>,
-) -> Result<PayloadFetchOutcome> {
+) -> Result<PayloadFetchOutcome<C>> {
     let header_outcome = fetch_headers_for_peer(peer, range).await?;
 
     if header_outcome.headers.is_empty() {
@@ -1042,12 +1085,21 @@ pub async fn fetch_payloads_for_peer(
 #[cfg(test)]
 mod tests {
     use super::{seal_and_verify_continuity, validate_payload};
+    use crate::chain::EthereumChain;
     use crate::test_utils::{build_test_transaction, make_log, make_receipt};
     use alloy_consensus::proofs;
     use alloy_primitives::{Address, Bytes, B256};
     use reth_ethereum_primitives::{BlockBody, Receipt};
     use reth_primitives_traits::{Header, SealedHeader};
     use std::collections::HashMap;
+
+    fn validate(
+        header: &Header,
+        body: &BlockBody,
+        receipts: &[Receipt],
+    ) -> Result<(), &'static str> {
+        validate_payload::<EthereumChain>(header, body, receipts)
+    }
 
     /// Build a header whose roots match the given body and receipts.
     fn consistent_header_for(
@@ -1076,7 +1128,7 @@ mod tests {
     fn validate_payload_accepts_consistent_empty_payload() {
         let header = consistent_header(1, B256::ZERO);
         let body = BlockBody::default();
-        assert!(validate_payload(&header, &body, &[]).is_ok());
+        assert!(validate(&header, &body, &[]).is_ok());
     }
 
     #[test]
@@ -1092,7 +1144,7 @@ mod tests {
         );
         let receipts = vec![make_receipt(vec![log])];
         let header = consistent_header_for(1, B256::ZERO, &body, &receipts);
-        assert!(validate_payload(&header, &body, &receipts).is_ok());
+        assert!(validate(&header, &body, &receipts).is_ok());
     }
 
     #[test]
@@ -1115,7 +1167,7 @@ mod tests {
             Bytes::from_static(&[0x02]),
         );
         let forged_receipts = vec![make_receipt(vec![forged_log])];
-        let result = validate_payload(&header, &body, &forged_receipts);
+        let result = validate(&header, &body, &forged_receipts);
         assert_eq!(result, Err("receipts root mismatch"));
     }
 
@@ -1126,7 +1178,7 @@ mod tests {
             ..consistent_header(1, B256::ZERO)
         };
         let body = BlockBody::default();
-        let result = validate_payload(&header, &body, &[]);
+        let result = validate(&header, &body, &[]);
         assert_eq!(result, Err("transactions root mismatch"));
     }
 
@@ -1135,7 +1187,7 @@ mod tests {
         let header = consistent_header(1, B256::ZERO);
         let body = BlockBody::default();
         let receipts = vec![make_receipt(vec![])];
-        let result = validate_payload(&header, &body, &receipts);
+        let result = validate(&header, &body, &receipts);
         assert_eq!(result, Err("transaction/receipt count mismatch"));
     }
 
@@ -1146,7 +1198,7 @@ mod tests {
             ..consistent_header(1, B256::ZERO)
         };
         let body = BlockBody::default();
-        let result = validate_payload(&header, &body, &[]);
+        let result = validate(&header, &body, &[]);
         assert_eq!(result, Err("receipts root mismatch"));
     }
 
@@ -1157,7 +1209,7 @@ mod tests {
             ..consistent_header(1, B256::ZERO)
         };
         let body = BlockBody::default();
-        let result = validate_payload(&header, &body, &[]);
+        let result = validate(&header, &body, &[]);
         assert_eq!(result, Err("ommers root mismatch"));
     }
 
@@ -1168,7 +1220,7 @@ mod tests {
             ..consistent_header(1, B256::ZERO)
         };
         let body = BlockBody::default();
-        let result = validate_payload(&header, &body, &[]);
+        let result = validate(&header, &body, &[]);
         assert_eq!(result, Err("withdrawals root mismatch"));
     }
 

@@ -3,6 +3,7 @@
 //! Peer feeder, ready set deduplication, quality-based peer selection,
 //! and JoinSet task tracking.
 
+use crate::chain::ChainTypes;
 use crate::config::IndexConfig;
 use crate::config::Selector;
 use crate::db::{self, Database};
@@ -22,7 +23,9 @@ use crate::types::{BlockNumber, TxIndex};
 use crate::{decode, filter};
 
 use alloy_consensus::transaction::SignerRecoverable;
+use alloy_consensus::transaction::TxHashRef;
 use alloy_consensus::Transaction;
+use alloy_consensus::TxReceipt;
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_primitives::{Address, TxKind, B256};
 use eyre::WrapErr;
@@ -121,14 +124,14 @@ struct ProcessOutcome {
 ///
 /// Created by [`prepare_block`], consumed by [`flush_batch`].
 /// Keeps the original [`BlockPayload`] for transfer/call scanning.
-struct ProcessedBlock {
+struct ProcessedBlock<C: ChainTypes> {
     block_number: BlockNumber,
     block_hash: B256,
     factory_discoveries: Vec<filter::FactoryDiscovery>,
     decoded_events: Vec<decode::DecodedEvent>,
     matched_count: u64,
     receipt_count: u64,
-    payload: BlockPayload,
+    payload: BlockPayload<C>,
 }
 
 // Compile-time size assertions for hot types (reth pattern).
@@ -145,10 +148,10 @@ const _: [(); 72] = [(); core::mem::size_of::<SyncOutcome>()];
 ///
 /// Returns an error if the sync encounters an unrecoverable failure.
 #[instrument(skip_all, fields(start_block = start_block.as_u64(), end_block = end_block.as_u64()))]
-pub async fn run_sync(
+pub async fn run_sync<C: ChainTypes>(
     start_block: BlockNumber,
     end_block: BlockNumber,
-    ctx: SyncContext,
+    ctx: SyncContext<C>,
 ) -> eyre::Result<SyncOutcome> {
     let started = Instant::now();
     let total_blocks = end_block.as_u64().saturating_sub(start_block.as_u64()) + 1;
@@ -172,9 +175,9 @@ pub async fn run_sync(
     ));
 
     // Channels
-    let (payload_tx, payload_rx) = mpsc::channel::<BlockPayload>(PAYLOAD_CHANNEL_SIZE);
-    let (processed_tx, processed_rx) = mpsc::channel::<ProcessedBlock>(PROCESSED_CHANNEL_SIZE);
-    let (ready_tx, ready_rx) = mpsc::unbounded_channel::<NetworkPeer>();
+    let (payload_tx, payload_rx) = mpsc::channel::<BlockPayload<C>>(PAYLOAD_CHANNEL_SIZE);
+    let (processed_tx, processed_rx) = mpsc::channel::<ProcessedBlock<C>>(PROCESSED_CHANNEL_SIZE);
+    let (ready_tx, ready_rx) = mpsc::unbounded_channel::<NetworkPeer<C>>();
 
     // Local shutdown signal for the peer feeder (triggered when fetch loop exits)
     let (feeder_shutdown_tx, feeder_shutdown_rx) = watch::channel(false);
@@ -264,9 +267,9 @@ pub async fn run_sync(
 
 // ── Peer feeder ──────────────────────────────────────────────────────
 
-fn spawn_peer_feeder(
-    pool: Arc<PeerPool>,
-    ready_tx: mpsc::UnboundedSender<NetworkPeer>,
+fn spawn_peer_feeder<C: ChainTypes>(
+    pool: Arc<PeerPool<C>>,
+    ready_tx: mpsc::UnboundedSender<NetworkPeer<C>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -302,38 +305,38 @@ fn spawn_peer_feeder(
 // ── Main fetch loop ──────────────────────────────────────────────────
 
 /// Shared references for the fetch loop (reduces argument counts).
-struct FetchLoopContext<'a> {
+struct FetchLoopContext<'a, C: ChainTypes> {
     scheduler: &'a Arc<PeerWorkScheduler>,
     peer_health: &'a Arc<PeerHealthTracker>,
-    pool: &'a Arc<PeerPool>,
+    pool: &'a Arc<PeerPool<C>>,
     active_tasks: &'a Arc<AtomicUsize>,
     metrics: &'a Arc<SieveMetrics>,
     start_block: BlockNumber,
     end_block: BlockNumber,
-    payload_tx: &'a mpsc::Sender<BlockPayload>,
-    ready_tx: &'a mpsc::UnboundedSender<NetworkPeer>,
+    payload_tx: &'a mpsc::Sender<BlockPayload<C>>,
+    ready_tx: &'a mpsc::UnboundedSender<NetworkPeer<C>>,
     bloom_filter: &'a Option<Arc<crate::filter::BloomFilter>>,
     head_seen_rx: &'a Option<watch::Receiver<u64>>,
 }
 
 /// Mutable state carried across fetch loop iterations.
-struct FetchLoopState {
+struct FetchLoopState<C: ChainTypes> {
     fetch_tasks: JoinSet<()>,
-    ready_peers: Vec<NetworkPeer>,
+    ready_peers: Vec<NetworkPeer<C>>,
     ready_set: HashSet<PeerId>,
     last_progress_check: Instant,
     last_progress_completed: u64,
 }
 
 #[instrument(skip_all)]
-async fn run_fetch_loop(
-    ctx: &FetchLoopContext<'_>,
-    mut ready_rx: mpsc::UnboundedReceiver<NetworkPeer>,
+async fn run_fetch_loop<C: ChainTypes>(
+    ctx: &FetchLoopContext<'_, C>,
+    mut ready_rx: mpsc::UnboundedReceiver<NetworkPeer<C>>,
     stop_rx: &watch::Receiver<bool>,
     abort_rx: &watch::Receiver<bool>,
 ) {
     let fetch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
-    let mut state = FetchLoopState {
+    let mut state = FetchLoopState::<C> {
         fetch_tasks: JoinSet::new(),
         ready_peers: Vec::new(),
         ready_set: HashSet::new(),
@@ -383,10 +386,10 @@ async fn run_fetch_loop(
 
 /// Run one dispatch iteration: reap tasks, check progress, acquire permit,
 /// dispatch. Returns `false` if the scheduler is done.
-async fn try_dispatch_iteration(
-    ctx: &FetchLoopContext<'_>,
+async fn try_dispatch_iteration<C: ChainTypes>(
+    ctx: &FetchLoopContext<'_, C>,
     semaphore: &Arc<Semaphore>,
-    state: &mut FetchLoopState,
+    state: &mut FetchLoopState<C>,
 ) -> bool {
     while state.fetch_tasks.try_join_next().is_some() {}
 
@@ -425,10 +428,10 @@ async fn try_dispatch_iteration(
 
 /// Block until the first peer arrives, add it to the ready set.
 /// Returns `false` if the channel closed.
-async fn await_first_peer(
-    ready_rx: &mut mpsc::UnboundedReceiver<NetworkPeer>,
-    pool: &PeerPool,
-    ready_peers: &mut Vec<NetworkPeer>,
+async fn await_first_peer<C: ChainTypes>(
+    ready_rx: &mut mpsc::UnboundedReceiver<NetworkPeer<C>>,
+    pool: &PeerPool<C>,
+    ready_peers: &mut Vec<NetworkPeer<C>>,
     ready_set: &mut HashSet<PeerId>,
     abort_rx: &watch::Receiver<bool>,
 ) -> bool {
@@ -450,9 +453,9 @@ async fn await_first_peer(
 }
 
 /// Pick the best peer, check health, get a batch, and spawn a fetch task.
-async fn dispatch_best_peer(
-    ctx: &FetchLoopContext<'_>,
-    ready_peers: &mut Vec<NetworkPeer>,
+async fn dispatch_best_peer<C: ChainTypes>(
+    ctx: &FetchLoopContext<'_, C>,
+    ready_peers: &mut Vec<NetworkPeer<C>>,
     ready_set: &mut HashSet<PeerId>,
     fetch_tasks: &mut JoinSet<()>,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -554,9 +557,9 @@ enum PeerAction {
 
 /// Check if a peer is eligible for dispatch. Returns `None` if eligible,
 /// or `Some(action)` if the peer should be skipped.
-async fn check_peer_eligibility(
-    ctx: &FetchLoopContext<'_>,
-    peer: &NetworkPeer,
+async fn check_peer_eligibility<C: ChainTypes>(
+    ctx: &FetchLoopContext<'_, C>,
+    peer: &NetworkPeer<C>,
 ) -> Option<PeerAction> {
     // Cooling-down peers
     if ctx.peer_health.is_peer_cooling_down(peer.peer_id).await {
@@ -601,10 +604,10 @@ async fn check_peer_eligibility(
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Non-blocking drain of ready channel, refreshing peer heads from pool.
-fn drain_ready_peers(
-    ready_rx: &mut mpsc::UnboundedReceiver<NetworkPeer>,
-    pool: &PeerPool,
-    ready_peers: &mut Vec<NetworkPeer>,
+fn drain_ready_peers<C: ChainTypes>(
+    ready_rx: &mut mpsc::UnboundedReceiver<NetworkPeer<C>>,
+    pool: &PeerPool<C>,
+    ready_peers: &mut Vec<NetworkPeer<C>>,
     ready_set: &mut HashSet<PeerId>,
 ) {
     while let Ok(mut peer) = ready_rx.try_recv() {
@@ -618,8 +621,8 @@ fn drain_ready_peers(
 }
 
 /// Pick the best peer by quality score.
-async fn pick_best_ready_peer_index(
-    peers: &[NetworkPeer],
+async fn pick_best_ready_peer_index<C: ChainTypes>(
+    peers: &[NetworkPeer<C>],
     peer_health: &PeerHealthTracker,
 ) -> usize {
     let mut best_idx = 0usize;
@@ -640,7 +643,11 @@ async fn pick_best_ready_peer_index(
     best_idx
 }
 
-fn recycle_peer(ready_tx: &mpsc::UnboundedSender<NetworkPeer>, peer: NetworkPeer, delay_ms: u64) {
+fn recycle_peer<C: ChainTypes>(
+    ready_tx: &mpsc::UnboundedSender<NetworkPeer<C>>,
+    peer: NetworkPeer<C>,
+    delay_ms: u64,
+) {
     let tx = ready_tx.clone();
     tokio::spawn(async move {
         sleep(Duration::from_millis(delay_ms)).await;
@@ -648,10 +655,10 @@ fn recycle_peer(ready_tx: &mpsc::UnboundedSender<NetworkPeer>, peer: NetworkPeer
     });
 }
 
-async fn check_progress(
+async fn check_progress<C: ChainTypes>(
     scheduler: &PeerWorkScheduler,
     active_tasks: &AtomicUsize,
-    pool: &PeerPool,
+    pool: &PeerPool<C>,
     metrics: &SieveMetrics,
     last_check: &mut Instant,
     last_completed: &mut u64,
@@ -704,9 +711,9 @@ async fn check_progress(
     clippy::needless_pass_by_value,
     reason = "Arc/Sender are cloned into spawned tasks"
 )]
-fn spawn_processing_workers(
-    payload_rx: mpsc::Receiver<BlockPayload>,
-    processed_tx: mpsc::Sender<ProcessedBlock>,
+fn spawn_processing_workers<C: ChainTypes>(
+    payload_rx: mpsc::Receiver<BlockPayload<C>>,
+    processed_tx: mpsc::Sender<ProcessedBlock<C>>,
     config: Arc<IndexConfig>,
     factories: Arc<Vec<ResolvedFactory>>,
 ) -> JoinSet<()> {
@@ -748,13 +755,13 @@ fn spawn_processing_workers(
     reason = "grouping these into a struct would add complexity without benefit"
 )]
 #[instrument(skip_all)]
-async fn consume_payloads(
-    mut processed_rx: mpsc::Receiver<ProcessedBlock>,
+async fn consume_payloads<C: ChainTypes>(
+    mut processed_rx: mpsc::Receiver<ProcessedBlock<C>>,
     config: Arc<IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
     metrics: Arc<SieveMetrics>,
-    pool: Arc<PeerPool>,
+    pool: Arc<PeerPool<C>>,
     transfer_handlers: Arc<TransferRegistry>,
     call_handlers: Arc<CallRegistry>,
     event_table_map: Arc<HashMap<String, (String, String)>>,
@@ -770,7 +777,7 @@ async fn consume_payloads(
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
     let mut max_indexed_block: u64 = 0;
-    let mut batch: Vec<ProcessedBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<ProcessedBlock<C>> = Vec::with_capacity(BATCH_SIZE);
 
     let ctx = ProcessContext {
         config: &config,
@@ -874,11 +881,11 @@ struct ProcessContext<'a> {
 }
 
 /// Log sync progress every 2 seconds.
-fn log_sync_progress(
+fn log_sync_progress<C: ChainTypes>(
     stats: &ConsumerStats,
     last_log: &mut Instant,
     total_blocks: u64,
-    pool: &PeerPool,
+    pool: &PeerPool<C>,
     started_at: Instant,
     verbose: bool,
     stop_rx: &watch::Receiver<bool>,
@@ -913,11 +920,11 @@ fn compute_block_hash(header: &reth_primitives_traits::Header) -> alloy_primitiv
 /// Factory children are registered in-memory immediately (so subsequent
 /// blocks in the same batch can match them). DB persistence is deferred
 /// to [`flush_batch`].
-fn prepare_block(
-    payload: BlockPayload,
+fn prepare_block<C: ChainTypes>(
+    payload: BlockPayload<C>,
     config: &IndexConfig,
     factories: &[ResolvedFactory],
-) -> ProcessedBlock {
+) -> ProcessedBlock<C> {
     let block_number = BlockNumber::new(payload.header().number);
     let block_hash = compute_block_hash(payload.header());
     let receipt_count = payload.receipts().len() as u64;
@@ -983,8 +990,8 @@ fn register_factory_child_in_memory(config: &IndexConfig, discovery: &filter::Fa
     clippy::too_many_arguments,
     reason = "grouping these into a struct would add complexity without benefit"
 )]
-async fn flush_batch(
-    batch: &mut Vec<ProcessedBlock>,
+async fn flush_batch<C: ChainTypes>(
+    batch: &mut Vec<ProcessedBlock<C>>,
     ctx: &ProcessContext<'_>,
     stats: &mut ConsumerStats,
     metrics: &SieveMetrics,
@@ -1059,7 +1066,10 @@ async fn finish_rejected_run(
 ///
 /// Returns an error on the first linkage violation, or if the stored-hash
 /// lookup fails.
-async fn verify_batch_anchors(batch: &[ProcessedBlock], db: &Database) -> eyre::Result<()> {
+async fn verify_batch_anchors<C: ChainTypes>(
+    batch: &[ProcessedBlock<C>],
+    db: &Database,
+) -> eyre::Result<()> {
     let mut known_hashes: HashMap<u64, B256> = batch
         .iter()
         .map(|b| (b.block_number.as_u64(), b.block_hash))
@@ -1119,8 +1129,8 @@ fn find_anchor_violation(
 /// scan transfers/calls, compute outcomes.
 /// Phase 2: batch insert — multi-row INSERT all events/transfers/calls.
 /// Phase 3: checkpoint + commit.
-async fn flush_batch_inner(
-    batch: &[ProcessedBlock],
+async fn flush_batch_inner<C: ChainTypes>(
+    batch: &[ProcessedBlock<C>],
     ctx: &ProcessContext<'_>,
 ) -> eyre::Result<Vec<ProcessOutcome>> {
     let mut tx = ctx.db.begin().await?;
@@ -1190,8 +1200,8 @@ async fn flush_batch_inner(
 /// Stores factory children (small, per-block). Accumulates events, transfers,
 /// and calls into the shared vecs for Phase 2 batch insert. Block hashes are
 /// stored in bulk by the caller via `store_block_hashes_batch`.
-async fn prepare_block_outcome<'a>(
-    block: &'a ProcessedBlock,
+async fn prepare_block_outcome<'a, C: ChainTypes>(
+    block: &'a ProcessedBlock<C>,
     ctx: &ProcessContext<'_>,
     tx: &mut sqlx::Transaction<'_, Postgres>,
     all_events: &mut Vec<(&'a decode::DecodedEvent, EventContext)>,
@@ -1476,8 +1486,8 @@ fn build_call_payload(
 }
 
 /// Scan native transfers and accumulate for batch insert (no DB writes).
-fn accumulate_transfers(
-    payload: &BlockPayload,
+fn accumulate_transfers<C: ChainTypes>(
+    payload: &BlockPayload<C>,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     ctx: &ProcessContext<'_>,
@@ -1502,8 +1512,8 @@ fn accumulate_transfers(
 }
 
 /// Scan function calls and accumulate for batch insert (no DB writes).
-fn accumulate_calls(
-    payload: &BlockPayload,
+fn accumulate_calls<C: ChainTypes>(
+    payload: &BlockPayload<C>,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     ctx: &ProcessContext<'_>,
@@ -1532,15 +1542,17 @@ fn accumulate_calls(
 ///
 /// For the first transaction in a block, `gas_used == cumulative_gas_used`.
 /// For subsequent transactions, `gas_used = cumulative[i] - cumulative[i-1]`.
-fn compute_gas_used(receipts: &[reth_ethereum_primitives::Receipt], tx_idx: usize) -> u64 {
-    let cumulative = receipts.get(tx_idx).map_or(0, |r| r.cumulative_gas_used);
+fn compute_gas_used<R: TxReceipt>(receipts: &[R], tx_idx: usize) -> u64 {
+    let cumulative = receipts
+        .get(tx_idx)
+        .map_or(0, TxReceipt::cumulative_gas_used);
     if tx_idx == 0 {
         cumulative
     } else {
         cumulative.saturating_sub(
             receipts
                 .get(tx_idx - 1)
-                .map_or(0, |r| r.cumulative_gas_used),
+                .map_or(0, TxReceipt::cumulative_gas_used),
         )
     }
 }
@@ -1549,8 +1561,8 @@ fn compute_gas_used(receipts: &[reth_ethereum_primitives::Receipt], tx_idx: usiz
 ///
 /// Caches sender recovery per `tx_index` to avoid redundant ECDSA work
 /// when multiple events originate from the same transaction.
-fn build_event_context(
-    payload: &BlockPayload,
+fn build_event_context<C: ChainTypes>(
+    payload: &BlockPayload<C>,
     block_hash: B256,
     event: &decode::DecodedEvent,
     sender_cache: &mut HashMap<TxIndex, Address>,
@@ -1586,7 +1598,7 @@ fn build_event_context(
     let cumulative = payload
         .receipts()
         .get(tx_idx_usize)
-        .map_or(0, |r| r.cumulative_gas_used);
+        .map_or(0, TxReceipt::cumulative_gas_used);
     let gas_used = compute_gas_used(payload.receipts(), tx_idx_usize);
 
     Ok(EventContext {
@@ -1614,8 +1626,8 @@ fn build_event_context(
     clippy::too_many_arguments,
     reason = "per-table counting adds table_counts"
 )]
-fn scan_transfers(
-    payload: &BlockPayload,
+fn scan_transfers<C: ChainTypes>(
+    payload: &BlockPayload<C>,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     transfer_handlers: &TransferRegistry,
@@ -1634,7 +1646,7 @@ fn scan_transfers(
         if tx_signed.value().is_zero() {
             continue;
         }
-        if !receipts.get(tx_idx).is_some_and(|r| r.success) {
+        if !receipts.get(tx_idx).is_some_and(TxReceipt::status) {
             continue;
         }
         let to_address = match tx_signed.kind() {
@@ -1675,7 +1687,9 @@ fn scan_transfers(
             tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
             tx_gas_used: compute_gas_used(receipts, tx_idx),
             tx_nonce: tx_signed.nonce(),
-            cumulative_gas_used: receipts.get(tx_idx).map_or(0, |r| r.cumulative_gas_used),
+            cumulative_gas_used: receipts
+                .get(tx_idx)
+                .map_or(0, TxReceipt::cumulative_gas_used),
             tx_status: true,
         };
 
@@ -1710,8 +1724,8 @@ fn scan_transfers(
     clippy::too_many_arguments,
     reason = "per-table counting adds table_counts"
 )]
-fn scan_calls(
-    payload: &BlockPayload,
+fn scan_calls<C: ChainTypes>(
+    payload: &BlockPayload<C>,
     block_hash: B256,
     sender_cache: &mut HashMap<TxIndex, Address>,
     config: &IndexConfig,
@@ -1749,7 +1763,7 @@ fn scan_calls(
             continue;
         };
 
-        if !receipts.get(tx_idx).is_some_and(|r| r.success) {
+        if !receipts.get(tx_idx).is_some_and(TxReceipt::status) {
             continue;
         }
 
@@ -1813,7 +1827,9 @@ fn scan_calls(
             tx_gas_price: tx_signed.effective_gas_price(payload.header().base_fee_per_gas),
             tx_gas_used: compute_gas_used(receipts, tx_idx),
             tx_nonce: tx_signed.nonce(),
-            cumulative_gas_used: receipts.get(tx_idx).map_or(0, |r| r.cumulative_gas_used),
+            cumulative_gas_used: receipts
+                .get(tx_idx)
+                .map_or(0, TxReceipt::cumulative_gas_used),
             tx_status: true,
         };
 

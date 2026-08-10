@@ -7,10 +7,13 @@
 //!
 //! This runs at sync time, discarding non-matching data immediately.
 
+use crate::chain::ChainTypes;
 use crate::config::IndexConfig;
 use crate::sync::BlockPayload;
 use crate::toml_config::ResolvedFactory;
 use crate::types::{BlockNumber, LogIndex, TxIndex};
+use alloy_consensus::transaction::TxHashRef;
+use alloy_consensus::TxReceipt;
 use alloy_dyn_abi::{DynSolValue, EventExt};
 use alloy_primitives::{Address, BloomInput, Log, LogData, B256};
 use reth_primitives_traits::Header;
@@ -79,7 +82,10 @@ const _: [(); 136] = [(); core::mem::size_of::<FilteredLog>()];
 /// Pre-computes tx hashes, validates receipt count matches transaction count,
 /// then zips for iteration.
 #[must_use]
-pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<FilteredLog> {
+pub fn filter_block<C: ChainTypes>(
+    payload: &BlockPayload<C>,
+    config: &IndexConfig,
+) -> Vec<FilteredLog> {
     let block_number = BlockNumber::new(payload.header().number);
     let block_timestamp = payload.header().timestamp;
 
@@ -107,7 +113,7 @@ pub fn filter_block(payload: &BlockPayload, config: &IndexConfig) -> Vec<Filtere
     for (tx_idx, (receipt, tx_hash)) in payload.receipts().iter().zip(tx_hashes.iter()).enumerate()
     {
         let tx_index = TxIndex::from_usize(tx_idx);
-        for (log_idx, log) in receipt.logs.iter().enumerate() {
+        for (log_idx, log) in receipt.logs().iter().enumerate() {
             let log_index = LogIndex::from_usize(log_idx);
             let topics = log.data.topics();
 
@@ -167,8 +173,8 @@ pub struct FactoryDiscovery {
 ///
 /// Returns discovered child addresses. Zero overhead if `factories` is empty.
 #[must_use]
-pub fn scan_factory_events(
-    payload: &BlockPayload,
+pub fn scan_factory_events<C: ChainTypes>(
+    payload: &BlockPayload<C>,
     factories: &[ResolvedFactory],
 ) -> Vec<FactoryDiscovery> {
     if factories.is_empty() {
@@ -188,7 +194,7 @@ pub fn scan_factory_events(
     let mut discoveries = Vec::new();
 
     for receipt in payload.receipts() {
-        for log in &receipt.logs {
+        for log in receipt.logs() {
             let topics = log.data.topics();
             let Some(&topic0) = topics.first() else {
                 continue;
@@ -264,6 +270,7 @@ fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> Option
 )]
 mod tests {
     use super::*;
+    use crate::chain::EthereumChain;
     use crate::config::usdc_transfer_config;
     use crate::test_utils::{build_test_transaction, make_log, make_receipt};
     use crate::types::{BlockNumber, LogIndex, TxIndex};
@@ -308,7 +315,7 @@ mod tests {
             ..Default::default()
         };
 
-        let payload = BlockPayload::new(header, body, vec![receipt]);
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![receipt]);
 
         let matched = filter_block(&payload, &config);
 
@@ -336,7 +343,7 @@ mod tests {
             ommers: vec![],
             withdrawals: None,
         };
-        let payload = BlockPayload::new(Header::default(), body, vec![receipt]);
+        let payload = BlockPayload::<EthereumChain>::new(Header::default(), body, vec![receipt]);
 
         let matched = filter_block(&payload, &config);
         assert!(matched.is_empty(), "should skip block on count mismatch");
@@ -352,7 +359,7 @@ mod tests {
             ommers: vec![],
             withdrawals: None,
         };
-        let payload = BlockPayload::new(header, body, vec![]);
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![]);
 
         let matched = filter_block(&payload, &config);
         assert!(matched.is_empty());
@@ -412,7 +419,7 @@ mod tests {
         };
         // Two txs but one receipt — need to match
         let receipt2 = make_receipt(vec![]);
-        let payload = BlockPayload::new(header, body, vec![receipt, receipt2]);
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![receipt, receipt2]);
 
         let matched = filter_block(&payload, &config);
         assert_eq!(matched.len(), 1);
@@ -444,7 +451,7 @@ mod tests {
             ommers: vec![],
             withdrawals: None,
         };
-        let payload = BlockPayload::new(Header::default(), body, vec![receipt]);
+        let payload = BlockPayload::<EthereumChain>::new(Header::default(), body, vec![receipt]);
 
         let matched = filter_block(&payload, &config);
         assert_eq!(matched.len(), 1);
@@ -510,7 +517,7 @@ mod tests {
             number: 21_000_042,
             ..Default::default()
         };
-        let payload = BlockPayload::new(header, body, vec![receipt1, receipt2]);
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![receipt1, receipt2]);
 
         let matched = filter_block(&payload, &config);
         assert_eq!(matched.len(), 1);
@@ -528,7 +535,7 @@ mod tests {
             ommers: vec![],
             withdrawals: None,
         };
-        let payload = BlockPayload::new(header, body, vec![]);
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![]);
         let discoveries = scan_factory_events(&payload, &[]);
         assert!(discoveries.is_empty());
     }
@@ -579,7 +586,7 @@ mod tests {
             ommers: vec![],
             withdrawals: None,
         };
-        let payload = BlockPayload::new(header, body, vec![receipt]);
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![receipt]);
 
         let discoveries = scan_factory_events(&payload, &[factory]);
         assert_eq!(discoveries.len(), 1);

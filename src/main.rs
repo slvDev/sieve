@@ -10,6 +10,7 @@
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod api;
+mod chain;
 mod cli;
 mod config;
 mod db;
@@ -77,7 +78,7 @@ async fn main() -> eyre::Result<()> {
                 .await
             }
             cli::Command::Inspect => cmd_inspect(&cli),
-            cli::Command::Peers => cmd_peers().await,
+            cli::Command::Peers { .. } => cmd_peers::<chain::EthereumChain>().await,
         };
     }
 
@@ -148,8 +149,8 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     maybe_spawn_api(startup.api_port, &startup, &db, &metrics, &stop_rx)?;
 
     let start_block = startup.start_block;
-    let ctx = build_sync_context(cli, startup, &db, &metrics, stop_rx).await?;
-
+    let ctx =
+        build_sync_context::<chain::EthereumChain>(cli, startup, &db, &metrics, stop_rx).await?;
     run_indexer(cli, start_block, ctx).await
 }
 
@@ -205,13 +206,13 @@ fn build_registries(
 /// # Errors
 ///
 /// Returns an error on P2P connection or factory child loading failures.
-async fn build_sync_context(
+async fn build_sync_context<C: chain::ChainTypes>(
     cli: &cli::Cli,
     startup: StartupConfig,
     db: &Arc<db::Database>,
     metrics: &Arc<metrics::SieveMetrics>,
     stop_rx: watch::Receiver<bool>,
-) -> eyre::Result<sync::SyncContext> {
+) -> eyre::Result<sync::SyncContext<C>> {
     let event_table_map = build_event_table_map(&startup.resolved_events);
     let receipt_tables = Arc::new(build_receipt_tables(
         &startup.resolved_events,
@@ -238,7 +239,7 @@ async fn build_sync_context(
     let stream_dispatcher = build_stream_dispatcher(&startup.resolved_streams);
 
     let session = if cli.verbose {
-        p2p::connect_mainnet_peers(startup.p2p_port).await?
+        p2p::connect_peers::<C>(startup.p2p_port).await?
     } else {
         let (done_tx, mut done_rx) = watch::channel(false);
         let spinner_task = tokio::spawn(async move {
@@ -251,15 +252,16 @@ async fn build_sync_context(
                 }
             }
         });
-        let session = p2p::connect_mainnet_peers(startup.p2p_port).await?;
+        let session = p2p::connect_peers::<C>(startup.p2p_port).await?;
         let _ = done_tx.send(true);
         spinner_task.await.ok();
         ui::clear_line();
         session
     };
     info!(
+        chain = C::NAME,
         peers = session.pool.len(),
-        "connected to ethereum p2p network"
+        "connected to p2p network"
     );
 
     Ok(sync::SyncContext {
@@ -965,9 +967,9 @@ fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
 ///
 /// Returns an error if the P2P network fails to start.
 #[expect(clippy::print_stdout, reason = "CLI output for peers command")]
-async fn cmd_peers() -> eyre::Result<()> {
-    println!("Connecting to Ethereum P2P network...");
-    let session = p2p::connect_mainnet_peers(None).await?;
+async fn cmd_peers<C: chain::ChainTypes>() -> eyre::Result<()> {
+    println!("Connecting to {} P2P network...", C::NAME);
+    let session = p2p::connect_peers::<C>(None).await?;
     println!("Startup complete: {} peers connected", session.pool.len());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -992,10 +994,10 @@ async fn cmd_peers() -> eyre::Result<()> {
 /// # Errors
 ///
 /// Returns an error on sync or database failures.
-async fn run_indexer(
+async fn run_indexer<C: chain::ChainTypes>(
     cli: &cli::Cli,
     start_block: BlockNumber,
-    ctx: sync::SyncContext,
+    ctx: sync::SyncContext<C>,
 ) -> eyre::Result<()> {
     let verbose = ctx.verbose;
     if let Some(end_block_raw) = cli.end_block {

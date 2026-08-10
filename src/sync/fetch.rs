@@ -1,5 +1,6 @@
 //! Fetch logic and task execution.
 
+use crate::chain::ChainTypes;
 use crate::filter::BloomFilter;
 use crate::p2p::{
     fetch_headers_for_peer, fetch_payloads_for_headers, fetch_payloads_for_peer, NetworkPeer,
@@ -16,8 +17,8 @@ use tracing::instrument;
 // ── FetchIngestOutcome ───────────────────────────────────────────────
 
 #[derive(Debug)]
-pub struct FetchIngestOutcome {
-    pub payloads: Vec<BlockPayload>,
+pub struct FetchIngestOutcome<C: ChainTypes> {
+    pub payloads: Vec<BlockPayload<C>>,
     pub missing_blocks: Vec<u64>,
     pub bloom_skipped: Vec<u64>,
     #[expect(
@@ -36,11 +37,11 @@ pub struct FetchIngestOutcome {
 /// # Errors
 ///
 /// Returns an error if the block batch is not consecutive or the fetch fails.
-pub async fn fetch_ingest_batch(
-    peer: &NetworkPeer,
+pub async fn fetch_ingest_batch<C: ChainTypes>(
+    peer: &NetworkPeer<C>,
     blocks: &[u64],
     bloom_filter: Option<&BloomFilter>,
-) -> Result<FetchIngestOutcome> {
+) -> Result<FetchIngestOutcome<C>> {
     if blocks.is_empty() {
         return Ok(FetchIngestOutcome {
             payloads: Vec::new(),
@@ -118,18 +119,18 @@ fn ensure_consecutive(blocks: &[u64]) -> Result<()> {
 // ── Fetch task types ─────────────────────────────────────────────────
 
 /// Shared context for fetch tasks (references to pipeline state).
-pub struct FetchTaskContext {
+pub struct FetchTaskContext<C: ChainTypes> {
     pub scheduler: Arc<PeerWorkScheduler>,
     pub peer_health: Arc<PeerHealthTracker>,
-    pub pool: Arc<PeerPool>,
-    pub payload_tx: mpsc::Sender<BlockPayload>,
-    pub ready_tx: mpsc::UnboundedSender<NetworkPeer>,
+    pub pool: Arc<PeerPool<C>>,
+    pub payload_tx: mpsc::Sender<BlockPayload<C>>,
+    pub ready_tx: mpsc::UnboundedSender<NetworkPeer<C>>,
     pub bloom_filter: Option<Arc<BloomFilter>>,
 }
 
 /// Parameters for a single fetch task invocation.
-pub struct FetchTaskParams {
-    pub peer: NetworkPeer,
+pub struct FetchTaskParams<C: ChainTypes> {
+    pub peer: NetworkPeer<C>,
     pub blocks: Vec<u64>,
     pub mode: FetchMode,
     pub permit: OwnedSemaphorePermit,
@@ -139,7 +140,7 @@ pub struct FetchTaskParams {
 
 /// Execute a single fetch task for a batch of blocks from a peer.
 #[instrument(skip_all, fields(peer_id = ?params.peer.peer_id, blocks = params.blocks.len()))]
-pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
+pub async fn run_fetch_task<C: ChainTypes>(ctx: FetchTaskContext<C>, params: FetchTaskParams<C>) {
     let FetchTaskParams {
         peer,
         blocks,
@@ -169,11 +170,11 @@ pub async fn run_fetch_task(ctx: FetchTaskContext, params: FetchTaskParams) {
     let _ = ctx.ready_tx.send(peer);
 }
 
-async fn handle_fetch_success(
-    ctx: &FetchTaskContext,
-    peer: &NetworkPeer,
+async fn handle_fetch_success<C: ChainTypes>(
+    ctx: &FetchTaskContext<C>,
+    peer: &NetworkPeer<C>,
     blocks: &[u64],
-    outcome: FetchIngestOutcome,
+    outcome: FetchIngestOutcome<C>,
     fetch_elapsed: Duration,
     mode: FetchMode,
 ) {
@@ -225,9 +226,9 @@ async fn handle_fetch_success(
     }
 }
 
-async fn handle_missing_blocks(
-    ctx: &FetchTaskContext,
-    peer: &NetworkPeer,
+async fn handle_missing_blocks<C: ChainTypes>(
+    ctx: &FetchTaskContext<C>,
+    peer: &NetworkPeer<C>,
     completed: &[u64],
     missing_blocks: &[u64],
     mode: FetchMode,
@@ -264,9 +265,9 @@ async fn handle_missing_blocks(
     );
 }
 
-async fn handle_fetch_error(
-    ctx: &FetchTaskContext,
-    peer: &NetworkPeer,
+async fn handle_fetch_error<C: ChainTypes>(
+    ctx: &FetchTaskContext<C>,
+    peer: &NetworkPeer<C>,
     blocks: &[u64],
     err: eyre::Error,
     fetch_elapsed: Duration,
@@ -297,7 +298,7 @@ async fn handle_fetch_error(
     );
 }
 
-async fn requeue_blocks(ctx: &FetchTaskContext, blocks: &[u64], mode: FetchMode) {
+async fn requeue_blocks<C: ChainTypes>(ctx: &FetchTaskContext<C>, blocks: &[u64], mode: FetchMode) {
     match mode {
         FetchMode::Normal => {
             let _ = ctx.scheduler.requeue_failed(blocks).await;

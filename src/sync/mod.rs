@@ -3,6 +3,7 @@
 //! Core types used across the sync pipeline. Sub-modules implement
 //! scheduling, fetching, head-following, and reorg handling.
 
+use crate::chain::ChainTypes;
 use crate::config::IndexConfig;
 use crate::db::Database;
 use crate::filter::BloomFilter;
@@ -11,7 +12,7 @@ use crate::metrics::SieveMetrics;
 use crate::p2p::PeerPool;
 use crate::stream::StreamDispatcher;
 use crate::toml_config::ResolvedFactory;
-use reth_ethereum_primitives::{BlockBody, Receipt};
+use alloy_consensus::BlockBody;
 use reth_primitives_traits::Header;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,9 +64,9 @@ impl std::error::Error for FactoryStateError {}
 
 /// Shared context for sync operations, bundling parameters that would
 /// otherwise require 7+ function arguments.
-pub struct SyncContext {
+pub struct SyncContext<C: ChainTypes> {
     /// Peer pool for P2P block fetching.
-    pub pool: Arc<PeerPool>,
+    pub pool: Arc<PeerPool<C>>,
     /// Event filter and ABI decode configuration.
     pub config: Arc<IndexConfig>,
     /// PostgreSQL database handle.
@@ -100,17 +101,21 @@ pub struct SyncContext {
 }
 
 /// Full payload for a block: header, body, receipts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockPayload {
+#[derive(Debug, Clone)]
+pub struct BlockPayload<C: ChainTypes> {
     header: Header,
-    body: BlockBody,
-    receipts: Vec<Receipt>,
+    body: BlockBody<C::SignedTx>,
+    receipts: Vec<C::Receipt>,
 }
 
-impl BlockPayload {
+impl<C: ChainTypes> BlockPayload<C> {
     /// Create a new block payload.
     #[must_use]
-    pub const fn new(header: Header, body: BlockBody, receipts: Vec<Receipt>) -> Self {
+    pub const fn new(
+        header: Header,
+        body: BlockBody<C::SignedTx>,
+        receipts: Vec<C::Receipt>,
+    ) -> Self {
         Self {
             header,
             body,
@@ -126,13 +131,13 @@ impl BlockPayload {
 
     /// Block body (transactions, ommers, withdrawals).
     #[must_use]
-    pub const fn body(&self) -> &BlockBody {
+    pub const fn body(&self) -> &BlockBody<C::SignedTx> {
         &self.body
     }
 
     /// Transaction receipts (one per transaction, in order).
     #[must_use]
-    pub fn receipts(&self) -> &[Receipt] {
+    pub fn receipts(&self) -> &[C::Receipt] {
         &self.receipts
     }
 }
@@ -155,7 +160,7 @@ pub struct FetchBatch {
 
 // Compile-time size assertions for hot types (reth pattern).
 #[cfg(target_pointer_width = "64")]
-const _: [(); 816] = [(); core::mem::size_of::<BlockPayload>()];
+const _: [(); 816] = [(); core::mem::size_of::<BlockPayload<crate::chain::EthereumChain>>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 32] = [(); core::mem::size_of::<FetchBatch>()];
 // SyncContext size varies with stream fields — skip assertion.

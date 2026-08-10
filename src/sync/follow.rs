@@ -4,6 +4,7 @@
 //! Each "epoch" discovers the current chain head via P2P, runs reorg
 //! preflight, then syncs the gap. Sleeps near the tip to avoid busy-looping.
 
+use crate::chain::ChainTypes;
 use crate::db::{self, Database};
 use crate::handler::{CallRegistry, HandlerRegistry, TransferRegistry};
 use crate::metrics::SieveMetrics;
@@ -23,8 +24,8 @@ use tokio::time::Instant;
 use tracing::{debug, info, instrument, warn};
 
 /// Shared state for the follow loop, reducing argument counts.
-struct FollowContext {
-    pool: Arc<PeerPool>,
+struct FollowContext<C: ChainTypes> {
+    pool: Arc<PeerPool<C>>,
     start_block: BlockNumber,
     config: Arc<crate::config::IndexConfig>,
     db: Arc<Database>,
@@ -50,7 +51,10 @@ struct FollowContext {
 ///
 /// Returns an error on unrecoverable failures (DB errors, deep reorgs).
 #[instrument(skip_all, fields(start_block = start_block.as_u64()))]
-pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre::Result<()> {
+pub async fn run_follow_loop<C: ChainTypes>(
+    start_block: BlockNumber,
+    ctx: SyncContext<C>,
+) -> eyre::Result<()> {
     info!(start_block = start_block.as_u64(), "entering follow mode");
 
     let baseline = ctx.db.last_checkpoint().await?.map_or_else(
@@ -65,7 +69,7 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
         baseline,
     ));
 
-    let fctx = FollowContext {
+    let fctx = FollowContext::<C> {
         pool: ctx.pool,
         start_block,
         config: ctx.config,
@@ -116,7 +120,7 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
 /// Spawn a background task that animates the "discovering" spinner at 80ms.
 ///
 /// Returns the sender to stop the spinner (send `true` to cancel).
-fn spawn_discovering_spinner(pool: Arc<PeerPool>) -> watch::Sender<bool> {
+fn spawn_discovering_spinner<C: ChainTypes>(pool: Arc<PeerPool<C>>) -> watch::Sender<bool> {
     let (tx, mut rx) = watch::channel(false);
     tokio::spawn(async move {
         let mut spinner = crate::ui::Spinner::new();
@@ -133,7 +137,10 @@ fn spawn_discovering_spinner(pool: Arc<PeerPool>) -> watch::Sender<bool> {
 }
 
 /// Print the periodic heartbeat based on current phase.
-async fn print_heartbeat(ctx: &FollowContext, phase: &FollowPhase) -> eyre::Result<()> {
+async fn print_heartbeat<C: ChainTypes>(
+    ctx: &FollowContext<C>,
+    phase: &FollowPhase,
+) -> eyre::Result<()> {
     match phase {
         FollowPhase::Discovering => {
             // Spinner background task handles pretty output
@@ -172,8 +179,8 @@ async fn print_heartbeat(ctx: &FollowContext, phase: &FollowPhase) -> eyre::Resu
 const MAX_SYNC_FAILURES: u32 = 5;
 
 /// Run a single follow epoch. Returns `true` if the loop should exit.
-async fn run_follow_epoch(
-    ctx: &FollowContext,
+async fn run_follow_epoch<C: ChainTypes>(
+    ctx: &FollowContext<C>,
     phase: &mut FollowPhase,
     spinner_stop: &mut Option<watch::Sender<bool>>,
     sync_failures: &mut u32,
@@ -211,8 +218,8 @@ async fn run_follow_epoch(
 /// A [`crate::sync::FactoryStateError`] is never retried: it means the
 /// in-memory factory state may still be poisoned, and a subsequent sync
 /// could succeed against that state and advance the checkpoint.
-async fn handle_sync_failure(
-    ctx: &FollowContext,
+async fn handle_sync_failure<C: ChainTypes>(
+    ctx: &FollowContext<C>,
     err: eyre::Report,
     sync_failures: &mut u32,
 ) -> eyre::Result<bool> {
@@ -265,7 +272,7 @@ enum FollowPhase {
 }
 
 /// Discover the current chain head and determine the epoch action.
-async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
+async fn discover_gap<C: ChainTypes>(ctx: &FollowContext<C>) -> eyre::Result<EpochAction> {
     let baseline = ctx.db.last_checkpoint().await?.map_or_else(
         || ctx.start_block.as_u64().saturating_sub(1),
         BlockNumber::as_u64,
@@ -318,11 +325,15 @@ async fn discover_gap(ctx: &FollowContext) -> eyre::Result<EpochAction> {
 }
 
 /// Run one sync epoch, returning the gap size.
-async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Result<u64> {
+async fn sync_epoch<C: ChainTypes>(
+    ctx: &FollowContext<C>,
+    next_block: u64,
+    head: u64,
+) -> eyre::Result<u64> {
     let gap = head.saturating_sub(next_block) + 1;
     info!(next_block, head, gap, "follow epoch: syncing gap");
 
-    let sync_ctx = SyncContext {
+    let sync_ctx = SyncContext::<C> {
         pool: Arc::clone(&ctx.pool),
         config: Arc::clone(&ctx.config),
         db: Arc::clone(&ctx.db),
@@ -375,9 +386,9 @@ async fn sync_epoch(ctx: &FollowContext, next_block: u64, head: u64) -> eyre::Re
     clippy::too_many_arguments,
     reason = "follow loop passes individual fields"
 )]
-async fn should_rollback_reorg(
+async fn should_rollback_reorg<C: ChainTypes>(
     db: &Database,
-    pool: &PeerPool,
+    pool: &PeerPool<C>,
     handlers: &HandlerRegistry,
     transfer_handlers: &TransferRegistry,
     call_handlers: &CallRegistry,
@@ -425,13 +436,13 @@ async fn should_rollback_reorg(
     clippy::too_many_arguments,
     reason = "follow loop passes individual fields"
 )]
-async fn execute_rollback(
+async fn execute_rollback<C: ChainTypes>(
     db: &Database,
     handlers: &HandlerRegistry,
     transfer_handlers: &TransferRegistry,
     call_handlers: &CallRegistry,
     config: &crate::config::IndexConfig,
-    anchors: &[crate::p2p::NetworkPeer],
+    anchors: &[crate::p2p::NetworkPeer<C>],
     expected_tip: alloy_primitives::B256,
     baseline: u64,
 ) -> eyre::Result<()> {
@@ -480,8 +491,8 @@ async fn rollback_to_ancestor(
 ///
 /// Broadcasts the highest confirmed head via `head_seen_tx` so the fetch
 /// loop can use it as head_cap instead of stale per-peer heads.
-async fn run_head_tracker(
-    pool: Arc<PeerPool>,
+async fn run_head_tracker<C: ChainTypes>(
+    pool: Arc<PeerPool<C>>,
     head_seen_tx: watch::Sender<u64>,
     mut stop_rx: watch::Receiver<bool>,
     initial_baseline: u64,
