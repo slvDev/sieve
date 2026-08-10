@@ -76,8 +76,13 @@ pub enum Command {
     },
     /// Dry-run: show tables, columns, and filters from the config.
     Inspect,
-    /// Connect to P2P network and report peer count (no DB or config needed).
-    Peers,
+    /// Connect to P2P network and report peer count (no DB needed).
+    Peers {
+        /// Chain to connect to: "mainnet" or "base". Defaults to the
+        /// config file's `chain` key if present, else mainnet.
+        #[arg(long)]
+        chain: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -288,6 +293,23 @@ mod tests {
     fn parse_inspect_subcommand() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["sieve", "inspect"])?;
         assert!(matches!(cli.command, Some(Command::Inspect)));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_peers_subcommand() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "peers"])?;
+        assert!(matches!(cli.command, Some(Command::Peers { chain: None })));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_peers_with_chain_flag() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "peers", "--chain", "base"])?;
+        assert!(matches!(
+            cli.command,
+            Some(Command::Peers { chain: Some(ref c) }) if c == "base"
+        ));
         Ok(())
     }
 

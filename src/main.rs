@@ -78,7 +78,10 @@ async fn main() -> eyre::Result<()> {
                 .await
             }
             cli::Command::Inspect => cmd_inspect(&cli),
-            cli::Command::Peers { .. } => cmd_peers::<chain::EthereumChain>().await,
+            cli::Command::Peers { chain } => match resolve_peers_chain(&cli, chain.as_deref())? {
+                chain::ChainKind::Mainnet => cmd_peers::<chain::EthereumChain>().await,
+                chain::ChainKind::Base => Err(unsupported_chain_error()),
+            },
         };
     }
 
@@ -92,6 +95,9 @@ async fn main() -> eyre::Result<()> {
 /// Returns an error on config, database, P2P, or sync failures.
 async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     let startup = load_toml_config(cli)?;
+
+    // Reject unsupported chains before any side effects (DB setup, API).
+    ensure_chain_supported(startup.chain)?;
 
     // Validate --end-block if provided
     if let Some(end_block) = cli.end_block {
@@ -149,9 +155,46 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     maybe_spawn_api(startup.api_port, &startup, &db, &metrics, &stop_rx)?;
 
     let start_block = startup.start_block;
-    let ctx =
-        build_sync_context::<chain::EthereumChain>(cli, startup, &db, &metrics, stop_rx).await?;
-    run_indexer(cli, start_block, ctx).await
+    match startup.chain {
+        chain::ChainKind::Mainnet => {
+            let ctx =
+                build_sync_context::<chain::EthereumChain>(cli, startup, &db, &metrics, stop_rx)
+                    .await?;
+            run_indexer(cli, start_block, ctx).await
+        }
+        // Unreachable: rejected by ensure_chain_supported above.
+        chain::ChainKind::Base => Err(unsupported_chain_error()),
+    }
+}
+
+/// Error for chains that are recognized but not yet wired up.
+fn unsupported_chain_error() -> eyre::Report {
+    eyre::eyre!("chain = \"base\" is recognized but not wired up yet")
+}
+
+/// Reject chains that cannot run yet, before any side effects occur.
+fn ensure_chain_supported(kind: chain::ChainKind) -> eyre::Result<()> {
+    match kind {
+        chain::ChainKind::Mainnet => Ok(()),
+        chain::ChainKind::Base => Err(unsupported_chain_error()),
+    }
+}
+
+/// Resolve the chain for the `peers` subcommand.
+///
+/// Precedence: `--chain` flag, then the config file's `chain` key (when the
+/// file exists — `peers` must keep working without one), then mainnet.
+fn resolve_peers_chain(cli: &cli::Cli, flag: Option<&str>) -> eyre::Result<chain::ChainKind> {
+    if let Some(name) = flag {
+        return chain::ChainKind::parse(name);
+    }
+    if Path::new(&cli.config).exists() {
+        let sieve_config = toml_config::load_config(Path::new(&cli.config))?;
+        if let Some(name) = sieve_config.chain.as_deref() {
+            return chain::ChainKind::parse(name);
+        }
+    }
+    Ok(chain::ChainKind::default())
 }
 
 /// Build handler registries and related data from resolved config.
@@ -287,6 +330,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
 /// Resolved startup parameters from TOML config + CLI.
 #[derive(Debug)]
 struct StartupConfig {
+    chain: chain::ChainKind,
     database_url: String,
     api_port: Option<u16>,
     p2p_port: Option<u16>,
@@ -384,7 +428,14 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         contract_min.min(factory_min).min(transfer_min)
     }));
 
+    let chain_kind = startup
+        .sieve_config
+        .chain
+        .as_deref()
+        .map_or(Ok(chain::ChainKind::default()), chain::ChainKind::parse)?;
+
     Ok(StartupConfig {
+        chain: chain_kind,
         database_url,
         api_port,
         p2p_port,

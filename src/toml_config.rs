@@ -17,6 +17,8 @@ use tracing::info;
 /// Top-level TOML config.
 #[derive(Debug, Deserialize)]
 pub struct SieveConfig {
+    /// Chain to index: "mainnet" (default) or "base".
+    pub chain: Option<String>,
     /// Optional API configuration.
     pub api: Option<ApiConfig>,
     /// Optional P2P configuration.

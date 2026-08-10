@@ -5,6 +5,8 @@
 #   WEBHOOK_URL   — webhook endpoint (required if [[streams]] type = "webhook")
 #   RABBITMQ_URL  — RabbitMQ connection string (required if [[streams]] type = "rabbitmq")
 
+# chain = "mainnet"  # default; which chain to index
+
 [api]
 port = 4000  # omit [api] section to disable GraphQL
 
