@@ -3,6 +3,7 @@
 //! Connects to Ethereum mainnet via devp2p, discovers peers, establishes
 //! sessions, and maintains a pool of active peers for future data fetching.
 
+use alloy_consensus::proofs;
 use alloy_primitives::B256;
 use eyre::{eyre, Result, WrapErr};
 use futures::StreamExt;
@@ -204,9 +205,12 @@ struct ChunkedResponse<T> {
 }
 
 /// Outcome of a header-only fetch for a peer.
+///
+/// Headers are sealed (hash computed once) and verified for parent-hash
+/// continuity; discontinuous headers are reported in `missing_blocks`.
 #[derive(Debug)]
 pub struct HeaderFetchOutcome {
-    pub headers: Vec<Header>,
+    pub headers: Vec<SealedHeader>,
     pub missing_blocks: Vec<u64>,
     pub headers_ms: u64,
     pub headers_requests: u64,
@@ -847,15 +851,8 @@ pub async fn fetch_headers_for_peer(
         headers_by_number.insert(header.number, header);
     }
 
-    let mut ordered_headers = Vec::new();
-    let mut missing_blocks = Vec::new();
-    for number in start..=end {
-        if let Some(header) = headers_by_number.remove(&number) {
-            ordered_headers.push(header);
-        } else {
-            missing_blocks.push(number);
-        }
-    }
+    let (ordered_headers, missing_blocks) =
+        seal_and_verify_continuity(start, end, headers_by_number);
 
     Ok(HeaderFetchOutcome {
         headers: ordered_headers,
@@ -865,13 +862,79 @@ pub async fn fetch_headers_for_peer(
     })
 }
 
+/// Order headers by block number, seal them, and verify parent-hash links.
+///
+/// A header whose number directly follows the previously accepted header
+/// must reference that header's hash as its parent; otherwise it is dropped
+/// and reported as missing so the scheduler retries it from another peer.
+fn seal_and_verify_continuity(
+    start: u64,
+    end: u64,
+    mut headers_by_number: HashMap<u64, Header>,
+) -> (Vec<SealedHeader>, Vec<u64>) {
+    let mut ordered_headers: Vec<SealedHeader> = Vec::new();
+    let mut missing_blocks = Vec::new();
+    for number in start..=end {
+        let Some(header) = headers_by_number.remove(&number) else {
+            missing_blocks.push(number);
+            continue;
+        };
+        let sealed = SealedHeader::seal_slow(header);
+        if let Some(prev) = ordered_headers.last() {
+            if number == prev.header().number.saturating_add(1)
+                && sealed.header().parent_hash != prev.hash()
+            {
+                debug!(
+                    block = number,
+                    parent_hash = %sealed.header().parent_hash,
+                    expected_parent = %prev.hash(),
+                    "header continuity mismatch; dropping header"
+                );
+                missing_blocks.push(number);
+                continue;
+            }
+        }
+        ordered_headers.push(sealed);
+    }
+    (ordered_headers, missing_blocks)
+}
+
+/// Validate a fetched body and receipts against the block header.
+///
+/// Recomputes the transaction, ommers, withdrawals, and receipt roots from
+/// the fetched data and compares them to the header commitments. Receipt
+/// blooms are recomputed from logs, never trusted from the peer.
+fn validate_payload(
+    header: &Header,
+    body: &reth_ethereum_primitives::BlockBody,
+    receipts: &[Receipt],
+) -> Result<(), &'static str> {
+    if body.transactions.len() != receipts.len() {
+        return Err("transaction/receipt count mismatch");
+    }
+    if proofs::calculate_transaction_root(&body.transactions) != header.transactions_root {
+        return Err("transactions root mismatch");
+    }
+    if proofs::calculate_ommers_root(&body.ommers) != header.ommers_hash {
+        return Err("ommers root mismatch");
+    }
+    if body.calculate_withdrawals_root() != header.withdrawals_root {
+        return Err("withdrawals root mismatch");
+    }
+    if Receipt::calculate_receipt_root_no_memo(receipts) != header.receipts_root {
+        return Err("receipts root mismatch");
+    }
+    Ok(())
+}
+
 /// Fetch bodies and receipts for a set of headers from a peer.
 ///
-/// Headers must already be fetched; this computes their hashes and requests
-/// the corresponding bodies and receipts in parallel.
+/// Headers must already be fetched and sealed; this uses their hashes to
+/// request the corresponding bodies and receipts in parallel, then validates
+/// each payload against the header commitments before returning it.
 pub async fn fetch_payloads_for_headers(
     peer: &NetworkPeer,
-    ordered_headers: Vec<Header>,
+    ordered_headers: Vec<SealedHeader>,
 ) -> Result<PayloadFetchOutcome> {
     if ordered_headers.is_empty() {
         return Ok(PayloadFetchOutcome {
@@ -882,11 +945,7 @@ pub async fn fetch_payloads_for_headers(
         });
     }
 
-    let mut hashes = Vec::with_capacity(ordered_headers.len());
-    for header in &ordered_headers {
-        let hash = SealedHeader::seal_slow(header.clone()).hash();
-        hashes.push(hash);
-    }
+    let hashes: Vec<B256> = ordered_headers.iter().map(SealedHeader::hash).collect();
 
     let bodies_fut = async {
         let started = Instant::now();
@@ -907,18 +966,28 @@ pub async fn fetch_payloads_for_headers(
 
     let mut payloads = Vec::with_capacity(ordered_headers.len());
     let mut missing_blocks = Vec::new();
-    for (idx, header) in ordered_headers.into_iter().enumerate() {
-        let number = header.number;
+    for (idx, sealed) in ordered_headers.into_iter().enumerate() {
+        let number = sealed.header().number;
         let body = bodies.get_mut(idx).and_then(Option::take);
         let block_receipts = receipts.get_mut(idx).and_then(Option::take);
 
         match (body, block_receipts) {
             (Some(body), Some(block_receipts)) => {
-                if body.transactions.len() != block_receipts.len() {
+                if let Err(reason) = validate_payload(sealed.header(), &body, &block_receipts) {
+                    debug!(
+                        peer_id = ?peer.peer_id,
+                        block = number,
+                        reason,
+                        "payload validation failed; dropping block"
+                    );
                     missing_blocks.push(number);
                     continue;
                 }
-                payloads.push(BlockPayload::new(header, body, block_receipts));
+                payloads.push(BlockPayload::new(
+                    sealed.into_header(),
+                    body,
+                    block_receipts,
+                ));
             }
             _ => {
                 missing_blocks.push(number);
@@ -966,4 +1035,184 @@ pub async fn fetch_payloads_for_peer(
     result.fetch_stats.headers_ms = header_outcome.headers_ms;
     result.fetch_stats.headers_requests = header_outcome.headers_requests;
     Ok(result)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{seal_and_verify_continuity, validate_payload};
+    use crate::test_utils::{build_test_transaction, make_log, make_receipt};
+    use alloy_consensus::proofs;
+    use alloy_primitives::{Address, Bytes, B256};
+    use reth_ethereum_primitives::{BlockBody, Receipt};
+    use reth_primitives_traits::{Header, SealedHeader};
+    use std::collections::HashMap;
+
+    /// Build a header whose roots match the given body and receipts.
+    fn consistent_header_for(
+        number: u64,
+        parent_hash: B256,
+        body: &BlockBody,
+        receipts: &[Receipt],
+    ) -> Header {
+        Header {
+            number,
+            parent_hash,
+            transactions_root: proofs::calculate_transaction_root(&body.transactions),
+            ommers_hash: proofs::calculate_ommers_root(&body.ommers),
+            withdrawals_root: body.calculate_withdrawals_root(),
+            receipts_root: Receipt::calculate_receipt_root_no_memo(receipts),
+            ..Default::default()
+        }
+    }
+
+    /// Build a header whose roots match an empty body and empty receipts.
+    fn consistent_header(number: u64, parent_hash: B256) -> Header {
+        consistent_header_for(number, parent_hash, &BlockBody::default(), &[])
+    }
+
+    #[test]
+    fn validate_payload_accepts_consistent_empty_payload() {
+        let header = consistent_header(1, B256::ZERO);
+        let body = BlockBody::default();
+        assert!(validate_payload(&header, &body, &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_payload_accepts_payload_with_tx_and_logs() {
+        let body = BlockBody {
+            transactions: vec![build_test_transaction()],
+            ..Default::default()
+        };
+        let log = make_log(
+            Address::repeat_byte(0x11),
+            vec![B256::repeat_byte(0x22)],
+            Bytes::from_static(&[0x01]),
+        );
+        let receipts = vec![make_receipt(vec![log])];
+        let header = consistent_header_for(1, B256::ZERO, &body, &receipts);
+        assert!(validate_payload(&header, &body, &receipts).is_ok());
+    }
+
+    #[test]
+    fn validate_payload_rejects_tampered_log() {
+        let body = BlockBody {
+            transactions: vec![build_test_transaction()],
+            ..Default::default()
+        };
+        let log = make_log(
+            Address::repeat_byte(0x11),
+            vec![B256::repeat_byte(0x22)],
+            Bytes::from_static(&[0x01]),
+        );
+        let header = consistent_header_for(1, B256::ZERO, &body, &[make_receipt(vec![log])]);
+
+        // Peer swaps in a receipt with a fabricated log for the same tx.
+        let forged_log = make_log(
+            Address::repeat_byte(0x33),
+            vec![B256::repeat_byte(0x44)],
+            Bytes::from_static(&[0x02]),
+        );
+        let forged_receipts = vec![make_receipt(vec![forged_log])];
+        let result = validate_payload(&header, &body, &forged_receipts);
+        assert_eq!(result, Err("receipts root mismatch"));
+    }
+
+    #[test]
+    fn validate_payload_rejects_wrong_tx_root() {
+        let header = Header {
+            transactions_root: B256::ZERO,
+            ..consistent_header(1, B256::ZERO)
+        };
+        let body = BlockBody::default();
+        let result = validate_payload(&header, &body, &[]);
+        assert_eq!(result, Err("transactions root mismatch"));
+    }
+
+    #[test]
+    fn validate_payload_rejects_count_mismatch() {
+        let header = consistent_header(1, B256::ZERO);
+        let body = BlockBody::default();
+        let receipts = vec![make_receipt(vec![])];
+        let result = validate_payload(&header, &body, &receipts);
+        assert_eq!(result, Err("transaction/receipt count mismatch"));
+    }
+
+    #[test]
+    fn validate_payload_rejects_wrong_receipts_root() {
+        let header = Header {
+            receipts_root: B256::ZERO,
+            ..consistent_header(1, B256::ZERO)
+        };
+        let body = BlockBody::default();
+        let result = validate_payload(&header, &body, &[]);
+        assert_eq!(result, Err("receipts root mismatch"));
+    }
+
+    #[test]
+    fn validate_payload_rejects_wrong_ommers_root() {
+        let header = Header {
+            ommers_hash: B256::ZERO,
+            ..consistent_header(1, B256::ZERO)
+        };
+        let body = BlockBody::default();
+        let result = validate_payload(&header, &body, &[]);
+        assert_eq!(result, Err("ommers root mismatch"));
+    }
+
+    #[test]
+    fn validate_payload_rejects_wrong_withdrawals_root() {
+        let header = Header {
+            withdrawals_root: Some(B256::ZERO),
+            ..consistent_header(1, B256::ZERO)
+        };
+        let body = BlockBody::default();
+        let result = validate_payload(&header, &body, &[]);
+        assert_eq!(result, Err("withdrawals root mismatch"));
+    }
+
+    #[test]
+    fn continuity_keeps_linked_headers() {
+        let h1 = consistent_header(1, B256::ZERO);
+        let h1_hash = SealedHeader::seal_slow(h1.clone()).hash();
+        let h2 = consistent_header(2, h1_hash);
+
+        let mut by_number = HashMap::new();
+        by_number.insert(1, h1);
+        by_number.insert(2, h2);
+
+        let (headers, missing) = seal_and_verify_continuity(1, 2, by_number);
+        assert_eq!(headers.len(), 2);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn continuity_drops_unlinked_child() {
+        let h1 = consistent_header(1, B256::ZERO);
+        let h2 = consistent_header(2, B256::repeat_byte(0xAA));
+
+        let mut by_number = HashMap::new();
+        by_number.insert(1, h1);
+        by_number.insert(2, h2);
+
+        let (headers, missing) = seal_and_verify_continuity(1, 2, by_number);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].header().number, 1);
+        assert_eq!(missing, vec![2]);
+    }
+
+    #[test]
+    fn continuity_skips_link_check_across_gaps() {
+        let h1 = consistent_header(1, B256::ZERO);
+        let h3 = consistent_header(3, B256::repeat_byte(0xBB));
+
+        let mut by_number = HashMap::new();
+        by_number.insert(1, h1);
+        by_number.insert(3, h3);
+
+        let (headers, missing) = seal_and_verify_continuity(1, 3, by_number);
+        assert_eq!(headers.len(), 2);
+        assert_eq!(missing, vec![2]);
+    }
 }

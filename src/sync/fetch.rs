@@ -71,10 +71,10 @@ pub async fn fetch_ingest_batch(
     let mut need_fetch = Vec::new();
     let mut bloom_skipped = Vec::new();
     for header in header_outcome.headers {
-        if bloom.header_may_match(&header) {
+        if bloom.header_may_match(header.header()) {
             need_fetch.push(header);
         } else {
-            bloom_skipped.push(header.number);
+            bloom_skipped.push(header.header().number);
         }
     }
 
