@@ -966,8 +966,8 @@ fn validate_payload<C: ChainTypes>(
     if proofs::calculate_ommers_root(&body.ommers) != header.ommers_hash {
         return Err("ommers root mismatch");
     }
-    if body.calculate_withdrawals_root() != header.withdrawals_root {
-        return Err("withdrawals root mismatch");
+    if !C::withdrawals_valid(header, body) {
+        return Err("withdrawals mismatch");
     }
     if C::receipts_root(receipts, header) != header.receipts_root {
         return Err("receipts root mismatch");
@@ -1227,7 +1227,7 @@ mod tests {
         };
         let body = BlockBody::default();
         let result = validate(&header, &body, &[]);
-        assert_eq!(result, Err("withdrawals root mismatch"));
+        assert_eq!(result, Err("withdrawals mismatch"));
     }
 
     #[test]

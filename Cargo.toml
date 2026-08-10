@@ -31,6 +31,7 @@ discv5 = "0.10.2"
 alloy-primitives = "1.5.2"
 alloy-rlp = "0.3.12"
 alloy-consensus = { version = "1.4.3", features = ["serde"] }
+alloy-eips = "1.4.3"
 alloy-dyn-abi = "1"
 alloy-json-abi = "1"
 alloy-sol-types = "1"

@@ -127,6 +127,31 @@ impl ChainTypes for BaseChain {
         )
     }
 
+    /// Fork-aware OP withdrawals validation, mirroring reth's OP consensus
+    /// checks:
+    ///
+    /// - pre-Canyon: neither header nor body carry withdrawals;
+    /// - Canyon→Isthmus: the header root must match the body root (both
+    ///   are the empty-withdrawals root on OP chains);
+    /// - post-Isthmus: the header root is repurposed as the
+    ///   `L2ToL1MessagePasser` predeploy storage root (not recomputable
+    ///   from the body), and the body root must be the empty root.
+    fn withdrawals_valid(header: &Header, body: &alloy_consensus::BlockBody<OpTxEnvelope>) -> bool {
+        use reth_optimism_forks::OpHardforks;
+
+        match (header.withdrawals_root, body.calculate_withdrawals_root()) {
+            (Some(header_root), Some(body_root)) => {
+                if Self::chain_spec().is_isthmus_active_at_timestamp(header.timestamp) {
+                    body_root == alloy_consensus::constants::EMPTY_ROOT_HASH
+                } else {
+                    body_root == header_root
+                }
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Base discovery: discv4 off, discv5 with the `basev0` packet
     /// protocol id, bootstrapped from the Base bootnodes. The RLPx-level
     /// boot nodes are replaced with the Base list too (the chainspec's
@@ -181,6 +206,107 @@ mod tests {
     #[test]
     fn all_bootnodes_parse() {
         assert_eq!(base_boot_nodes().len(), BASE_BOOTNODES.len());
+    }
+
+    /// Canyon activation on Base mainnet (Shanghai / withdrawals field).
+    const CANYON_TIMESTAMP: u64 = 1_704_992_401;
+    /// Isthmus activation on Base mainnet (withdrawals_root repurposed).
+    const ISTHMUS_TIMESTAMP: u64 = 1_746_806_401;
+
+    fn header_at(timestamp: u64, withdrawals_root: Option<alloy_primitives::B256>) -> Header {
+        Header {
+            timestamp,
+            withdrawals_root,
+            ..Default::default()
+        }
+    }
+
+    fn empty_withdrawals_body() -> alloy_consensus::BlockBody<OpTxEnvelope> {
+        alloy_consensus::BlockBody {
+            withdrawals: Some(alloy_eips::eip4895::Withdrawals::default()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn withdrawals_pre_canyon_none_on_both_sides() {
+        let ts = CANYON_TIMESTAMP - 1;
+        let body_absent: alloy_consensus::BlockBody<OpTxEnvelope> =
+            alloy_consensus::BlockBody::default();
+
+        assert!(BaseChain::withdrawals_valid(
+            &header_at(ts, None),
+            &body_absent
+        ));
+        // Header claims a root the fork doesn't have yet — reject.
+        let forged = header_at(ts, Some(alloy_primitives::B256::repeat_byte(0x42)));
+        assert!(!BaseChain::withdrawals_valid(&forged, &body_absent));
+        // Body carries withdrawals without a header root — reject.
+        assert!(!BaseChain::withdrawals_valid(
+            &header_at(ts, None),
+            &empty_withdrawals_body()
+        ));
+    }
+
+    #[test]
+    fn withdrawals_canyon_to_isthmus_roots_must_match() {
+        let ts = ISTHMUS_TIMESTAMP - 1;
+        let empty_root = alloy_consensus::constants::EMPTY_ROOT_HASH;
+
+        assert!(BaseChain::withdrawals_valid(
+            &header_at(ts, Some(empty_root)),
+            &empty_withdrawals_body()
+        ));
+        // Forged header root pre-Isthmus must be rejected.
+        let forged = header_at(ts, Some(alloy_primitives::B256::repeat_byte(0x42)));
+        assert!(!BaseChain::withdrawals_valid(
+            &forged,
+            &empty_withdrawals_body()
+        ));
+        // Missing body withdrawals against a header root — reject.
+        let body_absent: alloy_consensus::BlockBody<OpTxEnvelope> =
+            alloy_consensus::BlockBody::default();
+        assert!(!BaseChain::withdrawals_valid(
+            &header_at(ts, Some(empty_root)),
+            &body_absent
+        ));
+    }
+
+    #[test]
+    fn withdrawals_post_isthmus_storage_root_and_empty_body() {
+        let ts = ISTHMUS_TIMESTAMP;
+        let storage_root = alloy_primitives::B256::repeat_byte(0x42);
+
+        // Any header root is accepted (it commits to predeploy storage),
+        // as long as the body withdrawals list is present and empty.
+        assert!(BaseChain::withdrawals_valid(
+            &header_at(ts, Some(storage_root)),
+            &empty_withdrawals_body()
+        ));
+
+        // Header root missing post-Isthmus — reject.
+        let body_absent: alloy_consensus::BlockBody<OpTxEnvelope> =
+            alloy_consensus::BlockBody::default();
+        assert!(!BaseChain::withdrawals_valid(
+            &header_at(ts, None),
+            &empty_withdrawals_body()
+        ));
+        // Body withdrawals absent post-Isthmus — reject.
+        assert!(!BaseChain::withdrawals_valid(
+            &header_at(ts, Some(storage_root)),
+            &body_absent
+        ));
+        // Non-empty body withdrawals — reject.
+        let nonempty = alloy_consensus::BlockBody::<OpTxEnvelope> {
+            withdrawals: Some(alloy_eips::eip4895::Withdrawals::new(vec![
+                alloy_eips::eip4895::Withdrawal::default(),
+            ])),
+            ..Default::default()
+        };
+        assert!(!BaseChain::withdrawals_valid(
+            &header_at(ts, Some(storage_root)),
+            &nonempty
+        ));
     }
 
     #[test]

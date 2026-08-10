@@ -106,6 +106,14 @@ pub trait ChainTypes: Send + Sync + Sized + 'static {
     /// differently depending on the block timestamp (Canyon activation).
     fn receipts_root(receipts: &[Self::Receipt], header: &Header) -> B256;
 
+    /// Verify the body's withdrawals against the header commitment.
+    ///
+    /// On Ethereum the header's `withdrawals_root` commits to the body's
+    /// withdrawals list. On OP-stack chains bodies always carry an empty
+    /// list, and the post-Isthmus header commits to predeploy storage
+    /// instead — so OP chains only check that the list is empty.
+    fn withdrawals_valid(header: &Header, body: &BlockBody<Self::SignedTx>) -> bool;
+
     /// Apply chain-specific network configuration (discovery transports,
     /// boot nodes) to the builder. `listen_addr` is the RLPx listen socket.
     ///

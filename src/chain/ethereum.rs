@@ -1,6 +1,7 @@
 //! Ethereum mainnet chain wiring.
 
 use super::ChainTypes;
+use alloy_consensus::BlockBody;
 use alloy_primitives::B256;
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_eth_wire::EthNetworkPrimitives;
@@ -27,5 +28,9 @@ impl ChainTypes for EthereumChain {
 
     fn receipts_root(receipts: &[Receipt], _header: &Header) -> B256 {
         Receipt::calculate_receipt_root_no_memo(receipts)
+    }
+
+    fn withdrawals_valid(header: &Header, body: &BlockBody<TransactionSigned>) -> bool {
+        body.calculate_withdrawals_root() == header.withdrawals_root
     }
 }
