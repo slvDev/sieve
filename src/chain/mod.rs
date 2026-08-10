@@ -5,15 +5,19 @@
 //! over this trait and monomorphized per chain; `main` selects the concrete
 //! chain at runtime by dispatching on [`ChainKind`] parsed from config.
 
+mod base;
 mod ethereum;
 
+pub use base::BaseChain;
 pub use ethereum::EthereumChain;
 
 use alloy_consensus::{BlockBody, TxReceipt};
 use alloy_primitives::B256;
 use reth_chainspec::{EthChainSpec, Hardforks};
 use reth_eth_wire_types::{NetPrimitivesFor, NetworkPrimitives};
+use reth_network::config::NetworkConfigBuilder;
 use reth_primitives_traits::{Header, NodePrimitives, SignedTransaction};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Which chain to index, parsed from the TOML `chain = "..."` key.
@@ -83,6 +87,18 @@ pub trait ChainTypes: Send + Sync + Sized + 'static {
     /// Takes the header because OP chains hash deposit receipts
     /// differently depending on the block timestamp (Canyon activation).
     fn receipts_root(receipts: &[Self::Receipt], header: &Header) -> B256;
+
+    /// Apply chain-specific network configuration (discovery transports,
+    /// boot nodes) to the builder. `listen_addr` is the RLPx listen socket.
+    ///
+    /// Default: no changes (mainnet uses reth's stock discv4 + discv5).
+    fn configure_network(
+        builder: NetworkConfigBuilder<Self::Net>,
+        listen_addr: SocketAddr,
+    ) -> NetworkConfigBuilder<Self::Net> {
+        let _ = listen_addr;
+        builder
+    }
 }
 
 #[cfg(test)]

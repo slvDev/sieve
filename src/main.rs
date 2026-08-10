@@ -80,7 +80,7 @@ async fn main() -> eyre::Result<()> {
             cli::Command::Inspect => cmd_inspect(&cli),
             cli::Command::Peers { chain } => match resolve_peers_chain(&cli, chain.as_deref())? {
                 chain::ChainKind::Mainnet => cmd_peers::<chain::EthereumChain>().await,
-                chain::ChainKind::Base => Err(unsupported_chain_error()),
+                chain::ChainKind::Base => cmd_peers::<chain::BaseChain>().await,
             },
         };
     }
@@ -95,9 +95,6 @@ async fn main() -> eyre::Result<()> {
 /// Returns an error on config, database, P2P, or sync failures.
 async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     let startup = load_toml_config(cli)?;
-
-    // Reject unsupported chains before any side effects (DB setup, API).
-    ensure_chain_supported(startup.chain)?;
 
     // Validate --end-block if provided
     if let Some(end_block) = cli.end_block {
@@ -162,21 +159,9 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
                     .await?;
             run_indexer(cli, start_block, ctx).await
         }
-        // Unreachable: rejected by ensure_chain_supported above.
-        chain::ChainKind::Base => Err(unsupported_chain_error()),
-    }
-}
-
-/// Error for chains that are recognized but not yet wired up.
-fn unsupported_chain_error() -> eyre::Report {
-    eyre::eyre!("chain = \"base\" is recognized but not wired up yet")
-}
-
-/// Reject chains that cannot run yet, before any side effects occur.
-fn ensure_chain_supported(kind: chain::ChainKind) -> eyre::Result<()> {
-    match kind {
-        chain::ChainKind::Mainnet => Ok(()),
-        chain::ChainKind::Base => Err(unsupported_chain_error()),
+        chain::ChainKind::Base => Err(eyre::eyre!(
+            "chain = \"base\" indexing is not enabled yet (requires the chain-identity guard)"
+        )),
     }
 }
 

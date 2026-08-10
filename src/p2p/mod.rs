@@ -46,6 +46,7 @@ const MAX_INBOUND: usize = 200;
 const MAX_CONCURRENT_DIALS: usize = 200;
 const PEER_REFILL_INTERVAL_MS: u64 = 500;
 const MAX_HEADERS_PER_REQUEST: usize = 1024;
+const DEFAULT_P2P_PORT: u16 = 30303;
 // ── NetworkPeer ──────────────────────────────────────────────────────
 
 /// Active peer session information used for requests.
@@ -280,10 +281,15 @@ pub async fn connect_peers<C: ChainTypes>(p2p_port: Option<u16>) -> Result<Netwo
         .disable_tx_gossip(true)
         .block_import(Box::new(ProofOfStakeBlockImport::default()));
 
+    let listen_addr =
+        std::net::SocketAddr::from(([0, 0, 0, 0], p2p_port.unwrap_or(DEFAULT_P2P_PORT)));
     if let Some(port) = p2p_port {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         builder = builder.listener_addr(addr).discovery_addr(addr);
     }
+
+    // Chain-specific discovery/boot-node overrides (e.g. Base's basev0 discv5).
+    builder = C::configure_network(builder, listen_addr);
 
     let net_config = builder
         .build(reth_storage_api::noop::NoopProvider::<C::Spec, C::Primitives>::new(chain_spec));

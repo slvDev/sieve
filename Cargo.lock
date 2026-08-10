@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe438c63458706e03479442743baae6c88256498e6431708f6dfc520a26515d3"
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,6 +338,18 @@ dependencies = [
  "alloy-primitives",
  "alloy-serde",
  "serde",
+]
+
+[[package]]
+name = "alloy-op-hardforks"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6472c610150c4c4c15be9e1b964c9b78068f933bda25fb9cdf09b9ac2bb66f36"
+dependencies = [
+ "alloy-chains",
+ "alloy-hardforks",
+ "alloy-primitives",
+ "auto_impl",
 ]
 
 [[package]]
@@ -3994,6 +4012,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5366,6 +5393,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-consensus-common"
+version = "1.10.0"
+source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e64a3c7642024aca#a74cb9cbc38a5590b2596c67e64a3c7642024aca"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-primitives-traits",
+]
+
+[[package]]
 name = "reth-db-models"
 version = "1.10.0"
 source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e64a3c7642024aca#a74cb9cbc38a5590b2596c67e64a3c7642024aca"
@@ -5768,6 +5807,83 @@ dependencies = [
  "reth-network-peers",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "reth-optimism-chainspec"
+version = "1.10.0"
+source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e64a3c7642024aca#a74cb9cbc38a5590b2596c67e64a3c7642024aca"
+dependencies = [
+ "alloy-chains",
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-hardforks",
+ "alloy-primitives",
+ "derive_more",
+ "miniz_oxide",
+ "op-alloy-consensus",
+ "op-alloy-rpc-types",
+ "reth-chainspec",
+ "reth-ethereum-forks",
+ "reth-network-peers",
+ "reth-optimism-forks",
+ "reth-optimism-primitives",
+ "reth-primitives-traits",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "reth-optimism-consensus"
+version = "1.10.0"
+source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e64a3c7642024aca#a74cb9cbc38a5590b2596c67e64a3c7642024aca"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-trie",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-consensus-common",
+ "reth-execution-types",
+ "reth-optimism-chainspec",
+ "reth-optimism-forks",
+ "reth-optimism-primitives",
+ "reth-primitives-traits",
+ "reth-storage-api",
+ "reth-storage-errors",
+ "reth-trie-common",
+ "revm",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "reth-optimism-forks"
+version = "1.10.0"
+source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e64a3c7642024aca#a74cb9cbc38a5590b2596c67e64a3c7642024aca"
+dependencies = [
+ "alloy-op-hardforks",
+ "alloy-primitives",
+ "once_cell",
+ "reth-ethereum-forks",
+]
+
+[[package]]
+name = "reth-optimism-primitives"
+version = "1.10.0"
+source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e64a3c7642024aca#a74cb9cbc38a5590b2596c67e64a3c7642024aca"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "op-alloy-consensus",
+ "reth-primitives-traits",
+ "serde",
+ "serde_with",
 ]
 
 [[package]]
@@ -6870,20 +6986,28 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "discv5",
  "dotenvy",
  "eyre",
  "futures",
  "lapin",
+ "op-alloy-consensus",
  "owo-colors",
  "parking_lot",
  "prometheus-client",
  "reqwest",
  "reth-chainspec",
+ "reth-discv5",
  "reth-eth-wire",
  "reth-eth-wire-types",
  "reth-ethereum-primitives",
  "reth-network",
  "reth-network-api",
+ "reth-network-peers",
+ "reth-optimism-chainspec",
+ "reth-optimism-consensus",
+ "reth-optimism-forks",
+ "reth-optimism-primitives",
  "reth-primitives-traits",
  "reth-storage-api",
  "serde",
