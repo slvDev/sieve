@@ -86,6 +86,7 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
 
     let mut last_heartbeat = Instant::now();
     let mut phase = FollowPhase::Discovering;
+    let mut sync_failures = 0u32;
 
     // Background spinner for the discovering phase (80ms tick)
     let mut spinner_stop = if fctx.verbose {
@@ -103,7 +104,7 @@ pub async fn run_follow_loop(start_block: BlockNumber, ctx: SyncContext) -> eyre
             print_heartbeat(&fctx, &phase).await?;
             last_heartbeat = Instant::now();
         }
-        if run_follow_epoch(&fctx, &mut phase, &mut spinner_stop).await? {
+        if run_follow_epoch(&fctx, &mut phase, &mut spinner_stop, &mut sync_failures).await? {
             break;
         }
     }
@@ -163,11 +164,19 @@ async fn print_heartbeat(ctx: &FollowContext, phase: &FollowPhase) -> eyre::Resu
     Ok(())
 }
 
+/// Maximum consecutive failed sync epochs before the follow loop gives up.
+///
+/// A single failure is retried (the failing block is usually re-fetched
+/// from a different peer, and a raced reorg is handled by the next
+/// preflight); persistent failures indicate an unrecoverable problem.
+const MAX_SYNC_FAILURES: u32 = 5;
+
 /// Run a single follow epoch. Returns `true` if the loop should exit.
 async fn run_follow_epoch(
     ctx: &FollowContext,
     phase: &mut FollowPhase,
     spinner_stop: &mut Option<watch::Sender<bool>>,
+    sync_failures: &mut u32,
 ) -> eyre::Result<bool> {
     match discover_gap(ctx).await? {
         EpochAction::Wait => Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await),
@@ -179,7 +188,11 @@ async fn run_follow_epoch(
                 // Brief yield to let spinner task clear the line
                 tokio::task::yield_now().await;
             }
-            let gap = sync_epoch(ctx, next_block, head).await?;
+            let gap = match sync_epoch(ctx, next_block, head).await {
+                Ok(gap) => gap,
+                Err(err) => return handle_sync_failure(ctx, err, sync_failures).await,
+            };
+            *sync_failures = 0;
             *phase = FollowPhase::Following;
             if gap <= 2 {
                 ctx.metrics.is_ready.store(true, Ordering::Relaxed);
@@ -189,6 +202,39 @@ async fn run_follow_epoch(
             Ok(should_exit)
         }
     }
+}
+
+/// Handle a failed sync epoch: retry with a cap on consecutive failures.
+///
+/// Returns `Ok(should_exit)` when the failure is retriable, or the wrapped
+/// error once [`MAX_SYNC_FAILURES`] consecutive epochs have failed.
+/// A [`crate::sync::FactoryStateError`] is never retried: it means the
+/// in-memory factory state may still be poisoned, and a subsequent sync
+/// could succeed against that state and advance the checkpoint.
+async fn handle_sync_failure(
+    ctx: &FollowContext,
+    err: eyre::Report,
+    sync_failures: &mut u32,
+) -> eyre::Result<bool> {
+    if err
+        .downcast_ref::<crate::sync::FactoryStateError>()
+        .is_some()
+    {
+        return Err(err.wrap_err("factory state could not be restored; refusing to retry"));
+    }
+    *sync_failures += 1;
+    if *sync_failures >= MAX_SYNC_FAILURES {
+        return Err(err.wrap_err(format!(
+            "sync epoch failed {MAX_SYNC_FAILURES} consecutive times"
+        )));
+    }
+    warn!(
+        error = ?err,
+        attempt = *sync_failures,
+        max_attempts = MAX_SYNC_FAILURES,
+        "sync epoch failed; retrying next epoch"
+    );
+    Ok(wait_or_stop(&ctx.stop_rx, Duration::from_secs(1)).await)
 }
 
 /// Check if the stop signal has been received.
@@ -351,14 +397,18 @@ async fn should_rollback_reorg(
             wait_or_stop(stop_rx, Duration::from_secs(1)).await;
             Ok(true)
         }
-        ReorgCheck::ReorgDetected { anchor } => {
+        ReorgCheck::ReorgDetected {
+            anchors,
+            expected_tip,
+        } => {
             execute_rollback(
                 db,
                 handlers,
                 transfer_handlers,
                 call_handlers,
                 config,
-                &anchor,
+                &anchors,
+                expected_tip,
                 baseline,
             )
             .await?;
@@ -368,18 +418,50 @@ async fn should_rollback_reorg(
 }
 
 /// Find the common ancestor and roll back all indexed data above it.
+///
+/// Skips the rollback (returning `Ok`) when no anchor peer supplies a
+/// valid divergent chain — the next epoch's preflight will retry.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "follow loop passes individual fields"
+)]
 async fn execute_rollback(
     db: &Database,
     handlers: &HandlerRegistry,
     transfer_handlers: &TransferRegistry,
     call_handlers: &CallRegistry,
     config: &crate::config::IndexConfig,
-    anchor: &crate::p2p::NetworkPeer,
+    anchors: &[crate::p2p::NetworkPeer],
+    expected_tip: alloy_primitives::B256,
     baseline: u64,
 ) -> eyre::Result<()> {
     warn!(block = baseline, "reorg detected, finding common ancestor");
-    let ancestor = reorg::find_common_ancestor(db, anchor, baseline).await?;
+    let Some(ancestor) = reorg::find_common_ancestor(db, anchors, baseline, expected_tip).await?
+    else {
+        warn!("no anchor peer provided a valid divergent chain; retrying next epoch");
+        return Ok(());
+    };
 
+    rollback_to_ancestor(
+        db,
+        handlers,
+        transfer_handlers,
+        call_handlers,
+        config,
+        ancestor,
+    )
+    .await
+}
+
+/// Roll back all indexed data above `ancestor` in one DB transaction.
+async fn rollback_to_ancestor(
+    db: &Database,
+    handlers: &HandlerRegistry,
+    transfer_handlers: &TransferRegistry,
+    call_handlers: &CallRegistry,
+    config: &crate::config::IndexConfig,
+    ancestor: u64,
+) -> eyre::Result<()> {
     info!(ancestor, "rolling back to common ancestor");
     let ancestor_block = BlockNumber::new(ancestor);
     let mut tx = db.begin().await?;

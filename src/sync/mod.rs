@@ -27,6 +27,40 @@ pub use engine::run_sync;
 pub use follow::run_follow_loop;
 pub use reorg::ReorgCheck;
 
+/// Fatal error: the in-memory factory-child state could not be restored
+/// after a rejected batch.
+///
+/// While this error is live, the shared [`IndexConfig`] may still contain
+/// speculative (unvalidated) factory children. Retrying sync in this state
+/// could index events against attacker-supplied addresses or miss events
+/// from committed children — callers must propagate instead of retrying.
+#[derive(Debug)]
+pub struct FactoryStateError {
+    message: String,
+}
+
+impl FactoryStateError {
+    /// Build an [`eyre::Report`] with this error as the outermost type so
+    /// callers can `downcast_ref` it to detect the non-retriable case.
+    pub fn report(sync_err: &eyre::Report, rebuild_err: &eyre::Report) -> eyre::Report {
+        eyre::Report::new(Self {
+            message: format!(
+                "factory-children rebuild failed after rejected batch \
+                 (in-memory state may be stale): {rebuild_err:?}; \
+                 original sync error: {sync_err:?}"
+            ),
+        })
+    }
+}
+
+impl std::fmt::Display for FactoryStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FactoryStateError {}
+
 /// Shared context for sync operations, bundling parameters that would
 /// otherwise require 7+ function arguments.
 pub struct SyncContext {

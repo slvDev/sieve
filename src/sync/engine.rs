@@ -191,6 +191,10 @@ pub async fn run_sync(
         Arc::clone(&ctx.factories),
     );
 
+    // Abort signal: fired by the DB writer on fatal integrity errors so the
+    // fetch loop stops promptly instead of draining the whole range.
+    let (abort_tx, abort_rx) = watch::channel(false);
+
     // Spawn DB writer (reads ProcessedBlocks, batches, commits)
     let consumer_handle = tokio::spawn(consume_payloads(
         processed_rx,
@@ -209,6 +213,7 @@ pub async fn run_sync(
         started,
         ctx.verbose,
         ctx.stop_rx.clone(),
+        abort_tx,
     ));
 
     // Main fetch loop
@@ -226,7 +231,7 @@ pub async fn run_sync(
         bloom_filter: &ctx.bloom_filter,
         head_seen_rx: &ctx.head_seen_rx,
     };
-    run_fetch_loop(&fetch_ctx, ready_rx, &ctx.stop_rx).await;
+    run_fetch_loop(&fetch_ctx, ready_rx, &ctx.stop_rx, &abort_rx).await;
 
     // Shutdown: feeder → workers → DB writer
     let _ = feeder_shutdown_tx.send(true);
@@ -235,7 +240,14 @@ pub async fn run_sync(
     while worker_set.join_next().await.is_some() {} // wait for workers to drain
                                                     // All worker processed_tx clones dropped → DB writer sees channel close
 
-    let stats = consumer_handle.await.wrap_err("consumer task failed")?;
+    let stats = match consumer_handle.await {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(err)) => return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await),
+        Err(join_err) => {
+            let err = eyre::eyre!("consumer task failed: {join_err}");
+            return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await);
+        }
+    };
 
     let elapsed = started.elapsed();
     Ok(SyncOutcome {
@@ -318,6 +330,7 @@ async fn run_fetch_loop(
     ctx: &FetchLoopContext<'_>,
     mut ready_rx: mpsc::UnboundedReceiver<NetworkPeer>,
     stop_rx: &watch::Receiver<bool>,
+    abort_rx: &watch::Receiver<bool>,
 ) {
     let fetch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
     let mut state = FetchLoopState {
@@ -331,6 +344,10 @@ async fn run_fetch_loop(
     loop {
         if *stop_rx.borrow() {
             debug!("fetch loop: stop signal received");
+            break;
+        }
+        if *abort_rx.borrow() {
+            debug!("fetch loop: consumer abort signal received");
             break;
         }
 
@@ -347,6 +364,7 @@ async fn run_fetch_loop(
                 ctx.pool,
                 &mut state.ready_peers,
                 &mut state.ready_set,
+                abort_rx,
             )
             .await
             {
@@ -412,8 +430,14 @@ async fn await_first_peer(
     pool: &PeerPool,
     ready_peers: &mut Vec<NetworkPeer>,
     ready_set: &mut HashSet<PeerId>,
+    abort_rx: &watch::Receiver<bool>,
 ) -> bool {
-    let Some(mut peer) = ready_rx.recv().await else {
+    let mut abort_rx = abort_rx.clone();
+    let received = tokio::select! {
+        peer = ready_rx.recv() => peer,
+        _ = abort_rx.changed() => return false,
+    };
+    let Some(mut peer) = received else {
         return false;
     };
     if let Some(h) = pool.get_peer_head(peer.peer_id) {
@@ -741,7 +765,8 @@ async fn consume_payloads(
     started_at: Instant,
     verbose: bool,
     stop_rx: watch::Receiver<bool>,
-) -> ConsumerStats {
+    abort_tx: watch::Sender<bool>,
+) -> eyre::Result<ConsumerStats> {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
     let mut max_indexed_block: u64 = 0;
@@ -774,8 +799,9 @@ async fn consume_payloads(
                         &mut max_indexed_block,
                         stream_dispatcher.as_ref(),
                         is_backfill,
+                        &abort_tx,
                     )
-                    .await;
+                    .await?;
                     continue;
                 }
             }
@@ -792,8 +818,9 @@ async fn consume_payloads(
                     &mut max_indexed_block,
                     stream_dispatcher.as_ref(),
                     is_backfill,
+                    &abort_tx,
                 )
-                .await;
+                .await?;
             }
             break;
         };
@@ -812,8 +839,9 @@ async fn consume_payloads(
                 &mut max_indexed_block,
                 stream_dispatcher.as_ref(),
                 is_backfill,
+                &abort_tx,
             )
-            .await;
+            .await?;
         }
 
         log_sync_progress(
@@ -827,7 +855,7 @@ async fn consume_payloads(
         );
     }
 
-    stats
+    Ok(stats)
 }
 
 /// Shared references for the DB writer (reduces argument counts).
@@ -951,6 +979,10 @@ fn register_factory_child_in_memory(config: &IndexConfig, discovery: &filter::Fa
 /// transfers, calls, and factory children. Updates the checkpoint once
 /// with the maximum block number (using GREATEST). Dispatches stream
 /// notifications after commit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouping these into a struct would add complexity without benefit"
+)]
 async fn flush_batch(
     batch: &mut Vec<ProcessedBlock>,
     ctx: &ProcessContext<'_>,
@@ -959,22 +991,125 @@ async fn flush_batch(
     max_indexed_block: &mut u64,
     stream_dispatcher: Option<&Arc<crate::stream::StreamDispatcher>>,
     is_backfill: bool,
-) {
+    abort_tx: &watch::Sender<bool>,
+) -> eyre::Result<()> {
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     let batch_len = batch.len() as u64;
+
+    // Integrity gate: every block whose parent hash is known (same batch or
+    // already stored) must link to it. A violation means a peer served fork
+    // data (or a reorg raced the fetch) — abort the run instead of storing.
+    // Speculative in-memory state (factory children) is discarded by
+    // `run_sync` once the workers have stopped.
+    if let Err(err) = verify_batch_anchors(batch, ctx.db).await {
+        let _ = abort_tx.send(true);
+        return Err(err);
+    }
 
     match flush_batch_inner(batch, ctx).await {
         Ok(outcomes) => {
             update_batch_stats(stats, metrics, max_indexed_block, &outcomes, batch_len);
             dispatch_batch_notifications(stream_dispatcher, outcomes, is_backfill);
         }
-        Err(e) => {
-            warn!(batch_size = batch_len, error = %e, "failed to flush batch");
+        Err(err) => {
+            let _ = abort_tx.send(true);
+            return Err(err.wrap_err(format!("failed to flush batch of {batch_len} blocks")));
         }
     }
     batch.clear();
+    Ok(())
+}
+
+/// Clean up after a sync run whose consumer failed (rejected batch or
+/// panic): discard speculative in-memory factory state by reloading the
+/// committed set from the database.
+///
+/// Must only be called once the processing workers are joined — they
+/// register factory children speculatively, and a late registration would
+/// survive the rebuild. Returns the error to propagate: the original one,
+/// or a non-retriable [`crate::sync::FactoryStateError`] if the rebuild
+/// itself failed and speculative state may still be live.
+async fn finish_rejected_run(
+    db: &Database,
+    config: &IndexConfig,
+    err: eyre::Report,
+) -> eyre::Report {
+    match db::rebuild_factory_children(db, config).await {
+        Ok(children) => {
+            debug!(
+                children,
+                "restored committed factory children after rejected batch"
+            );
+            err
+        }
+        Err(rebuild_err) => crate::sync::FactoryStateError::report(&err, &rebuild_err),
+    }
+}
+
+/// Verify parent-hash linkage for every block in the batch.
+///
+/// Builds a map of known canonical hashes from the batch itself plus any
+/// previously stored hashes for parents outside the batch, then checks each
+/// block's `parent_hash` against it. Parents with no known hash (e.g.
+/// bloom-skipped blocks that never stored one) are skipped.
+///
+/// # Errors
+///
+/// Returns an error on the first linkage violation, or if the stored-hash
+/// lookup fails.
+async fn verify_batch_anchors(batch: &[ProcessedBlock], db: &Database) -> eyre::Result<()> {
+    let mut known_hashes: HashMap<u64, B256> = batch
+        .iter()
+        .map(|b| (b.block_number.as_u64(), b.block_hash))
+        .collect();
+
+    let blocks: Vec<(u64, B256)> = batch
+        .iter()
+        .map(|b| (b.block_number.as_u64(), b.payload.header().parent_hash))
+        .collect();
+
+    // Resolve parents outside the batch from previously stored hashes.
+    for &(number, _) in &blocks {
+        let Some(parent) = number.checked_sub(1) else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = known_hashes.entry(parent) {
+            if let Some(hash) = db.get_block_hash(BlockNumber::new(parent)).await? {
+                entry.insert(hash);
+            }
+        }
+    }
+
+    if let Some((number, actual, expected)) = find_anchor_violation(&blocks, &known_hashes) {
+        return Err(eyre::eyre!(
+            "block {number} parent-hash mismatch: header claims parent {actual} but chain has {expected} — refusing to store batch (fork data from peer or concurrent reorg)"
+        ));
+    }
+    Ok(())
+}
+
+/// Find the first parent-hash linkage violation.
+///
+/// `blocks` holds `(block_number, header_parent_hash)` pairs in any order;
+/// `known_hashes` maps block number → canonical hash for every block whose
+/// hash is known. Returns `(block_number, actual_parent, expected_parent)`.
+fn find_anchor_violation(
+    blocks: &[(u64, B256)],
+    known_hashes: &HashMap<u64, B256>,
+) -> Option<(u64, B256, B256)> {
+    for &(number, parent_hash) in blocks {
+        let Some(parent_number) = number.checked_sub(1) else {
+            continue;
+        };
+        if let Some(&expected) = known_hashes.get(&parent_number) {
+            if parent_hash != expected {
+                return Some((number, parent_hash, expected));
+            }
+        }
+    }
+    None
 }
 
 /// Inner flush: open one transaction, store all blocks, commit.
@@ -1769,6 +1904,43 @@ mod tests {
     fn compute_gas_used_first_tx() {
         let receipts = vec![make_receipt(21_000)];
         assert_eq!(compute_gas_used(&receipts, 0), 21_000);
+    }
+
+    #[test]
+    fn anchor_violation_none_for_linked_blocks() {
+        let h1 = B256::repeat_byte(0x01);
+        let h2 = B256::repeat_byte(0x02);
+        let known: HashMap<u64, B256> = [(10, h1), (11, h2)].into_iter().collect();
+        // Block 11's header claims parent h1 (hash of block 10) — linked.
+        let blocks = vec![(11u64, h1)];
+        assert_eq!(find_anchor_violation(&blocks, &known), None);
+    }
+
+    #[test]
+    fn anchor_violation_detected_against_stored_parent() {
+        let stored_parent = B256::repeat_byte(0x01);
+        let forged_parent = B256::repeat_byte(0xEE);
+        let known: HashMap<u64, B256> = std::iter::once((10, stored_parent)).collect();
+        let blocks = vec![(11u64, forged_parent)];
+        assert_eq!(
+            find_anchor_violation(&blocks, &known),
+            Some((11, forged_parent, stored_parent))
+        );
+    }
+
+    #[test]
+    fn anchor_violation_skips_unknown_parents() {
+        let known: HashMap<u64, B256> = HashMap::new();
+        // Parent hash of block 11 is unknown (e.g. bloom-skipped) — no check.
+        let blocks = vec![(11u64, B256::repeat_byte(0xEE))];
+        assert_eq!(find_anchor_violation(&blocks, &known), None);
+    }
+
+    #[test]
+    fn anchor_violation_skips_genesis() {
+        let known: HashMap<u64, B256> = HashMap::new();
+        let blocks = vec![(0u64, B256::ZERO)];
+        assert_eq!(find_anchor_violation(&blocks, &known), None);
     }
 
     #[test]

@@ -169,6 +169,19 @@ impl IndexConfig {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         children.remove(address);
     }
+
+    /// Atomically replace the entire dynamic factory-children map.
+    ///
+    /// Used to discard speculative registrations after a rejected batch:
+    /// the committed set is rebuilt off to the side and swapped in whole,
+    /// so a failed rebuild never leaves partial or empty state behind.
+    pub fn replace_factory_children(&self, children: HashMap<Address, usize>) {
+        let mut guard = self
+            .factory_children
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = children;
+    }
 }
 
 /// Hardcoded USDC Transfer config for tests.
@@ -269,6 +282,23 @@ mod tests {
         config.unregister_factory_child(&child);
         assert!(config.contract_for_address(&child).is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn replace_factory_children_swaps_whole_map() -> eyre::Result<()> {
+        let config = usdc_transfer_config()?;
+        let speculative = address!("0000000000000000000000000000000000000042");
+        let committed = address!("0000000000000000000000000000000000000043");
+
+        config.register_factory_child(speculative, 0);
+
+        let mut committed_map = HashMap::new();
+        committed_map.insert(committed, 0);
+        config.replace_factory_children(committed_map);
+
+        assert!(config.contract_for_address(&speculative).is_none());
+        assert!(config.contract_for_address(&committed).is_some());
         Ok(())
     }
 

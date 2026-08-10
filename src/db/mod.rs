@@ -18,6 +18,7 @@ use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use std::collections::HashMap;
 use tracing::info;
 
 /// PostgreSQL database wrapper.
@@ -246,17 +247,72 @@ pub async fn load_factory_children(db: &Database, config: &IndexConfig) -> eyre:
     Ok(count)
 }
 
+/// Discard all in-memory factory children and reload the committed set.
+///
+/// Processing workers register children speculatively before any payload
+/// validation, so after a rejected batch the in-memory map may contain
+/// entries from blocks that were never committed — including blocks that
+/// were still queued behind the failed batch. Rebuilding from the database
+/// restores exactly the committed state.
+///
+/// The replacement is atomic: the committed set is built off to the side
+/// and only swapped in once fully loaded. If the query fails, the current
+/// map is left untouched — callers must treat that as fatal, since the
+/// speculative state has not been discarded.
+///
+/// Callers must ensure no processing workers are running concurrently,
+/// otherwise a worker could re-register a speculative child after the
+/// rebuild.
+///
+/// # Errors
+///
+/// Returns an error if the reload query fails.
+pub async fn rebuild_factory_children(db: &Database, config: &IndexConfig) -> eyre::Result<u64> {
+    let rows = sqlx::query("SELECT factory_name, child_address FROM _sieve_factory_children")
+        .fetch_all(db.pool())
+        .await
+        .wrap_err("failed to load factory children for rebuild")?;
+
+    let mut committed: HashMap<Address, usize> = HashMap::new();
+    for row in &rows {
+        let factory_name: &str = row.try_get("factory_name")?;
+        let child_bytes: Vec<u8> = row.try_get("child_address")?;
+        if let Some((address, contract_idx)) =
+            parse_persisted_child(config, factory_name, &child_bytes)
+        {
+            committed.insert(address, contract_idx);
+        }
+    }
+
+    let count = committed.len() as u64;
+    config.replace_factory_children(committed);
+    Ok(count)
+}
+
 /// Validate and register a single persisted factory child.
 ///
 /// Returns `true` if the child was successfully registered.
 fn register_persisted_child(config: &IndexConfig, factory_name: &str, child_bytes: &[u8]) -> bool {
+    parse_persisted_child(config, factory_name, child_bytes)
+        .is_some_and(|(address, contract_idx)| config.register_factory_child(address, contract_idx))
+}
+
+/// Validate a persisted factory-child row, resolving its contract index.
+///
+/// Returns `None` (with a warning) for malformed addresses or rows that
+/// reference a contract missing from the current config.
+fn parse_persisted_child(
+    config: &IndexConfig,
+    factory_name: &str,
+    child_bytes: &[u8],
+) -> Option<(Address, usize)> {
     if child_bytes.len() != 20 {
         tracing::warn!(
             factory = factory_name,
             len = child_bytes.len(),
             "invalid child address length in DB, skipping"
         );
-        return false;
+        return None;
     }
 
     let child_address = Address::from_slice(child_bytes);
@@ -266,10 +322,10 @@ fn register_persisted_child(config: &IndexConfig, factory_name: &str, child_byte
             factory = factory_name,
             "factory child references unknown contract, skipping"
         );
-        return false;
+        return None;
     };
 
-    config.register_factory_child(child_address, contract_idx)
+    Some((child_address, contract_idx))
 }
 
 /// Persist a newly discovered factory child in the database.
