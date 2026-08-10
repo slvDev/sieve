@@ -5,13 +5,20 @@
 #   WEBHOOK_URL   — webhook endpoint (required if [[streams]] type = "webhook")
 #   RABBITMQ_URL  — RabbitMQ connection string (required if [[streams]] type = "rabbitmq")
 
-# chain = "mainnet"  # default; which chain to index
+# Which chain to index: "mainnet" (default) or "base".
+# A database is bound to its chain on first run; use a separate database
+# (or `sieve reset`) when switching chains.
+# chain = "mainnet"
 
 [api]
 port = 4000  # omit [api] section to disable GraphQL
 
 # [p2p]
 # port = 30303  # default; change to run multiple instances
+# Pin peers that are always dialed and kept connected (e.g. an archive
+# node for deep backfills — most Base full nodes only serve ~31 days of
+# receipts):
+# trusted_peers = ["enode://<pubkey>@<ip>:<port>"]
 
 [[contracts]]
 name = "USDC"

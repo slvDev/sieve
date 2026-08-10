@@ -123,6 +123,44 @@ All of it configured in one TOML file. All of it stored in PostgreSQL. All of it
 
 ## Configuration Reference
 
+### Chains
+
+Sieve indexes Ethereum mainnet by default. Base mainnet is supported too:
+
+```toml
+chain = "base"   # top-level key; "mainnet" (default) or "base"
+```
+
+A database is bound to its chain on first run — reusing a mainnet database
+with `chain = "base"` (or vice versa) is refused so chain state can never
+mix. Use a separate database per chain, or wipe with `sieve reset` /
+`--fresh`.
+
+Base notes:
+
+- Blocks arrive over Base's devp2p network directly (no RPC, same as
+  mainnet). Sieve speaks Base's `basev0` peer discovery and follows the
+  sequencer's unsafe head, typically within a block or two (2s blocks).
+- OP-stack deposit transactions (type `0x7E`) are indexed like any other
+  transaction: events decode normally, and user deposits with value show
+  up in native transfer tables (the sender is the deposit's `from`
+  address). The per-block L1-attributes deposit carries no value and is
+  skipped by transfer indexing.
+- Most public Base nodes only serve about a month of receipt history.
+  For deeper backfills, pin an archive node via `trusted_peers` (below);
+  Sieve automatically avoids asking peers for history they advertise as
+  pruned.
+- Test connectivity without a config: `sieve peers --chain base`.
+- Known limitation: Base's unscheduled "Cobalt" hardfork will introduce a
+  new transaction type (`0x79`) and can be activated via L1 signalling.
+  When it is scheduled, Sieve will need an update to keep following Base.
+
+```toml
+[p2p]
+# Always-connected peers (e.g. an archive node for deep backfills):
+trusted_peers = ["enode://<pubkey>@<ip>:<port>"]
+```
+
 ### Contracts and Events
 
 ```toml
