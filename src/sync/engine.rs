@@ -566,6 +566,10 @@ async fn check_peer_eligibility<C: ChainTypes>(
         return Some(PeerAction::Recycle(500));
     }
 
+    if let Some(action) = check_history_range(ctx, peer).await {
+        return Some(action);
+    }
+
     // Stale-head detection: peer's probed head is below our work range.
     // Skip in follow mode — the head tracker verifies blocks exist on the network,
     // and per-peer heads are stale (probed once at connect). Let fetches fail instead.
@@ -599,6 +603,34 @@ async fn check_peer_eligibility<C: ChainTypes>(
     }
 
     None
+}
+
+/// History-range check: a peer that has pruned history below the front of
+/// the work queue (advertised via the eth/69 Status earliest block) cannot
+/// serve the next batch. Cool it down briefly — it becomes useful again
+/// once the queue front passes its earliest block.
+async fn check_history_range<C: ChainTypes>(
+    ctx: &FetchLoopContext<'_, C>,
+    peer: &NetworkPeer<C>,
+) -> Option<PeerAction> {
+    let earliest = peer.earliest_block?;
+    if earliest == 0 {
+        return None;
+    }
+    let lowest_pending = ctx.scheduler.lowest_pending().await?;
+    if earliest <= lowest_pending {
+        return None;
+    }
+    debug!(
+        peer_id = ?peer.peer_id,
+        peer_earliest = earliest,
+        lowest_pending,
+        "peer pruned history below work queue, cooling down"
+    );
+    ctx.peer_health
+        .set_stale_head_cooldown(peer.peer_id, Duration::from_secs(30))
+        .await;
+    Some(PeerAction::RecycleImmediate)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

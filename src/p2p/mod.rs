@@ -56,6 +56,9 @@ pub struct NetworkPeer<C: ChainTypes> {
     pub eth_version: EthVersion,
     pub messages: PeerRequestSender<PeerRequest<C::Net>>,
     pub head_number: u64,
+    /// Earliest block this peer can serve (eth/69 Status). `None` = unknown
+    /// (pre-eth/69 peer); `Some(0)` = full history.
+    pub earliest_block: Option<u64>,
     pub last_success: Instant,
 }
 
@@ -67,6 +70,7 @@ impl<C: ChainTypes> Clone for NetworkPeer<C> {
             eth_version: self.eth_version,
             messages: self.messages.clone(),
             head_number: self.head_number,
+            earliest_block: self.earliest_block,
             last_success: self.last_success,
         }
     }
@@ -260,17 +264,24 @@ pub struct NetworkSession<C: ChainTypes> {
 /// Start the devp2p network for chain `C`, discover peers, and wait for
 /// initial connections.
 ///
+/// `trusted_peers` are always dialed and kept connected regardless of
+/// reputation (validated upstream at config-resolution time).
+///
 /// # Errors
 ///
 /// Returns an error if the network fails to start or no peers connect
 /// within the configured timeout.
-pub async fn connect_peers<C: ChainTypes>(p2p_port: Option<u16>) -> Result<NetworkSession<C>> {
+pub async fn connect_peers<C: ChainTypes>(
+    p2p_port: Option<u16>,
+    trusted_peers: &[reth_network_peers::TrustedPeer],
+) -> Result<NetworkSession<C>> {
     let secret_key = rng_secret_key();
     let peers_config = PeersConfig::default()
         .with_max_outbound(MAX_OUTBOUND)
         .with_max_inbound(MAX_INBOUND)
         .with_max_concurrent_dials(MAX_CONCURRENT_DIALS)
-        .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS));
+        .with_refill_slots_interval(Duration::from_millis(PEER_REFILL_INTERVAL_MS))
+        .with_trusted_nodes(trusted_peers.to_vec());
 
     let chain_spec = C::chain_spec();
     let boot_nodes = chain_spec.bootnodes().unwrap_or_default();
@@ -381,37 +392,45 @@ fn spawn_peer_watcher<C: ChainTypes>(
                     let head_hash = info.status.blockhash;
                     let messages_for_probe = messages.clone();
 
+                    // eth/69 peers advertise their head and served history
+                    // range directly in the Status — no probe needed.
+                    let status_head = info.status.latest_block.unwrap_or(0);
+                    let earliest_block = info.status.earliest_block;
+
                     pool.add_peer(NetworkPeer {
                         peer_id,
                         eth_version: info.version,
                         messages,
-                        head_number: 0,
+                        head_number: status_head,
+                        earliest_block,
                         last_success: Instant::now(),
                     });
 
                     info!(peers = pool.len(), "peer connected");
 
-                    let pool_for_probe = Arc::clone(&pool);
-                    let semaphore = Arc::clone(&head_probe_semaphore);
-                    tokio::spawn(async move {
-                        let Ok(_permit) = semaphore.acquire_owned().await else {
-                            return;
-                        };
-                        match request_head_number::<C>(peer_id, head_hash, &messages_for_probe)
-                            .await
-                        {
-                            Ok(head_number) => {
-                                pool_for_probe.update_peer_head(peer_id, head_number);
+                    if status_head == 0 {
+                        let pool_for_probe = Arc::clone(&pool);
+                        let semaphore = Arc::clone(&head_probe_semaphore);
+                        tokio::spawn(async move {
+                            let Ok(_permit) = semaphore.acquire_owned().await else {
+                                return;
+                            };
+                            match request_head_number::<C>(peer_id, head_hash, &messages_for_probe)
+                                .await
+                            {
+                                Ok(head_number) => {
+                                    pool_for_probe.update_peer_head(peer_id, head_number);
+                                }
+                                Err(err) => {
+                                    debug!(
+                                        peer_id = ?peer_id,
+                                        error = %err,
+                                        "failed to probe peer head; keeping peer with unknown head"
+                                    );
+                                }
                             }
-                            Err(err) => {
-                                debug!(
-                                    peer_id = ?peer_id,
-                                    error = %err,
-                                    "failed to probe peer head; keeping peer with unknown head"
-                                );
-                            }
-                        }
-                    });
+                        });
+                    }
                 }
                 NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
                     p2p_stats.sessions_closed.fetch_add(1, Ordering::Relaxed);

@@ -167,6 +167,24 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     }
 }
 
+/// Parse and validate trusted peer URLs from config.
+///
+/// Validated at config-resolution time — before any database or network
+/// side effects — and required to use the `enode://` scheme explicitly.
+fn parse_trusted_peers(raw: &[String]) -> eyre::Result<Vec<reth_network_peers::TrustedPeer>> {
+    raw.iter()
+        .map(|url| {
+            if !url.starts_with("enode://") {
+                return Err(eyre::eyre!(
+                    "invalid trusted peer \"{url}\": must be an enode:// URL"
+                ));
+            }
+            url.parse()
+                .map_err(|err| eyre::eyre!("invalid trusted peer \"{url}\": {err}"))
+        })
+        .collect()
+}
+
 /// Resolve the chain for the `peers` subcommand.
 ///
 /// Precedence: `--chain` flag, then the config file's `chain` key (when the
@@ -269,7 +287,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
     let stream_dispatcher = build_stream_dispatcher(&startup.resolved_streams);
 
     let session = if cli.verbose {
-        p2p::connect_peers::<C>(startup.p2p_port).await?
+        p2p::connect_peers::<C>(startup.p2p_port, &startup.trusted_peers).await?
     } else {
         let (done_tx, mut done_rx) = watch::channel(false);
         let spinner_task = tokio::spawn(async move {
@@ -282,7 +300,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
                 }
             }
         });
-        let session = p2p::connect_peers::<C>(startup.p2p_port).await?;
+        let session = p2p::connect_peers::<C>(startup.p2p_port, &startup.trusted_peers).await?;
         let _ = done_tx.send(true);
         spinner_task.await.ok();
         ui::clear_line();
@@ -321,6 +339,7 @@ struct StartupConfig {
     database_url: String,
     api_port: Option<u16>,
     p2p_port: Option<u16>,
+    trusted_peers: Vec<reth_network_peers::TrustedPeer>,
     index_config: config::IndexConfig,
     resolved_events: Vec<toml_config::ResolvedEvent>,
     factories: Vec<toml_config::ResolvedFactory>,
@@ -389,6 +408,14 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         .p2p_port
         .or_else(|| startup.sieve_config.p2p.as_ref().and_then(|p| p.port));
 
+    let trusted_peers = parse_trusted_peers(
+        startup
+            .sieve_config
+            .p2p
+            .as_ref()
+            .map_or(&[][..], |p| &p.trusted_peers),
+    )?;
+
     // Compute effective start_block: CLI override or minimum across contracts, factories, and transfers
     let start_block = BlockNumber::new(cli.start_block.unwrap_or_else(|| {
         let contract_min = startup
@@ -426,6 +453,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         database_url,
         api_port,
         p2p_port,
+        trusted_peers,
         index_config: startup.resolved.index_config,
         resolved_events: startup.resolved.resolved_events,
         factories: startup.resolved.factories,
@@ -1007,7 +1035,7 @@ fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
 #[expect(clippy::print_stdout, reason = "CLI output for peers command")]
 async fn cmd_peers<C: chain::ChainTypes>() -> eyre::Result<()> {
     println!("Connecting to {} P2P network...", C::NAME);
-    let session = p2p::connect_peers::<C>(None).await?;
+    let session = p2p::connect_peers::<C>(None, &[]).await?;
     println!("Startup complete: {} peers connected", session.pool.len());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));

@@ -45,6 +45,11 @@ pub struct ApiConfig {
 pub struct P2pConfig {
     /// Port for the P2P listener (default: 30303).
     pub port: Option<u16>,
+    /// Trusted peers (enode:// URLs) that are always dialed and kept
+    /// connected regardless of reputation. Useful for pinning archive
+    /// nodes on chains with thin peer sets.
+    #[serde(default)]
+    pub trusted_peers: Vec<String>,
 }
 
 /// A contract definition from TOML.

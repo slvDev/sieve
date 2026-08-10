@@ -422,6 +422,33 @@ impl PeerWorkScheduler {
         }
     }
 
+    /// Lowest block number still awaiting assignment, across BOTH the
+    /// normal queue and the escalation queue.
+    ///
+    /// Used to decide whether a history-pruned peer can serve the front
+    /// of the work queue. Escalation must be included: assignment serves
+    /// escalation first, so an old failed block there would otherwise be
+    /// handed to a peer that pruned it.
+    pub async fn lowest_pending(&self) -> Option<u64> {
+        let normal = {
+            let pending = self.pending.lock().await;
+            pending.peek().map(|Reverse(block)| *block)
+        };
+        let escalated = {
+            let escalation = self.escalation.lock().await;
+            escalation
+                .shards
+                .values()
+                .flat_map(|blocks| blocks.iter().copied())
+                .min()
+        };
+        match (normal, escalated) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) => a,
+            (None, b) => b,
+        }
+    }
+
     /// Returns the next batch for a peer (escalation first, then normal).
     pub async fn next_batch_for_peer(&self, peer_id: PeerId, peer_head: u64) -> FetchBatch {
         if self.is_peer_cooling_down(peer_id).await {
@@ -737,6 +764,27 @@ mod tests {
             PeerHealthConfig::from_scheduler_config(&config),
         ));
         PeerWorkScheduler::new_with_health(config, blocks, peer_health)
+    }
+
+    #[tokio::test]
+    async fn lowest_pending_includes_escalation_queue() {
+        let config = SchedulerConfig {
+            blocks_per_assignment: 100,
+            ..Default::default()
+        };
+        let scheduler = scheduler_with_blocks(config, 10, 20);
+
+        assert_eq!(scheduler.lowest_pending().await, Some(10));
+
+        // Drain the normal queue, then escalate an old block: it must
+        // still be reported as the lowest outstanding work.
+        let peer_id = PeerId::random();
+        let batch = scheduler.next_batch_for_peer(peer_id, 20).await;
+        assert!(!batch.blocks.is_empty());
+        assert_eq!(scheduler.lowest_pending().await, None);
+
+        scheduler.requeue_escalation_block(10).await;
+        assert_eq!(scheduler.lowest_pending().await, Some(10));
     }
 
     #[tokio::test]
