@@ -17,6 +17,7 @@ reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = 
 reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-network-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["secp256k1"] }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 
 # Alloy (Ethereum types + ABI decoding)
 alloy-primitives = "1.5.2"

@@ -5372,7 +5372,9 @@ source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e6
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
+ "bytes",
  "reth-primitives-traits",
+ "serde",
 ]
 
 [[package]]
@@ -5813,7 +5815,9 @@ version = "1.10.0"
 source = "git+https://github.com/paradigmxyz/reth?rev=a74cb9cbc38a5590b2596c67e64a3c7642024aca#a74cb9cbc38a5590b2596c67e64a3c7642024aca"
 dependencies = [
  "alloy-primitives",
+ "bytes",
  "reth-trie-common",
+ "serde",
 ]
 
 [[package]]
@@ -5848,6 +5852,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie-common",
  "revm-database",
+ "serde_json",
 ]
 
 [[package]]
@@ -6880,6 +6885,7 @@ dependencies = [
  "reth-network",
  "reth-network-api",
  "reth-primitives-traits",
+ "reth-storage-api",
  "serde",
  "serde_json",
  "sqlx",
