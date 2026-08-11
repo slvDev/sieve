@@ -40,6 +40,15 @@ impl ChainKind {
         }
     }
 
+    /// Etherscan V2 chain id for the selected chain.
+    #[must_use]
+    pub const fn etherscan_chain_id(self) -> u64 {
+        match self {
+            Self::Mainnet => 1,
+            Self::Base => 8453,
+        }
+    }
+
     /// Genesis hash of the selected chain.
     #[must_use]
     pub fn genesis_hash(self) -> B256 {

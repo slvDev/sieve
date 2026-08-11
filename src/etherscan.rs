@@ -22,17 +22,23 @@ pub struct ContractInfo {
 ///
 /// Returns an error if the HTTP request fails, the contract is not verified,
 /// or the response cannot be parsed.
-pub async fn fetch_contract_info(address: &str, api_key: &str) -> eyre::Result<ContractInfo> {
+pub async fn fetch_contract_info(
+    chain_id: u64,
+    address: &str,
+    api_key: &str,
+) -> eyre::Result<ContractInfo> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_default();
 
-    let (name, abi_json, implementation) = fetch_source_code(&client, address, api_key).await?;
+    let (name, abi_json, implementation) =
+        fetch_source_code(&client, chain_id, address, api_key).await?;
 
     // If proxy, fetch implementation ABI and use implementation name
     if !implementation.is_empty() {
-        let (impl_name, impl_abi, _) = fetch_source_code(&client, &implementation, api_key).await?;
+        let (impl_name, impl_abi, _) =
+            fetch_source_code(&client, chain_id, &implementation, api_key).await?;
         return Ok(ContractInfo {
             name: impl_name,
             abi_json: impl_abi,
@@ -55,14 +61,18 @@ pub async fn fetch_contract_info(address: &str, api_key: &str) -> eyre::Result<C
 /// # Errors
 ///
 /// Returns an error if the HTTP request fails or the response cannot be parsed.
-pub async fn fetch_creation_block(address: &str, api_key: &str) -> eyre::Result<Option<u64>> {
+pub async fn fetch_creation_block(
+    chain_id: u64,
+    address: &str,
+    api_key: &str,
+) -> eyre::Result<Option<u64>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_default();
 
     let url = format!(
-        "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getcontractcreation&contractaddresses={address}&apikey={api_key}"
+        "https://api.etherscan.io/v2/api?chainid={chain_id}&module=contract&action=getcontractcreation&contractaddresses={address}&apikey={api_key}"
     );
 
     let resp: serde_json::Value = client
@@ -105,11 +115,12 @@ fn parse_creation_response(resp: &serde_json::Value) -> eyre::Result<Option<u64>
 /// Returns `(contract_name, abi_json, implementation_address)`.
 async fn fetch_source_code(
     client: &reqwest::Client,
+    chain_id: u64,
     address: &str,
     api_key: &str,
 ) -> eyre::Result<(String, String, String)> {
     let url = format!(
-        "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getsourcecode&address={address}&apikey={api_key}"
+        "https://api.etherscan.io/v2/api?chainid={chain_id}&module=contract&action=getsourcecode&address={address}&apikey={api_key}"
     );
 
     let resp: serde_json::Value = client

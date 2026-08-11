@@ -78,7 +78,7 @@ async fn main() -> eyre::Result<()> {
                 .await
             }
             cli::Command::Inspect => cmd_inspect(&cli),
-            cli::Command::Peers { chain } => match resolve_peers_chain(&cli, chain.as_deref())? {
+            cli::Command::Peers { chain } => match resolve_config_chain(&cli, chain.as_deref())? {
                 chain::ChainKind::Mainnet => cmd_peers::<chain::EthereumChain>().await,
                 chain::ChainKind::Base => cmd_peers::<chain::BaseChain>().await,
             },
@@ -185,11 +185,11 @@ fn parse_trusted_peers(raw: &[String]) -> eyre::Result<Vec<reth_network_peers::T
         .collect()
 }
 
-/// Resolve the chain for the `peers` subcommand.
+/// Resolve the configured chain from a flag or the config file.
 ///
-/// Precedence: `--chain` flag, then the config file's `chain` key (when the
+/// Precedence: explicit flag, then the config file's `chain` key (when the
 /// file exists — `peers` must keep working without one), then mainnet.
-fn resolve_peers_chain(cli: &cli::Cli, flag: Option<&str>) -> eyre::Result<chain::ChainKind> {
+fn resolve_config_chain(cli: &cli::Cli, flag: Option<&str>) -> eyre::Result<chain::ChainKind> {
     if let Some(name) = flag {
         return chain::ChainKind::parse(name);
     }
@@ -691,6 +691,31 @@ async fn cmd_reset(cli: &cli::Cli) -> eyre::Result<()> {
 ///
 /// Returns an error if the address is invalid, the API key is missing,
 /// the Etherscan request fails, or the config file cannot be written.
+/// Spawn the "Fetching ABI" spinner; send `true` on the returned channel
+/// to stop it.
+fn spawn_etherscan_spinner() -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+    use std::io::Write as _;
+
+    let (done_tx, mut done_rx) = watch::channel(false);
+    let spinner_task = tokio::spawn(async move {
+        let mut spinner = ui::Spinner::new();
+        loop {
+            let mut stderr = std::io::stderr();
+            let _ = write!(
+                stderr,
+                "\x1b[2K\r  {} Fetching ABI from Etherscan...",
+                spinner.frame()
+            );
+            stderr.flush().ok();
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(80)) => {}
+                _ = done_rx.changed() => break,
+            }
+        }
+    });
+    (done_tx, spinner_task)
+}
+
 #[expect(clippy::print_stdout, reason = "CLI output for add-contract command")]
 async fn cmd_add_contract(
     cli: &cli::Cli,
@@ -721,31 +746,18 @@ async fn cmd_add_contract(
         ));
     }
 
-    // Spinner while fetching from Etherscan
-    let (done_tx, mut done_rx) = watch::channel(false);
-    let spinner_task = tokio::spawn(async move {
-        let mut spinner = ui::Spinner::new();
-        loop {
-            let mut stderr = std::io::stderr();
-            let _ = write!(
-                stderr,
-                "\x1b[2K\r  {} Fetching ABI from Etherscan...",
-                spinner.frame()
-            );
-            stderr.flush().ok();
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_millis(80)) => {}
-                _ = done_rx.changed() => break,
-            }
-        }
-    });
+    // Query the block explorer for the configured chain, not mainnet.
+    let chain_id = resolve_config_chain(cli, None)?.etherscan_chain_id();
 
-    let info = etherscan::fetch_contract_info(&checksummed, api_key).await?;
+    // Spinner while fetching from Etherscan
+    let (done_tx, spinner_task) = spawn_etherscan_spinner();
+
+    let info = etherscan::fetch_contract_info(chain_id, &checksummed, api_key).await?;
 
     // Fetch creation block if not provided via --start-block
     let start_block = match start_block {
         Some(b) => Some(b),
-        None => etherscan::fetch_creation_block(&checksummed, api_key)
+        None => etherscan::fetch_creation_block(chain_id, &checksummed, api_key)
             .await
             .unwrap_or(None),
     };
