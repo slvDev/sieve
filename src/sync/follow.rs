@@ -171,6 +171,12 @@ async fn print_heartbeat<C: ChainTypes>(
     Ok(())
 }
 
+/// Maximum number of blocks a single follow epoch may sync.
+///
+/// Bounds the engine's per-epoch allocation against inflated peer-reported
+/// heads; larger gaps are covered by consecutive epochs.
+const MAX_EPOCH_BLOCKS: u64 = 50_000;
+
 /// Maximum consecutive failed sync epochs before the follow loop gives up.
 ///
 /// A single failure is retried (the failing block is usually re-fetched
@@ -293,6 +299,12 @@ async fn discover_gap<C: ChainTypes>(ctx: &FollowContext<C>) -> eyre::Result<Epo
     } else {
         observed_head
     };
+
+    // Clamp the per-epoch gap: peer heads are peer-influenced data, and the
+    // sync engine materializes the block range. A genuinely large gap is
+    // simply covered by successive epochs; a lying peer can waste at most
+    // one bounded epoch.
+    let effective_head = effective_head.min(baseline.saturating_add(MAX_EPOCH_BLOCKS));
 
     ctx.metrics.chain_head.set(effective_head as i64);
 

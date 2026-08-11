@@ -145,6 +145,10 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
 
     let db = Arc::new(setup_database(cli, &startup).await?);
 
+    // Prune orphaned rows beyond the checkpoint BEFORE the API can serve
+    // them (an interrupted pre-contiguity run may have left some behind).
+    prune_beyond_checkpoint(&db, &startup).await?;
+
     // Metrics
     let metrics = Arc::new(metrics::SieveMetrics::new());
 
@@ -667,7 +671,6 @@ fn cmd_schema(cli: &cli::Cli) -> eyre::Result<()> {
 async fn cmd_reset(cli: &cli::Cli) -> eyre::Result<()> {
     let startup = load_resolved_config(cli)?;
     let database_url = resolve_database_url(cli)?;
-
     let db = db::Database::connect(&database_url).await?;
     db::drop_all_tables(
         &db,
@@ -1094,7 +1097,7 @@ async fn run_indexer<C: chain::ChainTypes>(
         }
 
         let metrics = Arc::clone(&ctx.metrics);
-        let outcome = sync::run_sync(effective_start, end_block, ctx).await?;
+        let outcome = run_historical_windows(effective_start, end_block, ctx).await?;
 
         // Historical sync complete — mark as ready
         metrics
@@ -1121,6 +1124,79 @@ async fn run_indexer<C: chain::ChainTypes>(
     }
 
     Ok(())
+}
+
+/// Prune all indexed rows above the checkpoint (orphans from runs that
+/// predate strictly-contiguous commits, or from a torn shutdown).
+///
+/// Runs before the API is spawned so unverified rows are never served.
+/// A zero/absent checkpoint means nothing contiguous was ever committed,
+/// so any existing rows in the sync range are orphans by definition.
+async fn prune_beyond_checkpoint(db: &db::Database, startup: &StartupConfig) -> eyre::Result<()> {
+    let (handlers, transfer_handlers, call_handlers, _, _) = build_registries(startup);
+    let checkpoint = db.last_checkpoint().await?.map_or(0, BlockNumber::as_u64);
+    let target = BlockNumber::new(checkpoint);
+    let mut tx = db.begin().await?;
+    handlers.rollback_all(target, &mut tx).await?;
+    transfer_handlers.rollback_all(target, &mut tx).await?;
+    call_handlers.rollback_all(target, &mut tx).await?;
+    db::rollback_factory_children(&mut tx, target, &startup.index_config).await?;
+    db::rollback_to(&mut tx, target).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Maximum blocks handed to one `run_sync` invocation during historical
+/// backfill. Bounds the scheduler's materialized block range: a full Base
+/// backfill is ~50M blocks, which must not become one giant allocation.
+const HISTORICAL_WINDOW_BLOCKS: u64 = 250_000;
+
+/// Run a historical sync in bounded windows, accumulating the outcome.
+///
+/// # Errors
+///
+/// Returns an error if any window fails.
+async fn run_historical_windows<C: chain::ChainTypes>(
+    start: BlockNumber,
+    end: BlockNumber,
+    ctx: sync::SyncContext<C>,
+) -> eyre::Result<sync::engine::SyncOutcome> {
+    let mut total = sync::engine::SyncOutcome::default();
+    let mut window_start = start.as_u64();
+    let end = end.as_u64();
+
+    while window_start <= end {
+        if *ctx.stop_rx.borrow() {
+            break;
+        }
+        let window_end = end.min(window_start.saturating_add(HISTORICAL_WINDOW_BLOCKS - 1));
+        let outcome = sync::run_sync(
+            BlockNumber::new(window_start),
+            BlockNumber::new(window_end),
+            ctx.clone(),
+        )
+        .await?;
+        total.accumulate(&outcome);
+        if *ctx.stop_rx.borrow() {
+            break;
+        }
+        // Defense in depth: never advance to the next window unless this
+        // window's full range is committed behind the checkpoint.
+        let checkpoint = ctx
+            .db
+            .last_checkpoint()
+            .await?
+            .map_or(0, BlockNumber::as_u64);
+        if checkpoint < window_end {
+            return Err(eyre::eyre!(
+                "window {window_start}-{window_end} reported success but the checkpoint is at \
+                 {checkpoint}; refusing to advance"
+            ));
+        }
+        window_start = window_end.saturating_add(1);
+    }
+
+    Ok(total)
 }
 
 /// Connect to PostgreSQL, optionally drop tables, and create schema.

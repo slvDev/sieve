@@ -17,7 +17,7 @@ use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
 use crate::sync::scheduler::{
     PeerHealthConfig, PeerHealthTracker, PeerWorkScheduler, SchedulerConfig,
 };
-use crate::sync::{BlockPayload, SyncContext};
+use crate::sync::{BlockPayload, FetchItem, SkippedHeader, SyncContext};
 use crate::toml_config::ResolvedFactory;
 use crate::types::{BlockNumber, TxIndex};
 use crate::{decode, filter};
@@ -80,7 +80,7 @@ impl Drop for ActiveTaskGuard {
 }
 
 /// Outcome of a sync run.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SyncOutcome {
     pub blocks_fetched: u64,
     pub total_receipts: u64,
@@ -90,6 +90,20 @@ pub struct SyncOutcome {
     pub transfers_stored: u64,
     pub calls_stored: u64,
     pub elapsed: Duration,
+}
+
+impl SyncOutcome {
+    /// Fold another outcome into this one (used by windowed backfills).
+    pub const fn accumulate(&mut self, other: &Self) {
+        self.blocks_fetched = self.blocks_fetched.saturating_add(other.blocks_fetched);
+        self.total_receipts = self.total_receipts.saturating_add(other.total_receipts);
+        self.events_matched = self.events_matched.saturating_add(other.events_matched);
+        self.events_decoded = self.events_decoded.saturating_add(other.events_decoded);
+        self.events_stored = self.events_stored.saturating_add(other.events_stored);
+        self.transfers_stored = self.transfers_stored.saturating_add(other.transfers_stored);
+        self.calls_stored = self.calls_stored.saturating_add(other.calls_stored);
+        self.elapsed = self.elapsed.saturating_add(other.elapsed);
+    }
 }
 
 /// Accumulated stats from the payload consumer.
@@ -134,6 +148,90 @@ struct ProcessedBlock<C: ChainTypes> {
     payload: BlockPayload<C>,
 }
 
+/// Item flowing from the processing workers to the DB writer.
+enum ProcessedItem<C: ChainTypes> {
+    /// Fully processed block ready for storage.
+    Block(Box<ProcessedBlock<C>>),
+    /// Bloom-skipped block: hash record only.
+    Skipped(SkippedHeader),
+}
+
+impl<C: ChainTypes> ProcessedItem<C> {
+    const fn number(&self) -> u64 {
+        match self {
+            Self::Block(block) => block.block_number.as_u64(),
+            Self::Skipped(skipped) => skipped.number,
+        }
+    }
+
+    const fn hash(&self) -> B256 {
+        match self {
+            Self::Block(block) => block.block_hash,
+            Self::Skipped(skipped) => skipped.hash,
+        }
+    }
+
+    const fn parent_hash(&self) -> B256 {
+        match self {
+            Self::Block(block) => block.payload.header().parent_hash,
+            Self::Skipped(skipped) => skipped.parent_hash,
+        }
+    }
+}
+
+/// Reorders out-of-order processed items so the DB writer only ever
+/// commits (and notifies) a contiguous, anchored prefix. Nothing above the
+/// contiguous frontier is inserted, so no unverified row is observable via
+/// the API or dispatched to webhooks/queues.
+struct ReorderBuffer<C: ChainTypes> {
+    /// Next block number expected by the contiguous prefix.
+    next: u64,
+    /// Blocks received ahead of the contiguous frontier.
+    pending: std::collections::BTreeMap<u64, ProcessedItem<C>>,
+}
+
+/// Hard cap on buffered out-of-order items before the run is aborted.
+///
+/// The scheduler's look-ahead is normally far smaller; hitting this means
+/// one block is persistently unfetchable while later blocks stream in, and
+/// aborting (checkpoint intact) is safer than growing without bound.
+const MAX_REORDER_PENDING: usize = 16_384;
+
+impl<C: ChainTypes> ReorderBuffer<C> {
+    const fn new(start: u64) -> Self {
+        Self {
+            next: start,
+            pending: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Buffer an item; ignores duplicates below the contiguous frontier.
+    fn push(&mut self, item: ProcessedItem<C>) {
+        if item.number() >= self.next {
+            self.pending.insert(item.number(), item);
+        } else {
+            debug!(
+                block = item.number(),
+                next = self.next,
+                "dropping duplicate item below contiguous frontier"
+            );
+        }
+    }
+
+    /// Drain the contiguous run starting at `next` into `batch`.
+    fn drain_contiguous(&mut self, batch: &mut Vec<ProcessedItem<C>>) {
+        while let Some(item) = self.pending.remove(&self.next) {
+            self.next = self.next.saturating_add(1);
+            batch.push(item);
+        }
+    }
+
+    /// Number of buffered out-of-order items.
+    fn buffered(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 // Compile-time size assertions for hot types (reth pattern).
 #[cfg(target_pointer_width = "64")]
 const _: [(); 72] = [(); core::mem::size_of::<SyncOutcome>()];
@@ -175,8 +273,8 @@ pub async fn run_sync<C: ChainTypes>(
     ));
 
     // Channels
-    let (payload_tx, payload_rx) = mpsc::channel::<BlockPayload<C>>(PAYLOAD_CHANNEL_SIZE);
-    let (processed_tx, processed_rx) = mpsc::channel::<ProcessedBlock<C>>(PROCESSED_CHANNEL_SIZE);
+    let (payload_tx, payload_rx) = mpsc::channel::<FetchItem<C>>(PAYLOAD_CHANNEL_SIZE);
+    let (processed_tx, processed_rx) = mpsc::channel::<ProcessedItem<C>>(PROCESSED_CHANNEL_SIZE);
     let (ready_tx, ready_rx) = mpsc::unbounded_channel::<NetworkPeer<C>>();
 
     // Local shutdown signal for the peer feeder (triggered when fetch loop exits)
@@ -217,6 +315,8 @@ pub async fn run_sync<C: ChainTypes>(
         ctx.verbose,
         ctx.stop_rx.clone(),
         abort_tx,
+        start_block.as_u64(),
+        end_block.as_u64(),
     ));
 
     // Main fetch loop
@@ -240,8 +340,15 @@ pub async fn run_sync<C: ChainTypes>(
     let _ = feeder_shutdown_tx.send(true);
     let _ = feeder_handle.await;
     drop(payload_tx); // signals workers (payload_rx returns None)
-    while worker_set.join_next().await.is_some() {} // wait for workers to drain
-                                                    // All worker processed_tx clones dropped → DB writer sees channel close
+                      // Wait for workers to drain. A panicked worker may have lost blocks —
+                      // that must fail the run, never be silently ignored. (All worker
+                      // processed_tx clones dropping lets the DB writer see channel close.)
+    let mut worker_failure: Option<eyre::Report> = None;
+    while let Some(joined) = worker_set.join_next().await {
+        if let Err(join_err) = joined {
+            worker_failure = Some(eyre::eyre!("processing worker failed: {join_err}"));
+        }
+    }
 
     let stats = match consumer_handle.await {
         Ok(Ok(stats)) => stats,
@@ -251,6 +358,10 @@ pub async fn run_sync<C: ChainTypes>(
             return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await);
         }
     };
+
+    if let Some(err) = worker_failure {
+        return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await);
+    }
 
     let elapsed = started.elapsed();
     Ok(SyncOutcome {
@@ -313,7 +424,7 @@ struct FetchLoopContext<'a, C: ChainTypes> {
     metrics: &'a Arc<SieveMetrics>,
     start_block: BlockNumber,
     end_block: BlockNumber,
-    payload_tx: &'a mpsc::Sender<BlockPayload<C>>,
+    payload_tx: &'a mpsc::Sender<FetchItem<C>>,
     ready_tx: &'a mpsc::UnboundedSender<NetworkPeer<C>>,
     bloom_filter: &'a Option<Arc<crate::filter::BloomFilter>>,
     head_seen_rx: &'a Option<watch::Receiver<u64>>,
@@ -744,8 +855,8 @@ async fn check_progress<C: ChainTypes>(
     reason = "Arc/Sender are cloned into spawned tasks"
 )]
 fn spawn_processing_workers<C: ChainTypes>(
-    payload_rx: mpsc::Receiver<BlockPayload<C>>,
-    processed_tx: mpsc::Sender<ProcessedBlock<C>>,
+    payload_rx: mpsc::Receiver<FetchItem<C>>,
+    processed_tx: mpsc::Sender<ProcessedItem<C>>,
     config: Arc<IndexConfig>,
     factories: Arc<Vec<ResolvedFactory>>,
 ) -> JoinSet<()> {
@@ -764,12 +875,17 @@ fn spawn_processing_workers<C: ChainTypes>(
 
         workers.spawn(async move {
             loop {
-                let payload = {
+                let item = {
                     let mut guard = rx.lock().await;
                     guard.recv().await
                 };
-                let Some(payload) = payload else { break };
-                let processed = prepare_block(payload, &cfg, &facts);
+                let Some(item) = item else { break };
+                let processed = match item {
+                    FetchItem::Payload(payload) => {
+                        ProcessedItem::Block(Box::new(prepare_block(*payload, &cfg, &facts)))
+                    }
+                    FetchItem::Skipped(skipped) => ProcessedItem::Skipped(skipped),
+                };
                 if tx.send(processed).await.is_err() {
                     break;
                 }
@@ -788,7 +904,7 @@ fn spawn_processing_workers<C: ChainTypes>(
 )]
 #[instrument(skip_all)]
 async fn consume_payloads<C: ChainTypes>(
-    mut processed_rx: mpsc::Receiver<ProcessedBlock<C>>,
+    mut processed_rx: mpsc::Receiver<ProcessedItem<C>>,
     config: Arc<IndexConfig>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
@@ -805,11 +921,14 @@ async fn consume_payloads<C: ChainTypes>(
     verbose: bool,
     stop_rx: watch::Receiver<bool>,
     abort_tx: watch::Sender<bool>,
+    start_block: u64,
+    end_block: u64,
 ) -> eyre::Result<ConsumerStats> {
     let mut stats = ConsumerStats::default();
     let mut last_log = Instant::now();
     let mut max_indexed_block: u64 = 0;
-    let mut batch: Vec<ProcessedBlock<C>> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<ProcessedItem<C>> = Vec::with_capacity(BATCH_SIZE);
+    let mut reorder = ReorderBuffer::new(start_block);
 
     let ctx = ProcessContext {
         config: &config,
@@ -861,13 +980,28 @@ async fn consume_payloads<C: ChainTypes>(
                 )
                 .await?;
             }
+            // The channel closed. Unless an external stop cut the run
+            // short, the contiguous frontier must have reached the end of
+            // the range — anything else means blocks were lost in flight
+            // (e.g. a panicked worker) and success must not be reported.
+            if !*stop_rx.borrow() && reorder.next != end_block.saturating_add(1) {
+                let _ = abort_tx.send(true);
+                return Err(eyre::eyre!(
+                    "sync range incomplete: contiguous frontier stopped at {} but the range \
+                     ends at {end_block} ({} items still buffered out of order)",
+                    reorder.next,
+                    reorder.buffered()
+                ));
+            }
             break;
         };
 
-        stats.blocks_fetched = stats.blocks_fetched.saturating_add(1);
-        stats.total_receipts = stats.total_receipts.saturating_add(processed.receipt_count);
+        if let ProcessedItem::Block(block) = &processed {
+            stats.blocks_fetched = stats.blocks_fetched.saturating_add(1);
+            stats.total_receipts = stats.total_receipts.saturating_add(block.receipt_count);
+        }
 
-        batch.push(processed);
+        buffer_item(&mut reorder, &mut batch, processed, &abort_tx)?;
 
         if batch.len() >= BATCH_SIZE {
             flush_batch(
@@ -1023,7 +1157,7 @@ fn register_factory_child_in_memory(config: &IndexConfig, discovery: &filter::Fa
     reason = "grouping these into a struct would add complexity without benefit"
 )]
 async fn flush_batch<C: ChainTypes>(
-    batch: &mut Vec<ProcessedBlock<C>>,
+    batch: &mut Vec<ProcessedItem<C>>,
     ctx: &ProcessContext<'_>,
     stats: &mut ConsumerStats,
     metrics: &SieveMetrics,
@@ -1037,17 +1171,55 @@ async fn flush_batch<C: ChainTypes>(
     }
     let batch_len = batch.len() as u64;
 
-    // Integrity gate: every block whose parent hash is known (same batch or
-    // already stored) must link to it. A violation means a peer served fork
+    // Integrity gate: every adjacency whose other side is known (same batch
+    // or already stored) must link. A violation means a peer served fork
     // data (or a reorg raced the fetch) — abort the run instead of storing.
     // Speculative in-memory state (factory children) is discarded by
     // `run_sync` once the workers have stopped.
-    if let Err(err) = verify_batch_anchors(batch, ctx.db).await {
-        let _ = abort_tx.send(true);
-        return Err(err);
+    match verify_batch_anchors(batch, ctx.db).await? {
+        AnchorCheck::Ok => {}
+        AnchorCheck::ParentMismatch {
+            block,
+            actual,
+            expected,
+        } => {
+            let _ = abort_tx.send(true);
+            return Err(eyre::eyre!(
+                "block {block} parent-hash mismatch: header claims parent {actual} but chain has \
+                 {expected} — refusing to store batch (fork data from peer or concurrent reorg)"
+            ));
+        }
+        AnchorCheck::ChildMismatch {
+            parent_block,
+            child_block,
+        } => {
+            // A previously committed descendant does not link to the newly
+            // verified parent. Roll stored state back to the last committed
+            // contiguous checkpoint (the batch itself is uncommitted, so
+            // the target must not include any of its blocks), then abort so
+            // the retry refetches everything above it.
+            let _ = abort_tx.send(true);
+            let committed = batch
+                .iter()
+                .map(ProcessedItem::number)
+                .min()
+                .unwrap_or(child_block)
+                .saturating_sub(1);
+            rollback_committed_to(ctx, committed).await?;
+            return Err(eyre::eyre!(
+                "stored block {child_block} does not link to verified parent {parent_block}; \
+                 rolled back to committed checkpoint {committed} (fork data from peer or \
+                 concurrent reorg)"
+            ));
+        }
     }
 
-    match flush_batch_inner(batch, ctx).await {
+    // The batch is a contiguous run by construction (reorder buffer), so
+    // committing it moves the checkpoint to its last block. Nothing beyond
+    // the contiguous prefix is ever committed or notified.
+    let checkpoint_to = batch.iter().map(ProcessedItem::number).max();
+
+    match flush_batch_inner(batch, ctx, checkpoint_to).await {
         Ok(outcomes) => {
             update_batch_stats(stats, metrics, max_indexed_block, &outcomes, batch_len);
             dispatch_batch_notifications(stream_dispatcher, outcomes, is_backfill);
@@ -1058,6 +1230,52 @@ async fn flush_batch<C: ChainTypes>(
         }
     }
     batch.clear();
+    Ok(())
+}
+
+/// Buffer an item and drain the contiguous prefix into the flush batch.
+///
+/// Only the contiguous prefix ever reaches the flush batch: rows and
+/// notifications for out-of-order blocks must not be published until every
+/// predecessor is committed and anchored.
+///
+/// # Errors
+///
+/// Returns an error (and fires the abort signal) if the out-of-order
+/// buffer exceeds [`MAX_REORDER_PENDING`].
+fn buffer_item<C: ChainTypes>(
+    reorder: &mut ReorderBuffer<C>,
+    batch: &mut Vec<ProcessedItem<C>>,
+    processed: ProcessedItem<C>,
+    abort_tx: &watch::Sender<bool>,
+) -> eyre::Result<()> {
+    reorder.push(processed);
+    reorder.drain_contiguous(batch);
+    if reorder.buffered() > MAX_REORDER_PENDING {
+        let _ = abort_tx.send(true);
+        return Err(eyre::eyre!(
+            "reorder buffer exceeded {MAX_REORDER_PENDING} items waiting for block {}; \
+             aborting run (a block appears unfetchable)",
+            reorder.next
+        ));
+    }
+    Ok(())
+}
+
+/// Roll back all indexed state above `block` in one transaction (used when
+/// a committed descendant fails adjacency verification).
+async fn rollback_committed_to(ctx: &ProcessContext<'_>, block: u64) -> eyre::Result<()> {
+    let target = BlockNumber::new(block);
+    let mut tx = ctx.db.begin().await?;
+    ctx.handlers.rollback_all(target, &mut tx).await?;
+    ctx.transfer_handlers.rollback_all(target, &mut tx).await?;
+    ctx.call_handlers.rollback_all(target, &mut tx).await?;
+    db::rollback_factory_children(&mut tx, target, ctx.config).await?;
+    db::rollback_to(&mut tx, target).await?;
+    tx.commit()
+        .await
+        .wrap_err("failed to commit adjacency rollback")?;
+    warn!(block, "rolled back stored state above verified parent");
     Ok(())
 }
 
@@ -1099,59 +1317,100 @@ async fn finish_rejected_run(
 /// Returns an error on the first linkage violation, or if the stored-hash
 /// lookup fails.
 async fn verify_batch_anchors<C: ChainTypes>(
-    batch: &[ProcessedBlock<C>],
+    batch: &[ProcessedItem<C>],
     db: &Database,
-) -> eyre::Result<()> {
-    let mut known_hashes: HashMap<u64, B256> = batch
+) -> eyre::Result<AnchorCheck> {
+    let mut known_hashes: HashMap<u64, B256> =
+        batch.iter().map(|b| (b.number(), b.hash())).collect();
+    let mut known_parents: HashMap<u64, B256> = batch
         .iter()
-        .map(|b| (b.block_number.as_u64(), b.block_hash))
+        .map(|b| (b.number(), b.parent_hash()))
         .collect();
 
-    let blocks: Vec<(u64, B256)> = batch
+    let triples: Vec<(u64, B256, B256)> = batch
         .iter()
-        .map(|b| (b.block_number.as_u64(), b.payload.header().parent_hash))
+        .map(|b| (b.number(), b.hash(), b.parent_hash()))
         .collect();
 
-    // Resolve parents outside the batch from previously stored hashes.
-    for &(number, _) in &blocks {
-        let Some(parent) = number.checked_sub(1) else {
-            continue;
-        };
-        if let std::collections::hash_map::Entry::Vacant(entry) = known_hashes.entry(parent) {
-            if let Some(hash) = db.get_block_hash(BlockNumber::new(parent)).await? {
-                entry.insert(hash);
+    // Resolve neighbors outside the batch from previously stored rows:
+    // the parent's hash (for the parent-direction check) and the child's
+    // parent hash (for the child-direction check).
+    for &(number, _, _) in &triples {
+        if let Some(parent) = number.checked_sub(1) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = known_hashes.entry(parent) {
+                if let Some(hash) = db.get_block_hash(BlockNumber::new(parent)).await? {
+                    entry.insert(hash);
+                }
+            }
+        }
+        if let Some(child) = number.checked_add(1) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = known_parents.entry(child) {
+                if let Some(parent_hash) =
+                    db::get_block_parent_hash(db, BlockNumber::new(child)).await?
+                {
+                    entry.insert(parent_hash);
+                }
             }
         }
     }
 
-    if let Some((number, actual, expected)) = find_anchor_violation(&blocks, &known_hashes) {
-        return Err(eyre::eyre!(
-            "block {number} parent-hash mismatch: header claims parent {actual} but chain has {expected} — refusing to store batch (fork data from peer or concurrent reorg)"
-        ));
-    }
-    Ok(())
+    Ok(find_anchor_violation(
+        &triples,
+        &known_hashes,
+        &known_parents,
+    ))
 }
 
-/// Find the first parent-hash linkage violation.
+/// Outcome of batch adjacency verification.
+#[derive(Debug, PartialEq, Eq)]
+enum AnchorCheck {
+    /// All known adjacencies link.
+    Ok,
+    /// A batch block's parent hash contradicts the known parent hash.
+    ParentMismatch {
+        block: u64,
+        actual: B256,
+        expected: B256,
+    },
+    /// A known child's parent hash contradicts a batch block's hash.
+    ChildMismatch { parent_block: u64, child_block: u64 },
+}
+
+/// Check every adjacency of the batch in both directions.
 ///
-/// `blocks` holds `(block_number, header_parent_hash)` pairs in any order;
-/// `known_hashes` maps block number → canonical hash for every block whose
-/// hash is known. Returns `(block_number, actual_parent, expected_parent)`.
+/// `triples` holds `(number, hash, parent_hash)` for each batch item in any
+/// order; `known_hashes`/`known_parents` map block number → hash / parent
+/// hash for every block whose value is known (batch plus stored neighbors).
+/// Unknown neighbors are skipped — they are checked when their side flushes.
 fn find_anchor_violation(
-    blocks: &[(u64, B256)],
+    triples: &[(u64, B256, B256)],
     known_hashes: &HashMap<u64, B256>,
-) -> Option<(u64, B256, B256)> {
-    for &(number, parent_hash) in blocks {
-        let Some(parent_number) = number.checked_sub(1) else {
-            continue;
-        };
-        if let Some(&expected) = known_hashes.get(&parent_number) {
-            if parent_hash != expected {
-                return Some((number, parent_hash, expected));
+    known_parents: &HashMap<u64, B256>,
+) -> AnchorCheck {
+    for &(number, hash, parent_hash) in triples {
+        if let Some(parent_number) = number.checked_sub(1) {
+            if let Some(&expected) = known_hashes.get(&parent_number) {
+                if parent_hash != expected {
+                    return AnchorCheck::ParentMismatch {
+                        block: number,
+                        actual: parent_hash,
+                        expected,
+                    };
+                }
+            }
+        }
+        if let Some(child_number) = number.checked_add(1) {
+            if let Some(&child_parent) = known_parents.get(&child_number) {
+                if child_parent != hash {
+                    return AnchorCheck::ChildMismatch {
+                        parent_block: number,
+                        child_block: child_number,
+                    };
+                }
             }
         }
     }
-    None
+    AnchorCheck::Ok
 }
 
 /// Inner flush: open one transaction, store all blocks, commit.
@@ -1162,8 +1421,9 @@ fn find_anchor_violation(
 /// Phase 2: batch insert — multi-row INSERT all events/transfers/calls.
 /// Phase 3: checkpoint + commit.
 async fn flush_batch_inner<C: ChainTypes>(
-    batch: &[ProcessedBlock<C>],
+    batch: &[ProcessedItem<C>],
     ctx: &ProcessContext<'_>,
+    checkpoint_to: Option<u64>,
 ) -> eyre::Result<Vec<ProcessOutcome>> {
     let mut tx = ctx.db.begin().await?;
     let mut outcomes = Vec::with_capacity(batch.len());
@@ -1171,19 +1431,21 @@ async fn flush_batch_inner<C: ChainTypes>(
     let mut all_transfers: Vec<(NativeTransfer, EventContext)> = Vec::new();
     let mut all_calls: Vec<(DecodedCall, EventContext)> = Vec::new();
 
-    // Batch store all block hashes in one UNNEST query
-    let block_numbers: Vec<i64> = batch
+    // Batch store all block hashes (payload AND bloom-skipped) in one
+    // UNNEST query, including parent hashes for adjacency verification.
+    let block_numbers: Vec<i64> = batch.iter().map(|b| b.number() as i64).collect();
+    let block_hashes: Vec<Vec<u8>> = batch.iter().map(|b| b.hash().as_slice().to_vec()).collect();
+    let parent_hashes: Vec<Vec<u8>> = batch
         .iter()
-        .map(|b| b.block_number.as_u64() as i64)
+        .map(|b| b.parent_hash().as_slice().to_vec())
         .collect();
-    let block_hashes: Vec<Vec<u8>> = batch
-        .iter()
-        .map(|b| b.block_hash.as_slice().to_vec())
-        .collect();
-    db::store_block_hashes_batch(&mut tx, &block_numbers, &block_hashes).await?;
+    db::store_block_hashes_batch(&mut tx, &block_numbers, &block_hashes, &parent_hashes).await?;
 
-    // Phase 1: per-block preparation
-    for block in batch {
+    // Phase 1: per-block preparation (payload blocks only)
+    for item in batch {
+        let ProcessedItem::Block(block) = item else {
+            continue;
+        };
         let outcome = prepare_block_outcome(
             block,
             ctx,
@@ -1215,9 +1477,9 @@ async fn flush_batch_inner<C: ChainTypes>(
             .await?;
     }
 
-    // Phase 3: checkpoint + commit
-    if let Some(max_block) = batch.iter().map(|b| b.block_number).max() {
-        db::update_checkpoint(&mut tx, max_block).await?;
+    // Phase 3: checkpoint (contiguous prefix only) + commit
+    if let Some(checkpoint) = checkpoint_to {
+        db::update_checkpoint(&mut tx, BlockNumber::new(checkpoint)).await?;
     }
 
     tx.commit()
@@ -1958,37 +2220,111 @@ mod tests {
     fn anchor_violation_none_for_linked_blocks() {
         let h1 = B256::repeat_byte(0x01);
         let h2 = B256::repeat_byte(0x02);
-        let known: HashMap<u64, B256> = [(10, h1), (11, h2)].into_iter().collect();
-        // Block 11's header claims parent h1 (hash of block 10) — linked.
-        let blocks = vec![(11u64, h1)];
-        assert_eq!(find_anchor_violation(&blocks, &known), None);
+        let known_hashes: HashMap<u64, B256> = [(10, h1), (11, h2)].into_iter().collect();
+        let known_parents: HashMap<u64, B256> = std::iter::once((11, h1)).collect();
+        // Block 11 claims parent h1 (hash of block 10) — linked.
+        let triples = vec![(11u64, h2, h1)];
+        assert_eq!(
+            find_anchor_violation(&triples, &known_hashes, &known_parents),
+            AnchorCheck::Ok
+        );
     }
 
     #[test]
     fn anchor_violation_detected_against_stored_parent() {
         let stored_parent = B256::repeat_byte(0x01);
         let forged_parent = B256::repeat_byte(0xEE);
-        let known: HashMap<u64, B256> = std::iter::once((10, stored_parent)).collect();
-        let blocks = vec![(11u64, forged_parent)];
+        let known_hashes: HashMap<u64, B256> = std::iter::once((10, stored_parent)).collect();
+        let known_parents: HashMap<u64, B256> = HashMap::new();
+        let triples = vec![(11u64, B256::repeat_byte(0x02), forged_parent)];
         assert_eq!(
-            find_anchor_violation(&blocks, &known),
-            Some((11, forged_parent, stored_parent))
+            find_anchor_violation(&triples, &known_hashes, &known_parents),
+            AnchorCheck::ParentMismatch {
+                block: 11,
+                actual: forged_parent,
+                expected: stored_parent,
+            }
         );
     }
 
     #[test]
-    fn anchor_violation_skips_unknown_parents() {
-        let known: HashMap<u64, B256> = HashMap::new();
-        // Parent hash of block 11 is unknown (e.g. bloom-skipped) — no check.
-        let blocks = vec![(11u64, B256::repeat_byte(0xEE))];
-        assert_eq!(find_anchor_violation(&blocks, &known), None);
+    fn anchor_violation_detected_against_stored_child() {
+        // A stored child (block 12) claims a parent hash that does not
+        // match the newly verified block 11 — the stored segment is bad.
+        let my_hash = B256::repeat_byte(0x02);
+        let child_parent = B256::repeat_byte(0xEE);
+        let known_hashes: HashMap<u64, B256> = std::iter::once((11, my_hash)).collect();
+        let known_parents: HashMap<u64, B256> = std::iter::once((12, child_parent)).collect();
+        let triples = vec![(11u64, my_hash, B256::repeat_byte(0x01))];
+        assert_eq!(
+            find_anchor_violation(&triples, &known_hashes, &known_parents),
+            AnchorCheck::ChildMismatch {
+                parent_block: 11,
+                child_block: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn anchor_violation_skips_unknown_neighbors() {
+        let known_hashes: HashMap<u64, B256> = HashMap::new();
+        let known_parents: HashMap<u64, B256> = HashMap::new();
+        // Neither neighbor of block 11 is known — no check possible.
+        let triples = vec![(11u64, B256::repeat_byte(0x02), B256::repeat_byte(0xEE))];
+        assert_eq!(
+            find_anchor_violation(&triples, &known_hashes, &known_parents),
+            AnchorCheck::Ok
+        );
     }
 
     #[test]
     fn anchor_violation_skips_genesis() {
-        let known: HashMap<u64, B256> = HashMap::new();
-        let blocks = vec![(0u64, B256::ZERO)];
-        assert_eq!(find_anchor_violation(&blocks, &known), None);
+        let known_hashes: HashMap<u64, B256> = HashMap::new();
+        let known_parents: HashMap<u64, B256> = HashMap::new();
+        let triples = vec![(0u64, B256::repeat_byte(0x01), B256::ZERO)];
+        assert_eq!(
+            find_anchor_violation(&triples, &known_hashes, &known_parents),
+            AnchorCheck::Ok
+        );
+    }
+
+    fn skipped(number: u64) -> ProcessedItem<crate::chain::EthereumChain> {
+        ProcessedItem::Skipped(crate::sync::SkippedHeader {
+            number,
+            hash: B256::repeat_byte(0x01),
+            parent_hash: B256::repeat_byte(0x02),
+        })
+    }
+
+    #[test]
+    fn reorder_buffer_releases_contiguous_prefix_only() {
+        let mut buffer = ReorderBuffer::new(10);
+        let mut batch = Vec::new();
+
+        // Out-of-order blocks beyond a hole stay buffered.
+        buffer.push(skipped(12));
+        buffer.push(skipped(13));
+        buffer.drain_contiguous(&mut batch);
+        assert!(batch.is_empty());
+        assert_eq!(buffer.buffered(), 2);
+
+        // Hole filled: the whole run drains in order.
+        buffer.push(skipped(10));
+        buffer.push(skipped(11));
+        buffer.drain_contiguous(&mut batch);
+        let numbers: Vec<u64> = batch.iter().map(ProcessedItem::number).collect();
+        assert_eq!(numbers, vec![10, 11, 12, 13]);
+        assert_eq!(buffer.buffered(), 0);
+
+        // Duplicates below the frontier are dropped.
+        buffer.push(skipped(9));
+        assert_eq!(buffer.buffered(), 0);
+
+        // Next contiguous block flows straight through.
+        batch.clear();
+        buffer.push(skipped(14));
+        buffer.drain_contiguous(&mut batch);
+        assert_eq!(batch.len(), 1);
     }
 
     #[test]

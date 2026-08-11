@@ -100,6 +100,30 @@ pub struct SyncContext<C: ChainTypes> {
     pub verbose: bool,
 }
 
+// Manual Clone: every field is a cheap handle; `C` itself need not be Clone.
+impl<C: ChainTypes> Clone for SyncContext<C> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: Arc::clone(&self.pool),
+            config: Arc::clone(&self.config),
+            db: Arc::clone(&self.db),
+            handlers: Arc::clone(&self.handlers),
+            metrics: Arc::clone(&self.metrics),
+            stop_rx: self.stop_rx.clone(),
+            factories: Arc::clone(&self.factories),
+            transfer_handlers: Arc::clone(&self.transfer_handlers),
+            call_handlers: Arc::clone(&self.call_handlers),
+            stream_dispatcher: self.stream_dispatcher.clone(),
+            event_table_map: Arc::clone(&self.event_table_map),
+            is_backfill: self.is_backfill,
+            receipt_tables: Arc::clone(&self.receipt_tables),
+            bloom_filter: self.bloom_filter.clone(),
+            head_seen_rx: self.head_seen_rx.clone(),
+            verbose: self.verbose,
+        }
+    }
+}
+
 /// Full payload for a block: header, body, receipts.
 #[derive(Debug, Clone)]
 pub struct BlockPayload<C: ChainTypes> {
@@ -140,6 +164,28 @@ impl<C: ChainTypes> BlockPayload<C> {
     pub fn receipts(&self) -> &[C::Receipt] {
         &self.receipts
     }
+}
+
+/// Canonical-hash record for a block whose payload was skipped by the
+/// bloom pre-screen. Carried through the pipeline so every block's hash
+/// and parent link are stored and anchored, leaving no unverifiable gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkippedHeader {
+    pub number: u64,
+    pub hash: alloy_primitives::B256,
+    pub parent_hash: alloy_primitives::B256,
+}
+
+/// Item flowing from fetch tasks to the processing workers.
+///
+/// Payloads are boxed: the enum would otherwise be as large as its
+/// biggest variant for every skipped-header record.
+#[derive(Debug)]
+pub enum FetchItem<C: ChainTypes> {
+    /// Full payload for filtering/decoding.
+    Payload(Box<BlockPayload<C>>),
+    /// Bloom-skipped block: hash record only.
+    Skipped(SkippedHeader),
 }
 
 /// Fetch scheduling mode for a batch.

@@ -163,6 +163,31 @@ pub async fn store_block_hash(
     Ok(())
 }
 
+/// Read the stored parent hash for a block, if known.
+///
+/// Returns `None` when the row is absent or was written by a version that
+/// predates parent tracking.
+pub async fn get_block_parent_hash(
+    db: &Database,
+    block_number: BlockNumber,
+) -> eyre::Result<Option<B256>> {
+    let row: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT parent_hash FROM _sieve_block_hashes WHERE block_number = $1")
+            .bind(block_number.as_u64() as i64)
+            .fetch_optional(db.pool())
+            .await
+            .wrap_err("failed to read block parent hash")?;
+
+    match row {
+        Some((Some(bytes),)) => {
+            let hash = B256::try_from(bytes.as_slice())
+                .map_err(|_| eyre::eyre!("invalid parent hash length in DB"))?;
+            Ok(Some(hash))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Store multiple block hashes in a single UNNEST query.
 ///
 /// # Errors
@@ -172,17 +197,20 @@ pub async fn store_block_hashes_batch(
     tx: &mut Transaction<'_, Postgres>,
     block_numbers: &[i64],
     block_hashes: &[Vec<u8>],
+    parent_hashes: &[Vec<u8>],
 ) -> eyre::Result<()> {
     if block_numbers.is_empty() {
         return Ok(());
     }
     sqlx::query(
-        "INSERT INTO _sieve_block_hashes (block_number, block_hash) \
-         SELECT * FROM UNNEST($1::BIGINT[], $2::BYTEA[]) \
-         ON CONFLICT (block_number) DO UPDATE SET block_hash = EXCLUDED.block_hash",
+        "INSERT INTO _sieve_block_hashes (block_number, block_hash, parent_hash) \
+         SELECT * FROM UNNEST($1::BIGINT[], $2::BYTEA[], $3::BYTEA[]) \
+         ON CONFLICT (block_number) DO UPDATE \
+         SET block_hash = EXCLUDED.block_hash, parent_hash = EXCLUDED.parent_hash",
     )
     .bind(block_numbers)
     .bind(block_hashes)
+    .bind(parent_hashes)
     .execute(&mut **tx)
     .await
     .wrap_err("failed to store block hashes")?;
@@ -453,10 +481,14 @@ CREATE TABLE IF NOT EXISTS _sieve_checkpoints (
 )";
 
 /// DDL for the `_sieve_block_hashes` table.
+///
+/// `parent_hash` enables cross-batch adjacency verification; it is
+/// nullable only for rows written by versions that predate the column.
 pub const BLOCK_HASHES_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _sieve_block_hashes (
     block_number BIGINT PRIMARY KEY,
-    block_hash BYTEA NOT NULL
+    block_hash BYTEA NOT NULL,
+    parent_hash BYTEA
 )";
 
 /// DDL for the `_sieve_factory_children` table.
@@ -499,6 +531,12 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
         .execute(db.pool())
         .await
         .wrap_err("failed to create _sieve_block_hashes")?;
+
+    // Older databases predate the parent_hash column — add it in place.
+    sqlx::raw_sql("ALTER TABLE _sieve_block_hashes ADD COLUMN IF NOT EXISTS parent_hash BYTEA")
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to add parent_hash column")?;
 
     sqlx::raw_sql(&format!("{FACTORY_CHILDREN_DDL};"))
         .execute(db.pool())

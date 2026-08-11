@@ -241,7 +241,6 @@ pub struct HeaderFetchOutcome {
 pub struct PayloadFetchOutcome<C: ChainTypes> {
     pub payloads: Vec<BlockPayload<C>>,
     pub missing_blocks: Vec<u64>,
-    pub bloom_skipped: Vec<u64>,
     pub fetch_stats: FetchStageStats,
 }
 
@@ -392,45 +391,44 @@ fn spawn_peer_watcher<C: ChainTypes>(
                     let head_hash = info.status.blockhash;
                     let messages_for_probe = messages.clone();
 
-                    // eth/69 peers advertise their head and served history
-                    // range directly in the Status — no probe needed.
-                    let status_head = info.status.latest_block.unwrap_or(0);
+                    // The Status head/history range are peer-claimed hints.
+                    // The history range is only ever used to AVOID asking a
+                    // peer for work, so it is safe to take as-is; the head
+                    // number is verified by probing the claimed head hash.
                     let earliest_block = info.status.earliest_block;
 
                     pool.add_peer(NetworkPeer {
                         peer_id,
                         eth_version: info.version,
                         messages,
-                        head_number: status_head,
+                        head_number: 0,
                         earliest_block,
                         last_success: Instant::now(),
                     });
 
                     info!(peers = pool.len(), "peer connected");
 
-                    if status_head == 0 {
-                        let pool_for_probe = Arc::clone(&pool);
-                        let semaphore = Arc::clone(&head_probe_semaphore);
-                        tokio::spawn(async move {
-                            let Ok(_permit) = semaphore.acquire_owned().await else {
-                                return;
-                            };
-                            match request_head_number::<C>(peer_id, head_hash, &messages_for_probe)
-                                .await
-                            {
-                                Ok(head_number) => {
-                                    pool_for_probe.update_peer_head(peer_id, head_number);
-                                }
-                                Err(err) => {
-                                    debug!(
-                                        peer_id = ?peer_id,
-                                        error = %err,
-                                        "failed to probe peer head; keeping peer with unknown head"
-                                    );
-                                }
+                    let pool_for_probe = Arc::clone(&pool);
+                    let semaphore = Arc::clone(&head_probe_semaphore);
+                    tokio::spawn(async move {
+                        let Ok(_permit) = semaphore.acquire_owned().await else {
+                            return;
+                        };
+                        match request_head_number::<C>(peer_id, head_hash, &messages_for_probe)
+                            .await
+                        {
+                            Ok(head_number) => {
+                                pool_for_probe.update_peer_head(peer_id, head_number);
                             }
-                        });
-                    }
+                            Err(err) => {
+                                debug!(
+                                    peer_id = ?peer_id,
+                                    error = %err,
+                                    "failed to probe peer head; keeping peer with unknown head"
+                                );
+                            }
+                        }
+                    });
                 }
                 NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason }) => {
                     p2p_stats.sessions_closed.fetch_add(1, Ordering::Relaxed);
@@ -568,8 +566,8 @@ pub async fn discover_head_p2p<C: ChainTypes>(
         match request_headers_batch(peer, start, probe_limit).await {
             Ok(headers) => {
                 pool.mark_peer_success(peer.peer_id);
-                if let Some(last) = headers.last() {
-                    best = best.max(last.number);
+                if let Some(highest) = highest_valid_ascending(start, headers) {
+                    best = best.max(highest);
                 }
             }
             Err(e) => {
@@ -585,18 +583,63 @@ pub async fn discover_head_p2p<C: ChainTypes>(
     Ok(Some(best))
 }
 
+/// Validate a rising header response and return the highest trustworthy
+/// block number in it.
+///
+/// Headers must start at exactly `start`, ascend contiguously, and each
+/// must parent-link to the previous one. The valid prefix ends at the
+/// first violation — a peer replaying unrelated headers (or inventing a
+/// single header with a huge number) cannot inflate the observed head.
+fn highest_valid_ascending(start: u64, headers: Vec<Header>) -> Option<u64> {
+    let mut prev_hash: Option<B256> = None;
+    let mut best: Option<u64> = None;
+    for (idx, header) in headers.into_iter().enumerate() {
+        if header.number != start.checked_add(idx as u64)? {
+            break;
+        }
+        let parent_hash = header.parent_hash;
+        let sealed = SealedHeader::seal_slow(header);
+        if let Some(prev) = prev_hash {
+            if parent_hash != prev {
+                break;
+            }
+        }
+        best = Some(sealed.header().number);
+        prev_hash = Some(sealed.hash());
+    }
+    best
+}
+
 // ── Low-level request functions ──────────────────────────────────────
 
+/// Resolve the block number of a peer's claimed head hash.
+///
+/// The response header is only accepted if it actually seals to the
+/// requested hash — a peer cannot claim an arbitrary head number without
+/// producing a header that hashes to its advertised Status hash.
 async fn request_head_number<C: ChainTypes>(
     peer_id: PeerId,
     head_hash: B256,
     messages: &PeerRequestSender<PeerRequest<C::Net>>,
 ) -> Result<u64> {
-    let headers = request_headers_by_hash::<C>(peer_id, head_hash, messages).await?;
+    let mut headers = request_headers_by_hash::<C>(peer_id, head_hash, messages).await?;
+    if headers.len() != 1 {
+        return Err(eyre!(
+            "expected exactly one header for head probe, got {}",
+            headers.len()
+        ));
+    }
     let header = headers
-        .first()
+        .pop()
         .ok_or_else(|| eyre!("empty header response for head"))?;
-    Ok(header.number)
+    let sealed = SealedHeader::seal_slow(header);
+    if sealed.hash() != head_hash {
+        return Err(eyre!(
+            "head probe header hash mismatch: requested {head_hash}, got {}",
+            sealed.hash()
+        ));
+    }
+    Ok(sealed.header().number)
 }
 
 async fn request_headers_by_number<C: ChainTypes>(
@@ -1007,7 +1050,6 @@ pub async fn fetch_payloads_for_headers<C: ChainTypes>(
         return Ok(PayloadFetchOutcome {
             payloads: Vec::new(),
             missing_blocks: Vec::new(),
-            bloom_skipped: Vec::new(),
             fetch_stats: FetchStageStats::default(),
         });
     }
@@ -1066,7 +1108,6 @@ pub async fn fetch_payloads_for_headers<C: ChainTypes>(
     Ok(PayloadFetchOutcome {
         payloads,
         missing_blocks,
-        bloom_skipped: Vec::new(),
         fetch_stats: FetchStageStats {
             headers_ms: 0,
             bodies_ms,
@@ -1089,7 +1130,6 @@ pub async fn fetch_payloads_for_peer<C: ChainTypes>(
         return Ok(PayloadFetchOutcome {
             payloads: Vec::new(),
             missing_blocks: header_outcome.missing_blocks,
-            bloom_skipped: Vec::new(),
             fetch_stats: FetchStageStats {
                 headers_ms: header_outcome.headers_ms,
                 headers_requests: header_outcome.headers_requests,
