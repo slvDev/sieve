@@ -195,6 +195,10 @@ async fn probe_peers_for_hash<C: ChainTypes>(
 }
 
 /// Probe a single peer for the header hash at `block_number`.
+///
+/// The response must contain exactly one header at exactly the requested
+/// height — a peer replaying an unrelated (but stored) header must not be
+/// able to cast a vote for a different block.
 async fn probe_single_peer<C: ChainTypes>(peer: &NetworkPeer<C>, block_number: u64) -> ProbeResult {
     let headers = match request_headers_batch(peer, block_number, 1).await {
         Ok(h) => h,
@@ -204,9 +208,21 @@ async fn probe_single_peer<C: ChainTypes>(peer: &NetworkPeer<C>, block_number: u
         }
     };
 
+    if headers.len() != 1 {
+        return ProbeResult::Empty;
+    }
     let Some(header) = headers.into_iter().next() else {
         return ProbeResult::Empty;
     };
+    if header.number != block_number {
+        debug!(
+            peer_id = ?peer.peer_id,
+            requested = block_number,
+            got = header.number,
+            "reorg probe returned wrong height; ignoring"
+        );
+        return ProbeResult::Empty;
+    }
 
     ProbeResult::Hash(SealedHeader::seal_slow(header).hash())
 }
