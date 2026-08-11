@@ -426,31 +426,48 @@ pub async fn rollback_factory_children(
 /// Returns an error if any DROP statement fails.
 pub async fn drop_all_tables(
     db: &Database,
+    configured_chain: &str,
     events: &[ResolvedEvent],
     transfers: &[ResolvedTransfer],
     calls: &[ResolvedCall],
 ) -> eyre::Result<()> {
-    // User tables
-    for event in events {
-        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", event.table_name);
-        sqlx::raw_sql(&sql)
-            .execute(db.pool())
-            .await
-            .wrap_err_with(|| format!("failed to drop table '{}'", event.table_name))?;
+    // Every Sieve-owned table: the persisted registry (covers tables from
+    // earlier configs, e.g. before a chain switch) plus the tables named
+    // in the current config. Databases that predate the registry cannot
+    // enumerate their old tables, so a chain-SWITCH reset on them would
+    // silently leave the old chain's tables behind — refuse it. The source
+    // chain comes from the identity row when present (Base support predates
+    // table tracking), else prior state implies legacy mainnet.
+    let registry = owned_tables(db).await?;
+    if registry.is_none() {
+        let source_chain = match stored_chain_tolerant(db).await? {
+            Some(chain) => Some(chain),
+            None => has_prior_sieve_state_tolerant(db)
+                .await?
+                .then(|| LEGACY_CHAIN.to_owned()),
+        };
+        if let Some(source) = source_chain {
+            if source != configured_chain {
+                return Err(eyre::eyre!(
+                    "this database predates table tracking and holds chain \"{source}\" state; \
+                     a reset cannot locate all of its old tables, so switching it to chain \
+                     \"{configured_chain}\" could mix chain data — use a fresh database instead"
+                ));
+            }
+        }
     }
-    for transfer in transfers {
-        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", transfer.table_name);
+    let mut tables: std::collections::BTreeSet<String> =
+        registry.unwrap_or_default().into_iter().collect();
+    tables.extend(events.iter().map(|e| e.table_name.clone()));
+    tables.extend(transfers.iter().map(|t| t.table_name.clone()));
+    tables.extend(calls.iter().map(|c| c.table_name.clone()));
+
+    for table in &tables {
+        let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
         sqlx::raw_sql(&sql)
             .execute(db.pool())
             .await
-            .wrap_err_with(|| format!("failed to drop table '{}'", transfer.table_name))?;
-    }
-    for call in calls {
-        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", call.table_name);
-        sqlx::raw_sql(&sql)
-            .execute(db.pool())
-            .await
-            .wrap_err_with(|| format!("failed to drop table '{}'", call.table_name))?;
+            .wrap_err_with(|| format!("failed to drop table '{table}'"))?;
     }
 
     // Internal tables
@@ -459,6 +476,7 @@ pub async fn drop_all_tables(
         "_sieve_block_hashes",
         "_sieve_checkpoints",
         "_sieve_chain",
+        "_sieve_tables",
         "_sqlx_migrations",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
@@ -509,6 +527,16 @@ CREATE TABLE IF NOT EXISTS _sieve_chain (
     genesis_hash BYTEA NOT NULL
 )";
 
+/// DDL for the `_sieve_tables` registry of Sieve-owned user tables.
+///
+/// `sieve reset` / `--fresh` must drop every table Sieve ever created,
+/// not just the ones named in the currently loaded config — otherwise a
+/// chain switch could leave stale tables behind and later mix chain data.
+pub const OWNED_TABLES_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _sieve_tables (
+    table_name TEXT PRIMARY KEY
+)";
+
 /// Create sieve-internal tables at runtime.
 ///
 /// Uses `CREATE TABLE IF NOT EXISTS` so it is safe to call on every startup.
@@ -548,8 +576,74 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
         .await
         .wrap_err("failed to create _sieve_chain")?;
 
+    sqlx::raw_sql(&format!("{OWNED_TABLES_DDL};"))
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to create _sieve_tables")?;
+
     info!("internal tables ready");
     Ok(())
+}
+
+/// Record a user table as Sieve-owned so future resets can drop it even
+/// when it is no longer part of the loaded config.
+async fn register_owned_table(db: &Database, table_name: &str) -> eyre::Result<()> {
+    sqlx::query("INSERT INTO _sieve_tables (table_name) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(table_name)
+        .execute(db.pool())
+        .await
+        .wrap_err_with(|| format!("failed to register owned table '{table_name}'"))?;
+    Ok(())
+}
+
+/// Read all Sieve-owned table names recorded by previous runs.
+///
+/// Returns `None` when the registry does not exist yet (databases created
+/// before table tracking) — callers must treat such databases as having an
+/// unknown table set.
+async fn owned_tables(db: &Database) -> eyre::Result<Option<Vec<String>>> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sieve_tables') IS NOT NULL")
+        .fetch_one(db.pool())
+        .await
+        .wrap_err("failed to check _sieve_tables existence")?;
+    if !exists {
+        return Ok(None);
+    }
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT table_name FROM _sieve_tables")
+        .fetch_all(db.pool())
+        .await
+        .wrap_err("failed to read owned tables")?;
+    Ok(Some(rows.into_iter().map(|(name,)| name).collect()))
+}
+
+/// Read the bound chain from `_sieve_chain`, tolerating the table not
+/// existing yet (the reset path runs before any DDL).
+async fn stored_chain_tolerant(db: &Database) -> eyre::Result<Option<String>> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sieve_chain') IS NOT NULL")
+        .fetch_one(db.pool())
+        .await
+        .wrap_err("failed to check _sieve_chain existence")?;
+    if !exists {
+        return Ok(None);
+    }
+    let chain: Option<String> = sqlx::query_scalar("SELECT chain FROM _sieve_chain WHERE id = 1")
+        .fetch_optional(db.pool())
+        .await
+        .wrap_err("failed to read stored chain")?;
+    Ok(chain)
+}
+
+/// Like [`has_prior_sieve_state`], but tolerates the internal tables not
+/// existing yet (the reset path runs before any DDL).
+async fn has_prior_sieve_state_tolerant(db: &Database) -> eyre::Result<bool> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sieve_checkpoints') IS NOT NULL")
+        .fetch_one(db.pool())
+        .await
+        .wrap_err("failed to check _sieve_checkpoints existence")?;
+    if !exists {
+        return Ok(false);
+    }
+    has_prior_sieve_state(db).await
 }
 
 /// Chain that databases created before chain tracking are assumed to hold.
@@ -641,6 +735,7 @@ pub async fn ensure_chain_identity(db: &Database, chain: &str, genesis: B256) ->
 /// Returns an error if any DDL statement fails.
 pub async fn create_user_tables(db: &Database, events: &[ResolvedEvent]) -> eyre::Result<()> {
     for event in events {
+        register_owned_table(db, &event.table_name).await?;
         sqlx::raw_sql(&event.create_table_sql)
             .execute(db.pool())
             .await
@@ -673,6 +768,7 @@ pub async fn create_transfer_tables(
     transfers: &[ResolvedTransfer],
 ) -> eyre::Result<()> {
     for transfer in transfers {
+        register_owned_table(db, &transfer.table_name).await?;
         sqlx::raw_sql(&transfer.create_table_sql)
             .execute(db.pool())
             .await
@@ -702,6 +798,7 @@ pub async fn create_transfer_tables(
 /// Returns an error if any DDL statement fails.
 pub async fn create_call_tables(db: &Database, calls: &[ResolvedCall]) -> eyre::Result<()> {
     for call in calls {
+        register_owned_table(db, &call.table_name).await?;
         sqlx::raw_sql(&call.create_table_sql)
             .execute(db.pool())
             .await
@@ -809,6 +906,67 @@ mod tests {
         ensure_chain_identity(&db, "mainnet", main_genesis).await?;
         ensure_chain_identity(&db, "mainnet", main_genesis).await?;
 
+        reset_identity_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn legacy_reset_refuses_chain_switch() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_identity_state(&db).await?;
+
+        // Simulate a registry-less database bound to base with state.
+        sqlx::query("DROP TABLE IF EXISTS _sieve_tables")
+            .execute(db.pool())
+            .await
+            .wrap_err("drop registry failed")?;
+        sqlx::query("INSERT INTO _sieve_chain (id, chain, genesis_hash) VALUES (1, 'base', $1)")
+            .bind(alloy_primitives::B256::repeat_byte(0x0B).as_slice())
+            .execute(db.pool())
+            .await
+            .wrap_err("insert identity failed")?;
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 1000 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("set checkpoint failed")?;
+
+        // Registry-less base DB + mainnet destination → refused.
+        let result = drop_all_tables(&db, "mainnet", &[], &[], &[]).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("chain \"base\" state"));
+
+        // Same-chain reset is allowed.
+        drop_all_tables(&db, "base", &[], &[], &[]).await?;
+
+        // Recreate internal tables for the other tests and clean up.
+        create_internal_tables(&db).await?;
+        reset_identity_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn legacy_reset_refuses_base_on_legacy_mainnet() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_identity_state(&db).await?;
+
+        // Registry-less DB, no identity row, but prior state → legacy mainnet.
+        sqlx::query("DROP TABLE IF EXISTS _sieve_tables")
+            .execute(db.pool())
+            .await
+            .wrap_err("drop registry failed")?;
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 1000 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("set checkpoint failed")?;
+
+        let result = drop_all_tables(&db, "base", &[], &[], &[]).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("chain \"mainnet\" state"));
+
+        // Mainnet destination on legacy mainnet is allowed.
+        drop_all_tables(&db, "mainnet", &[], &[], &[]).await?;
+
+        create_internal_tables(&db).await?;
         reset_identity_state(&db).await
     }
 

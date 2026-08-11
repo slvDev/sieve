@@ -671,9 +671,12 @@ fn cmd_schema(cli: &cli::Cli) -> eyre::Result<()> {
 async fn cmd_reset(cli: &cli::Cli) -> eyre::Result<()> {
     let startup = load_resolved_config(cli)?;
     let database_url = resolve_database_url(cli)?;
+    let chain_kind = resolve_config_chain(cli, None)?;
+
     let db = db::Database::connect(&database_url).await?;
     db::drop_all_tables(
         &db,
+        chain_kind.name(),
         &startup.resolved.resolved_events,
         &startup.resolved.transfers,
         &startup.resolved.calls,
@@ -1210,6 +1213,7 @@ async fn setup_database(cli: &cli::Cli, startup: &StartupConfig) -> eyre::Result
         info!("--fresh: dropping all tables");
         db::drop_all_tables(
             &db,
+            startup.chain.name(),
             &startup.resolved_events,
             &startup.resolved_transfers,
             &startup.resolved_calls,
