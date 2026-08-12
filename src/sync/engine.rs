@@ -179,15 +179,18 @@ impl<C: ChainTypes> ProcessedItem<C> {
     }
 }
 
-/// Reorders out-of-order processed items so the DB writer only ever
-/// commits (and notifies) a contiguous, anchored prefix. Nothing above the
-/// contiguous frontier is inserted, so no unverified row is observable via
-/// the API or dispatched to webhooks/queues.
-struct ReorderBuffer<C: ChainTypes> {
+/// Reorders out-of-order items into strict block-number order.
+///
+/// Used twice in the pipeline: by the sequencer (so factory discovery and
+/// registration happen in block order before any later block is filtered)
+/// and by the DB writer (so only a contiguous, anchored prefix is ever
+/// committed and notified — no unverified row is observable via the API
+/// or dispatched to webhooks/queues).
+struct ReorderBuffer<T> {
     /// Next block number expected by the contiguous prefix.
     next: u64,
-    /// Blocks received ahead of the contiguous frontier.
-    pending: std::collections::BTreeMap<u64, ProcessedItem<C>>,
+    /// Items received ahead of the contiguous frontier.
+    pending: std::collections::BTreeMap<u64, T>,
 }
 
 /// Hard cap on buffered out-of-order items before the run is aborted.
@@ -197,7 +200,7 @@ struct ReorderBuffer<C: ChainTypes> {
 /// aborting (checkpoint intact) is safer than growing without bound.
 const MAX_REORDER_PENDING: usize = 16_384;
 
-impl<C: ChainTypes> ReorderBuffer<C> {
+impl<T> ReorderBuffer<T> {
     const fn new(start: u64) -> Self {
         Self {
             next: start,
@@ -206,23 +209,23 @@ impl<C: ChainTypes> ReorderBuffer<C> {
     }
 
     /// Buffer an item; ignores duplicates below the contiguous frontier.
-    fn push(&mut self, item: ProcessedItem<C>) {
-        if item.number() >= self.next {
-            self.pending.insert(item.number(), item);
+    fn push(&mut self, number: u64, item: T) {
+        if number >= self.next {
+            self.pending.insert(number, item);
         } else {
             debug!(
-                block = item.number(),
+                block = number,
                 next = self.next,
                 "dropping duplicate item below contiguous frontier"
             );
         }
     }
 
-    /// Drain the contiguous run starting at `next` into `batch`.
-    fn drain_contiguous(&mut self, batch: &mut Vec<ProcessedItem<C>>) {
+    /// Drain the contiguous run starting at `next` into `out`.
+    fn drain_contiguous(&mut self, out: &mut Vec<T>) {
         while let Some(item) = self.pending.remove(&self.next) {
             self.next = self.next.saturating_add(1);
-            batch.push(item);
+            out.push(item);
         }
     }
 
@@ -230,6 +233,20 @@ impl<C: ChainTypes> ReorderBuffer<C> {
     fn buffered(&self) -> usize {
         self.pending.len()
     }
+}
+
+/// Item flowing from the sequencer to the processing workers.
+///
+/// Factory discovery has already happened (in block order), so workers
+/// only filter and decode — which is order-independent.
+enum OrderedItem<C: ChainTypes> {
+    /// Payload plus the factory children it created (already registered).
+    Payload {
+        payload: Box<BlockPayload<C>>,
+        factory_discoveries: Vec<filter::FactoryDiscovery>,
+    },
+    /// Bloom-skipped block: hash record only.
+    Skipped(SkippedHeader),
 }
 
 // Compile-time size assertions for hot types (reth pattern).
@@ -274,6 +291,7 @@ pub async fn run_sync<C: ChainTypes>(
 
     // Channels
     let (payload_tx, payload_rx) = mpsc::channel::<FetchItem<C>>(PAYLOAD_CHANNEL_SIZE);
+    let (ordered_tx, ordered_rx) = mpsc::channel::<OrderedItem<C>>(PAYLOAD_CHANNEL_SIZE);
     let (processed_tx, processed_rx) = mpsc::channel::<ProcessedItem<C>>(PROCESSED_CHANNEL_SIZE);
     let (ready_tx, ready_rx) = mpsc::unbounded_channel::<NetworkPeer<C>>();
 
@@ -285,16 +303,21 @@ pub async fn run_sync<C: ChainTypes>(
         spawn_peer_feeder(Arc::clone(&ctx.pool), ready_tx.clone(), feeder_shutdown_rx);
 
     // Spawn N parallel processing workers (CPU: filter + decode)
-    let mut worker_set = spawn_processing_workers(
-        payload_rx,
-        processed_tx,
-        Arc::clone(&ctx.config),
-        Arc::clone(&ctx.factories),
-    );
+    let worker_set = spawn_processing_workers(ordered_rx, processed_tx, Arc::clone(&ctx.config));
 
     // Abort signal: fired by the DB writer on fatal integrity errors so the
     // fetch loop stops promptly instead of draining the whole range.
     let (abort_tx, abort_rx) = watch::channel(false);
+
+    // Sequencer: ordered factory discovery between fetch and the workers.
+    let sequencer_handle = tokio::spawn(run_sequencer(
+        payload_rx,
+        ordered_tx,
+        Arc::clone(&ctx.config),
+        Arc::clone(&ctx.factories),
+        start_block.as_u64(),
+        abort_tx.clone(),
+    ));
 
     // Spawn DB writer (reads ProcessedBlocks, batches, commits)
     let consumer_handle = tokio::spawn(consume_payloads(
@@ -339,29 +362,20 @@ pub async fn run_sync<C: ChainTypes>(
     // Shutdown: feeder → workers → DB writer
     let _ = feeder_shutdown_tx.send(true);
     let _ = feeder_handle.await;
-    drop(payload_tx); // signals workers (payload_rx returns None)
-                      // Wait for workers to drain. A panicked worker may have lost blocks —
-                      // that must fail the run, never be silently ignored. (All worker
-                      // processed_tx clones dropping lets the DB writer see channel close.)
-    let mut worker_failure: Option<eyre::Report> = None;
-    while let Some(joined) = worker_set.join_next().await {
-        if let Err(join_err) = joined {
-            worker_failure = Some(eyre::eyre!("processing worker failed: {join_err}"));
-        }
-    }
+    drop(payload_tx); // closes the sequencer input, which closes the workers
 
-    let stats = match consumer_handle.await {
-        Ok(Ok(stats)) => stats,
-        Ok(Err(err)) => return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await),
-        Err(join_err) => {
-            let err = eyre::eyre!("consumer task failed: {join_err}");
+    let worker_failure = join_pipeline_stages(sequencer_handle, worker_set).await;
+
+    let consumer_result = match consumer_handle.await {
+        Ok(result) => result,
+        Err(join_err) => Err(eyre::eyre!("consumer task failed: {join_err}")),
+    };
+    let stats = match (consumer_result, worker_failure) {
+        (Ok(stats), None) => stats,
+        (Err(err), _) | (Ok(_), Some(err)) => {
             return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await);
         }
     };
-
-    if let Some(err) = worker_failure {
-        return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await);
-    }
 
     let elapsed = started.elapsed();
     Ok(SyncOutcome {
@@ -855,23 +869,21 @@ async fn check_progress<C: ChainTypes>(
     reason = "Arc/Sender are cloned into spawned tasks"
 )]
 fn spawn_processing_workers<C: ChainTypes>(
-    payload_rx: mpsc::Receiver<FetchItem<C>>,
+    ordered_rx: mpsc::Receiver<OrderedItem<C>>,
     processed_tx: mpsc::Sender<ProcessedItem<C>>,
     config: Arc<IndexConfig>,
-    factories: Arc<Vec<ResolvedFactory>>,
 ) -> JoinSet<()> {
     let num_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
 
     info!(num_workers, "spawning block processing workers");
 
-    let payload_rx = Arc::new(tokio::sync::Mutex::new(payload_rx));
+    let ordered_rx = Arc::new(tokio::sync::Mutex::new(ordered_rx));
     let mut workers = JoinSet::new();
 
     for _ in 0..num_workers {
-        let rx = Arc::clone(&payload_rx);
+        let rx = Arc::clone(&ordered_rx);
         let tx = processed_tx.clone();
         let cfg = Arc::clone(&config);
-        let facts = Arc::clone(&factories);
 
         workers.spawn(async move {
             loop {
@@ -881,10 +893,15 @@ fn spawn_processing_workers<C: ChainTypes>(
                 };
                 let Some(item) = item else { break };
                 let processed = match item {
-                    FetchItem::Payload(payload) => {
-                        ProcessedItem::Block(Box::new(prepare_block(*payload, &cfg, &facts)))
-                    }
-                    FetchItem::Skipped(skipped) => ProcessedItem::Skipped(skipped),
+                    OrderedItem::Payload {
+                        payload,
+                        factory_discoveries,
+                    } => ProcessedItem::Block(Box::new(prepare_block(
+                        *payload,
+                        &cfg,
+                        factory_discoveries,
+                    ))),
+                    OrderedItem::Skipped(skipped) => ProcessedItem::Skipped(skipped),
                 };
                 if tx.send(processed).await.is_err() {
                     break;
@@ -894,6 +911,79 @@ fn spawn_processing_workers<C: ChainTypes>(
     }
 
     workers
+}
+
+/// Sequencing stage between fetch and the processing workers.
+///
+/// With factories configured, items are reordered into strict block-number
+/// order and factory discovery/registration runs here, sequentially —
+/// guaranteeing that when a worker filters block N+1, every child created
+/// up to and including block N is already registered. Without factories
+/// there is no cross-block dependency, so items pass through unordered
+/// (avoiding head-of-line blocking; the DB writer restores order anyway).
+///
+/// # Errors
+///
+/// Returns an error (after firing the abort signal) if the reorder buffer
+/// exceeds [`MAX_REORDER_PENDING`].
+async fn run_sequencer<C: ChainTypes>(
+    mut payload_rx: mpsc::Receiver<FetchItem<C>>,
+    ordered_tx: mpsc::Sender<OrderedItem<C>>,
+    config: Arc<IndexConfig>,
+    factories: Arc<Vec<ResolvedFactory>>,
+    start_block: u64,
+    abort_tx: watch::Sender<bool>,
+) -> eyre::Result<()> {
+    if factories.is_empty() {
+        while let Some(item) = payload_rx.recv().await {
+            let out = match item {
+                FetchItem::Payload(payload) => OrderedItem::Payload {
+                    payload,
+                    factory_discoveries: Vec::new(),
+                },
+                FetchItem::Skipped(skipped) => OrderedItem::Skipped(skipped),
+            };
+            if ordered_tx.send(out).await.is_err() {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+
+    let mut buffer: ReorderBuffer<FetchItem<C>> = ReorderBuffer::new(start_block);
+    let mut ready = Vec::new();
+    while let Some(item) = payload_rx.recv().await {
+        let number = match &item {
+            FetchItem::Payload(payload) => payload.header().number,
+            FetchItem::Skipped(skipped) => skipped.number,
+        };
+        buffer.push(number, item);
+        buffer.drain_contiguous(&mut ready);
+        if buffer.buffered() > MAX_REORDER_PENDING {
+            let _ = abort_tx.send(true);
+            return Err(eyre::eyre!(
+                "sequencer buffer exceeded {MAX_REORDER_PENDING} items waiting for block {}; \
+                 aborting run (a block appears unfetchable)",
+                buffer.next
+            ));
+        }
+        for item in std::mem::take(&mut ready) {
+            let out = match item {
+                FetchItem::Payload(payload) => {
+                    let factory_discoveries = scan_and_register(&payload, &config, &factories);
+                    OrderedItem::Payload {
+                        payload,
+                        factory_discoveries,
+                    }
+                }
+                FetchItem::Skipped(skipped) => OrderedItem::Skipped(skipped),
+            };
+            if ordered_tx.send(out).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── DB writer (payload consumer) ────────────────────────────────────
@@ -1083,28 +1173,18 @@ fn compute_block_hash(header: &reth_primitives_traits::Header) -> alloy_primitiv
 
 /// CPU-only block processing: factory pre-scan, filter, and decode.
 ///
-/// Factory children are registered in-memory immediately (so subsequent
-/// blocks in the same batch can match them). DB persistence is deferred
-/// to [`flush_batch`].
+/// Factory children were already discovered and registered by the
+/// sequencer (in strict block order), so this stage is order-independent
+/// and safe to run on parallel workers. DB persistence of the discoveries
+/// is deferred to [`flush_batch`].
 fn prepare_block<C: ChainTypes>(
     payload: BlockPayload<C>,
     config: &IndexConfig,
-    factories: &[ResolvedFactory],
+    factory_discoveries: Vec<filter::FactoryDiscovery>,
 ) -> ProcessedBlock<C> {
     let block_number = BlockNumber::new(payload.header().number);
     let block_hash = compute_block_hash(payload.header());
     let receipt_count = payload.receipts().len() as u64;
-
-    // Factory pre-scan: register children in-memory (no DB write)
-    let factory_discoveries = if factories.is_empty() {
-        Vec::new()
-    } else {
-        let discoveries = filter::scan_factory_events(&payload, factories);
-        for d in &discoveries {
-            register_factory_child_in_memory(config, d);
-        }
-        discoveries
-    };
 
     // Filter + decode
     let matched = filter::filter_block(&payload, config);
@@ -1120,6 +1200,23 @@ fn prepare_block<C: ChainTypes>(
         receipt_count,
         payload,
     }
+}
+
+/// Scan a payload for factory creation events and register the children
+/// in-memory.
+///
+/// MUST be called in strict block-number order (the sequencer's job):
+/// filtering of any later block depends on every earlier registration.
+fn scan_and_register<C: ChainTypes>(
+    payload: &BlockPayload<C>,
+    config: &IndexConfig,
+    factories: &[ResolvedFactory],
+) -> Vec<filter::FactoryDiscovery> {
+    let discoveries = filter::scan_factory_events(payload, factories);
+    for discovery in &discoveries {
+        register_factory_child_in_memory(config, discovery);
+    }
+    discoveries
 }
 
 /// Register a factory child in-memory only (no DB write).
@@ -1244,12 +1341,12 @@ async fn flush_batch<C: ChainTypes>(
 /// Returns an error (and fires the abort signal) if the out-of-order
 /// buffer exceeds [`MAX_REORDER_PENDING`].
 fn buffer_item<C: ChainTypes>(
-    reorder: &mut ReorderBuffer<C>,
+    reorder: &mut ReorderBuffer<ProcessedItem<C>>,
     batch: &mut Vec<ProcessedItem<C>>,
     processed: ProcessedItem<C>,
     abort_tx: &watch::Sender<bool>,
 ) -> eyre::Result<()> {
-    reorder.push(processed);
+    reorder.push(processed.number(), processed);
     reorder.drain_contiguous(batch);
     if reorder.buffered() > MAX_REORDER_PENDING {
         let _ = abort_tx.send(true);
@@ -1277,6 +1374,28 @@ async fn rollback_committed_to(ctx: &ProcessContext<'_>, block: u64) -> eyre::Re
         .wrap_err("failed to commit adjacency rollback")?;
     warn!(block, "rolled back stored state above verified parent");
     Ok(())
+}
+
+/// Wait for the sequencer and workers to drain, surfacing any failure.
+///
+/// A panicked or failed stage may have lost blocks — that must fail the
+/// run, never be silently ignored. (All worker processed_tx clones
+/// dropping lets the DB writer see channel close.)
+async fn join_pipeline_stages(
+    sequencer_handle: tokio::task::JoinHandle<eyre::Result<()>>,
+    mut worker_set: JoinSet<()>,
+) -> Option<eyre::Report> {
+    let mut failure: Option<eyre::Report> = match sequencer_handle.await {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => Some(err),
+        Err(join_err) => Some(eyre::eyre!("sequencer task failed: {join_err}")),
+    };
+    while let Some(joined) = worker_set.join_next().await {
+        if let Err(join_err) = joined {
+            failure = Some(eyre::eyre!("processing worker failed: {join_err}"));
+        }
+    }
+    failure
 }
 
 /// Clean up after a sync run whose consumer failed (rejected batch or
@@ -2200,6 +2319,10 @@ fn decode_matched_logs(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
 
@@ -2288,6 +2411,126 @@ mod tests {
         );
     }
 
+    /// Regression test for the parallel-worker factory race: a child
+    /// created in block N must already be registered when block N+1 is
+    /// filtered, even when N+1 arrives first. This is the sequencer's
+    /// ordering contract (reorder → scan+register per block, in order →
+    /// forward), exercised synchronously.
+    #[test]
+    fn sequencer_registers_children_before_later_blocks() -> eyre::Result<()> {
+        use crate::chain::EthereumChain;
+        use crate::test_utils::{build_test_transaction, make_log, make_receipt};
+        use alloy_primitives::address;
+
+        let child_abi = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]"#;
+        let factory_abi_json = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"pool","type":"address"}],"name":"PoolCreated","type":"event"}]"#;
+
+        let child_contract =
+            crate::config::ContractConfig::new("Pool", Address::ZERO, child_abi, &["Transfer"])?;
+        let config = IndexConfig::new(vec![child_contract]);
+
+        let factory_abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(factory_abi_json).map_err(|e| eyre::eyre!("abi parse: {e}"))?;
+        let creation_event = factory_abi
+            .events
+            .get("PoolCreated")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no PoolCreated"))?;
+
+        let factory_addr = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
+        let child_addr = address!("8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8");
+        let factory = ResolvedFactory {
+            factory_address: factory_addr,
+            creation_event: creation_event.clone(),
+            creation_selector: creation_event.selector(),
+            child_address_param: "pool".to_owned(),
+            child_contract_name: "Pool".to_owned(),
+            start_block: 100,
+        };
+
+        // Block 100: pool creation. Block 101: the pool emits a Transfer.
+        let creation_log = make_log(
+            factory_addr,
+            vec![
+                creation_event.selector(),
+                B256::left_padding_from(child_addr.as_slice()),
+            ],
+            alloy_primitives::Bytes::new(),
+        );
+        let creation_payload = BlockPayload::<EthereumChain>::new(
+            reth_primitives_traits::Header {
+                number: 100,
+                ..Default::default()
+            },
+            alloy_consensus::BlockBody {
+                transactions: vec![build_test_transaction()],
+                ..Default::default()
+            },
+            vec![make_receipt(vec![creation_log])],
+        );
+
+        let transfer_selector: B256 =
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                .parse()
+                .map_err(|e| eyre::eyre!("parse: {e}"))?;
+        let transfer_log = make_log(
+            child_addr,
+            vec![
+                transfer_selector,
+                B256::repeat_byte(0x01),
+                B256::repeat_byte(0x02),
+            ],
+            alloy_primitives::Bytes::from_static(&[0u8; 32]),
+        );
+        let child_payload = BlockPayload::<EthereumChain>::new(
+            reth_primitives_traits::Header {
+                number: 101,
+                ..Default::default()
+            },
+            alloy_consensus::BlockBody {
+                transactions: vec![build_test_transaction()],
+                ..Default::default()
+            },
+            vec![make_receipt(vec![transfer_log])],
+        );
+
+        // Control: before registration the child's event does not match.
+        assert_eq!(filter::filter_block(&child_payload, &config).len(), 0);
+
+        // Simulate out-of-order arrival: block 101 first, then block 100.
+        let mut buffer: ReorderBuffer<BlockPayload<EthereumChain>> = ReorderBuffer::new(100);
+        let mut ready = Vec::new();
+        buffer.push(101, child_payload);
+        buffer.drain_contiguous(&mut ready);
+        assert!(
+            ready.is_empty(),
+            "later block must wait for its predecessor"
+        );
+
+        buffer.push(100, creation_payload);
+        buffer.drain_contiguous(&mut ready);
+        assert_eq!(ready.len(), 2);
+
+        // Ordered processing (the sequencer loop): registration of block
+        // 100's child happens before block 101 is filtered.
+        let mut matched_in_child_block = 0;
+        for payload in &ready {
+            let disc = scan_and_register(payload, &config, std::slice::from_ref(&factory));
+            if payload.header().number == 100 {
+                assert_eq!(disc.len(), 1, "block 100 must discover the child");
+                assert!(
+                    config.contract_for_address(&child_addr).is_some(),
+                    "child must be registered after block 100"
+                );
+            }
+            if payload.header().number == 101 {
+                matched_in_child_block = filter::filter_block(payload, &config).len();
+            }
+        }
+        assert_eq!(matched_in_child_block, 1);
+        Ok(())
+    }
+
     fn skipped(number: u64) -> ProcessedItem<crate::chain::EthereumChain> {
         ProcessedItem::Skipped(crate::sync::SkippedHeader {
             number,
@@ -2302,27 +2545,27 @@ mod tests {
         let mut batch = Vec::new();
 
         // Out-of-order blocks beyond a hole stay buffered.
-        buffer.push(skipped(12));
-        buffer.push(skipped(13));
+        buffer.push(12, skipped(12));
+        buffer.push(13, skipped(13));
         buffer.drain_contiguous(&mut batch);
         assert!(batch.is_empty());
         assert_eq!(buffer.buffered(), 2);
 
         // Hole filled: the whole run drains in order.
-        buffer.push(skipped(10));
-        buffer.push(skipped(11));
+        buffer.push(10, skipped(10));
+        buffer.push(11, skipped(11));
         buffer.drain_contiguous(&mut batch);
         let numbers: Vec<u64> = batch.iter().map(ProcessedItem::number).collect();
         assert_eq!(numbers, vec![10, 11, 12, 13]);
         assert_eq!(buffer.buffered(), 0);
 
         // Duplicates below the frontier are dropped.
-        buffer.push(skipped(9));
+        buffer.push(9, skipped(9));
         assert_eq!(buffer.buffered(), 0);
 
         // Next contiguous block flows straight through.
         batch.clear();
-        buffer.push(skipped(14));
+        buffer.push(14, skipped(14));
         buffer.drain_contiguous(&mut batch);
         assert_eq!(batch.len(), 1);
     }
