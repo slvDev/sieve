@@ -345,6 +345,26 @@ pub struct ResolvedFactory {
     pub start_block: u64,
 }
 
+impl ResolvedFactory {
+    /// Stable description of the child-extraction rule.
+    ///
+    /// The creation-event selector alone does not pin down extraction: it
+    /// hashes parameter TYPES only, while `decode_child_address` selects a
+    /// value by parameter NAME and its indexed/body position. The full
+    /// signature (names, types, and `indexed` flags in order) plus the
+    /// selected parameter therefore fully determines which address gets
+    /// extracted — any ABI edit that changes it invalidates previously
+    /// persisted children.
+    #[must_use]
+    pub fn extraction_fingerprint(&self) -> String {
+        format!(
+            "{} => {}",
+            self.creation_event.full_signature(),
+            self.child_address_param
+        )
+    }
+}
+
 /// A fully resolved native ETH transfer definition.
 #[derive(Debug, Clone)]
 pub struct ResolvedTransfer {
@@ -1138,8 +1158,19 @@ pub fn resolve_config(config: &SieveConfig, config_dir: &Path) -> eyre::Result<R
     let mut resolved_factories = Vec::new();
     let mut resolved_calls = Vec::new();
     let mut table_names = HashSet::new();
+    let mut contract_names = HashSet::new();
 
     for contract in &config.contracts {
+        // Contract names route factory children to their ABI/handlers and
+        // key persisted children — a duplicate would silently apply the
+        // first contract's ABI to the second's children.
+        if !contract_names.insert(contract.name.clone()) {
+            return Err(eyre::eyre!(
+                "duplicate contract name \"{}\"; contract names identify handler routing and \
+                 factory children, so each [[contracts]] entry must have a unique name",
+                contract.name
+            ));
+        }
         let contract_config = resolve_contract(
             contract,
             config_dir,
@@ -1149,6 +1180,22 @@ pub fn resolve_config(config: &SieveConfig, config_dir: &Path) -> eyre::Result<R
             &mut resolved_calls,
         )?;
         contract_configs.push(contract_config);
+    }
+
+    // Factory discovery is keyed by (address, creation event selector) at
+    // scan time — two factories sharing a key would collapse into one and
+    // route all children to a single contract.
+    let mut factory_keys = HashSet::new();
+    for factory in &resolved_factories {
+        if !factory_keys.insert((factory.factory_address, factory.creation_selector)) {
+            return Err(eyre::eyre!(
+                "duplicate factory: address {} with creation event \"{}\" is configured on \
+                 more than one contract; each (factory address, creation event) pair can only \
+                 discover children for one contract",
+                factory.factory_address,
+                factory.creation_event.name
+            ));
+        }
     }
 
     // Resolve native ETH transfers (table_names set is shared with events)
@@ -1437,22 +1484,53 @@ fn resolve_factory(
             factory.event,
         )
     })?;
+    // An overloaded creation event is ambiguous: silently picking one
+    // variant could scan the wrong signature and find zero children.
+    if creation_events.len() > 1 {
+        return Err(eyre::eyre!(
+            "factory event '{}' is overloaded ({} variants) in the ABI for contract \
+             '{contract_name}'; overloaded creation events are ambiguous and not supported",
+            factory.event,
+            creation_events.len(),
+        ));
+    }
     let creation_event = creation_events.first().ok_or_else(|| {
         eyre::eyre!(
             "no variants for factory event '{}' in contract '{contract_name}'",
             factory.event,
         )
     })?;
+    // Discovery matches logs by their topic0 selector, which anonymous
+    // events never emit — such a config would silently find zero children
+    // while coverage advances.
+    if creation_event.anonymous {
+        return Err(eyre::eyre!(
+            "factory event '{}' for contract '{contract_name}' is anonymous; anonymous events \
+             emit no selector topic, so creation events could never be discovered",
+            factory.event,
+        ));
+    }
 
-    let param_exists = creation_event
+    let param = creation_event
         .inputs
         .iter()
-        .any(|p| p.name == factory.param);
-    if !param_exists {
+        .find(|p| p.name == factory.param)
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "factory param '{}' not found in event '{}' for contract '{contract_name}'",
+                factory.param,
+                factory.event,
+            )
+        })?;
+    // Runtime decoding only accepts address values; any other Solidity
+    // type would silently produce zero children forever.
+    if param.ty != "address" {
         return Err(eyre::eyre!(
-            "factory param '{}' not found in event '{}' for contract '{contract_name}'",
+            "factory param '{}' in event '{}' for contract '{contract_name}' has type '{}', \
+             but the child address param must be of type 'address'",
             factory.param,
             factory.event,
+            param.ty,
         ));
     }
 
@@ -2196,6 +2274,134 @@ table = "nope"
     }
 
     #[test]
+    fn resolve_error_duplicate_contract_name() -> eyre::Result<()> {
+        let dir = setup_test_dir("dup_contract_name", TRANSFER_ONLY_ABI)?;
+
+        let toml_str = r#"
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "usdc_transfers"
+
+[[contracts]]
+name = "USDC"
+address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+abi = "abis/erc20.json"
+start_block = 21000000
+
+[[contracts.events]]
+name = "Transfer"
+table = "other_transfers"
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        let Err(err) = resolve_config(&config, &dir) else {
+            return Err(eyre::eyre!("expected error for duplicate contract name"));
+        };
+        assert!(err.to_string().contains("duplicate contract name"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    const POOL_FACTORY_ABI: &str = r#"[
+        {"anonymous":false,"inputs":[
+            {"indexed":true,"internalType":"address","name":"pool","type":"address"}
+        ],"name":"PoolCreated","type":"event"}
+    ]"#;
+
+    #[test]
+    fn resolve_error_duplicate_factory_key() -> eyre::Result<()> {
+        let dir = setup_test_dir("dup_factory_key", TRANSFER_ONLY_ABI)?;
+        std::fs::write(dir.join("abis").join("factory.json"), POOL_FACTORY_ABI)?;
+
+        // Two contracts fed by the SAME factory address and creation
+        // event — discovery would collapse them into one at scan time.
+        let toml_str = r#"
+[[contracts]]
+name = "PoolA"
+abi = "abis/erc20.json"
+
+[contracts.factory]
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+abi = "abis/factory.json"
+event = "PoolCreated"
+param = "pool"
+start_block = 100
+
+[[contracts.events]]
+name = "Transfer"
+table = "pool_a_transfers"
+
+[[contracts]]
+name = "PoolB"
+abi = "abis/erc20.json"
+
+[contracts.factory]
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+abi = "abis/factory.json"
+event = "PoolCreated"
+param = "pool"
+start_block = 100
+
+[[contracts.events]]
+name = "Transfer"
+table = "pool_b_transfers"
+"#;
+        let config: SieveConfig = toml::from_str(toml_str)?;
+        let Err(err) = resolve_config(&config, &dir) else {
+            return Err(eyre::eyre!("expected error for duplicate factory key"));
+        };
+        assert!(err.to_string().contains("duplicate factory"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn extraction_fingerprint_captures_layout_and_param() -> eyre::Result<()> {
+        let abi: JsonAbi =
+            serde_json::from_str(POOL_FACTORY_ABI).map_err(|e| eyre::eyre!("abi parse: {e}"))?;
+        let event = abi
+            .events
+            .get("PoolCreated")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no event"))?;
+
+        let factory = ResolvedFactory {
+            factory_address: alloy_primitives::Address::ZERO,
+            creation_event: event.clone(),
+            creation_selector: event.selector(),
+            child_address_param: "pool".to_owned(),
+            child_contract_name: "Pool".to_owned(),
+            start_block: 0,
+        };
+        let original = factory.extraction_fingerprint();
+        assert!(original.contains("PoolCreated"));
+        assert!(original.ends_with("=> pool"));
+        assert!(original.contains("indexed"));
+
+        // Flipping only the indexed flag keeps the selector but must
+        // change the fingerprint — extraction reads a different slot.
+        let mut reindexed = factory.clone();
+        for input in &mut reindexed.creation_event.inputs {
+            input.indexed = !input.indexed;
+        }
+        assert_eq!(reindexed.creation_selector, factory.creation_selector);
+        assert_ne!(reindexed.extraction_fingerprint(), original);
+
+        // Selecting a different param changes it too.
+        let mut reparam = factory;
+        reparam.child_address_param = "token0".to_owned();
+        assert_ne!(reparam.extraction_fingerprint(), original);
+        Ok(())
+    }
+
+    #[test]
     fn resolve_error_missing_param() -> eyre::Result<()> {
         let dir = setup_test_dir("missing_param", TRANSFER_ONLY_ABI)?;
 
@@ -2501,6 +2707,57 @@ table = "uniswap_swaps"
         assert_eq!(f.param, "pool");
         assert_eq!(f.start_block, 12_369_621);
 
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_factory_rejects_non_address_param() -> eyre::Result<()> {
+        let abi_json = r#"[{"anonymous":false,"inputs":[
+            {"indexed":true,"internalType":"address","name":"pool","type":"address"},
+            {"indexed":false,"internalType":"uint24","name":"fee","type":"uint24"}
+        ],"name":"PoolCreated","type":"event"}]"#;
+        let abi: JsonAbi =
+            serde_json::from_str(abi_json).map_err(|e| eyre::eyre!("abi parse: {e}"))?;
+
+        let factory = TomlFactory {
+            address: "0x1F98431c8aD98523631AE4a59f267346ea31F984".to_owned(),
+            abi: None,
+            event: "PoolCreated".to_owned(),
+            param: "fee".to_owned(),
+            start_block: 1,
+        };
+
+        let result = resolve_factory(&factory, "Pool", &abi, Path::new("."));
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("must be of type 'address'"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_factory_rejects_overloaded_event() -> eyre::Result<()> {
+        let abi_json = r#"[
+            {"anonymous":false,"inputs":[
+                {"indexed":true,"internalType":"address","name":"pool","type":"address"}
+            ],"name":"PoolCreated","type":"event"},
+            {"anonymous":false,"inputs":[
+                {"indexed":true,"internalType":"address","name":"pool","type":"address"},
+                {"indexed":false,"internalType":"uint24","name":"fee","type":"uint24"}
+            ],"name":"PoolCreated","type":"event"}
+        ]"#;
+        let abi: JsonAbi =
+            serde_json::from_str(abi_json).map_err(|e| eyre::eyre!("abi parse: {e}"))?;
+
+        let factory = TomlFactory {
+            address: "0x1F98431c8aD98523631AE4a59f267346ea31F984".to_owned(),
+            abi: None,
+            event: "PoolCreated".to_owned(),
+            param: "pool".to_owned(),
+            start_block: 1,
+        };
+
+        let result = resolve_factory(&factory, "Pool", &abi, Path::new("."));
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("overloaded"));
         Ok(())
     }
 
