@@ -257,23 +257,32 @@ pub async fn rollback_to(
 /// Load persisted factory children from the database into the config.
 ///
 /// Called at startup to restore dynamically discovered child contracts.
+/// Every row is resolved through its FULL factory identity (address,
+/// creation selector, child contract name) against the currently
+/// configured factories — a display name alone must never route children.
 /// Returns the number of children loaded.
 ///
 /// # Errors
 ///
-/// Returns an error if the query fails.
-pub async fn load_factory_children(db: &Database, config: &IndexConfig) -> eyre::Result<u64> {
-    let rows = sqlx::query("SELECT factory_name, child_address FROM _sieve_factory_children")
-        .fetch_all(db.pool())
-        .await
-        .wrap_err("failed to load factory children")?;
+/// Returns an error if the query fails or a row's identity does not
+/// match a configured factory.
+pub async fn load_factory_children(
+    db: &Database,
+    config: &IndexConfig,
+    factories: &[ResolvedFactory],
+) -> eyre::Result<u64> {
+    let rows = sqlx::query(
+        "SELECT factory_name, factory_address, creation_selector, child_address \
+         FROM _sieve_factory_children",
+    )
+    .fetch_all(db.pool())
+    .await
+    .wrap_err("failed to load factory children")?;
 
     let mut count = 0u64;
     for row in &rows {
-        let factory_name: &str = row.try_get("factory_name")?;
-        let child_bytes: Vec<u8> = row.try_get("child_address")?;
-
-        if register_persisted_child(config, factory_name, &child_bytes) {
+        let (address, contract_idx) = parse_persisted_child(config, factories, row)?;
+        if config.register_factory_child(address, contract_idx) {
             count = count.saturating_add(1);
         }
     }
@@ -478,6 +487,26 @@ async fn register_new_factory(
             covered_through = checkpoint,
             "recording assumed factory coverage (--assume-factory-coverage)"
         );
+        // The same assertion binds this factory's pre-identity-tracking
+        // children (NULL identity columns) to the asserted identity, so
+        // they load under it from now on.
+        let stamped = sqlx::query(
+            "UPDATE _sieve_factory_children SET factory_address = $2, creation_selector = $3 \
+             WHERE factory_name = $1 AND factory_address IS NULL",
+        )
+        .bind(&factory.child_contract_name)
+        .bind(factory.factory_address.as_slice())
+        .bind(factory.creation_selector.as_slice())
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to bind legacy factory children")?;
+        if stamped.rows_affected() > 0 {
+            warn!(
+                factory = %factory.child_contract_name,
+                children = stamped.rows_affected(),
+                "bound legacy factory children to the asserted identity"
+            );
+        }
     }
     sqlx::query(
         "INSERT INTO _sieve_factories (factory_address, creation_selector, \
@@ -593,21 +622,23 @@ pub async fn advance_factory_coverage(
 /// # Errors
 ///
 /// Returns an error if the reload query fails.
-pub async fn rebuild_factory_children(db: &Database, config: &IndexConfig) -> eyre::Result<u64> {
-    let rows = sqlx::query("SELECT factory_name, child_address FROM _sieve_factory_children")
-        .fetch_all(db.pool())
-        .await
-        .wrap_err("failed to load factory children for rebuild")?;
+pub async fn rebuild_factory_children(
+    db: &Database,
+    config: &IndexConfig,
+    factories: &[ResolvedFactory],
+) -> eyre::Result<u64> {
+    let rows = sqlx::query(
+        "SELECT factory_name, factory_address, creation_selector, child_address \
+         FROM _sieve_factory_children",
+    )
+    .fetch_all(db.pool())
+    .await
+    .wrap_err("failed to load factory children for rebuild")?;
 
     let mut committed: HashMap<Address, usize> = HashMap::new();
     for row in &rows {
-        let factory_name: &str = row.try_get("factory_name")?;
-        let child_bytes: Vec<u8> = row.try_get("child_address")?;
-        if let Some((address, contract_idx)) =
-            parse_persisted_child(config, factory_name, &child_bytes)
-        {
-            committed.insert(address, contract_idx);
-        }
+        let (address, contract_idx) = parse_persisted_child(config, factories, row)?;
+        committed.insert(address, contract_idx);
     }
 
     let count = committed.len() as u64;
@@ -615,63 +646,111 @@ pub async fn rebuild_factory_children(db: &Database, config: &IndexConfig) -> ey
     Ok(count)
 }
 
-/// Validate and register a single persisted factory child.
+/// Validate a persisted factory-child row, resolving its contract index
+/// through the FULL factory identity.
 ///
-/// Returns `true` if the child was successfully registered.
-fn register_persisted_child(config: &IndexConfig, factory_name: &str, child_bytes: &[u8]) -> bool {
-    parse_persisted_child(config, factory_name, child_bytes)
-        .is_some_and(|(address, contract_idx)| config.register_factory_child(address, contract_idx))
-}
-
-/// Validate a persisted factory-child row, resolving its contract index.
+/// A row is only accepted when a currently configured factory matches its
+/// stored `(factory_address, creation_selector, child_contract_name)`
+/// exactly. Everything else is FATAL — silently skipping rows would drop
+/// persisted children while the checkpoint stays advanced, and routing by
+/// name alone could hand a different factory's children to the wrong
+/// ABI/handlers:
 ///
-/// Returns `None` (with a warning) for malformed addresses or rows that
-/// reference a contract missing from the current config.
+/// - no configured factory with the row's name: the factory was removed
+///   or renamed — migrate or delete the rows;
+/// - identity mismatch: the name was reused for a DIFFERENT factory —
+///   the children belong to the old identity and must not be loaded;
+/// - missing identity columns: rows from before identity tracking —
+///   rerun once with `--assume-factory-coverage` to bind them.
+///
+/// # Errors
+///
+/// Returns an error for malformed rows or any identity mismatch.
 fn parse_persisted_child(
     config: &IndexConfig,
-    factory_name: &str,
-    child_bytes: &[u8],
-) -> Option<(Address, usize)> {
+    factories: &[ResolvedFactory],
+    row: &sqlx::postgres::PgRow,
+) -> eyre::Result<(Address, usize)> {
+    let factory_name: &str = row.try_get("factory_name")?;
+    let stored_address: Option<Vec<u8>> = row.try_get("factory_address")?;
+    let stored_selector: Option<Vec<u8>> = row.try_get("creation_selector")?;
+    let child_bytes: Vec<u8> = row.try_get("child_address")?;
+
     if child_bytes.len() != 20 {
-        tracing::warn!(
-            factory = factory_name,
-            len = child_bytes.len(),
-            "invalid child address length in DB, skipping"
-        );
-        return None;
+        return Err(eyre::eyre!(
+            "corrupt child address ({} bytes) for factory \"{factory_name}\" in \
+             _sieve_factory_children",
+            child_bytes.len()
+        ));
     }
+    let child_address = Address::from_slice(&child_bytes);
 
-    let child_address = Address::from_slice(child_bytes);
-
-    let Some(contract_idx) = config.contracts.iter().position(|c| c.name == factory_name) else {
-        tracing::warn!(
-            factory = factory_name,
-            "factory child references unknown contract, skipping"
-        );
-        return None;
+    let Some(factory) = factories
+        .iter()
+        .find(|f| f.child_contract_name == factory_name)
+    else {
+        return Err(eyre::eyre!(
+            "persisted factory children reference factory \"{factory_name}\", which is not in \
+             the current config; if the contract was renamed, migrate the rows \
+             (UPDATE _sieve_factory_children SET factory_name = '<new>' WHERE factory_name = \
+             '{factory_name}'); if it was removed intentionally, delete them \
+             (DELETE FROM _sieve_factory_children WHERE factory_name = '{factory_name}')"
+        ));
     };
 
-    Some((child_address, contract_idx))
+    match (stored_address, stored_selector) {
+        (Some(addr), Some(sel))
+            if addr == factory.factory_address.as_slice()
+                && sel == factory.creation_selector.as_slice() => {}
+        (Some(_), Some(_)) => {
+            return Err(eyre::eyre!(
+                "persisted children of \"{factory_name}\" were discovered by a DIFFERENT \
+                 factory identity than the one now configured (factory {}, event \"{}\"); \
+                 loading them would route another factory's children through this ABI and \
+                 handlers — use a fresh database or run `sieve reset`",
+                factory.factory_address,
+                factory.creation_event.name,
+            ));
+        }
+        _ => {
+            return Err(eyre::eyre!(
+                "persisted children of \"{factory_name}\" predate factory identity tracking; \
+                 rerun once with --assume-factory-coverage to bind them to the configured \
+                 factory (only if this factory was configured continuously), or use a fresh \
+                 database"
+            ));
+        }
+    }
+
+    let Some(contract_idx) = config.contracts.iter().position(|c| c.name == factory_name) else {
+        return Err(eyre::eyre!(
+            "factory \"{factory_name}\" has no matching contract entry in the current config"
+        ));
+    };
+
+    Ok((child_address, contract_idx))
 }
 
-/// Persist a newly discovered factory child in the database.
+/// Persist a newly discovered factory child in the database, bound to
+/// the full identity of the factory that discovered it.
 ///
 /// # Errors
 ///
 /// Returns an error if the INSERT fails.
 pub async fn store_factory_child(
     tx: &mut Transaction<'_, Postgres>,
-    factory_name: &str,
-    child_address: &Address,
-    block_number: u64,
+    discovery: &crate::filter::FactoryDiscovery,
 ) -> eyre::Result<()> {
     sqlx::query(
-        "INSERT INTO _sieve_factory_children (factory_name, child_address, block_number) \
-         VALUES ($1, $2, $3) ON CONFLICT (child_address) DO NOTHING",
+        "INSERT INTO _sieve_factory_children \
+         (factory_name, factory_address, creation_selector, child_address, block_number) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (child_address) DO NOTHING",
     )
-    .bind(factory_name)
-    .bind(child_address.as_slice())
-    .bind(block_number as i64)
+    .bind(&discovery.child_contract_name)
+    .bind(discovery.factory_address.as_slice())
+    .bind(discovery.creation_selector.as_slice())
+    .bind(discovery.child_address.as_slice())
+    .bind(discovery.block_number as i64)
     .execute(&mut **tx)
     .await
     .wrap_err("failed to store factory child")?;
@@ -809,10 +888,17 @@ CREATE TABLE IF NOT EXISTS _sieve_block_hashes (
 )";
 
 /// DDL for the `_sieve_factory_children` table.
+///
+/// `factory_address` and `creation_selector` bind each child to the full
+/// identity of the factory that discovered it; they are nullable only for
+/// rows written by versions that predate identity tracking (bound once
+/// via `--assume-factory-coverage`).
 pub const FACTORY_CHILDREN_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _sieve_factory_children (
     id BIGSERIAL PRIMARY KEY,
     factory_name TEXT NOT NULL,
+    factory_address BYTEA,
+    creation_selector BYTEA,
     child_address BYTEA NOT NULL,
     block_number BIGINT NOT NULL,
     UNIQUE (child_address)
@@ -891,6 +977,16 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
         .execute(db.pool())
         .await
         .wrap_err("failed to create _sieve_factory_children")?;
+
+    // Older databases predate factory identity tracking — add the
+    // identity columns in place (rows stay NULL until bound explicitly).
+    sqlx::raw_sql(
+        "ALTER TABLE _sieve_factory_children ADD COLUMN IF NOT EXISTS factory_address BYTEA;\n\
+         ALTER TABLE _sieve_factory_children ADD COLUMN IF NOT EXISTS creation_selector BYTEA",
+    )
+    .execute(db.pool())
+    .await
+    .wrap_err("failed to add factory identity columns")?;
 
     sqlx::raw_sql(&format!("{CHAIN_IDENTITY_DDL};"))
         .execute(db.pool())
@@ -1265,6 +1361,150 @@ mod tests {
             child_contract_name: name.to_owned(),
             start_block,
         })
+    }
+
+    /// Build a `FactoryDiscovery` as the scanner would for this factory.
+    fn test_discovery(
+        factory: &crate::toml_config::ResolvedFactory,
+        child: Address,
+        block: u64,
+    ) -> crate::filter::FactoryDiscovery {
+        crate::filter::FactoryDiscovery {
+            child_contract_name: factory.child_contract_name.clone(),
+            factory_address: factory.factory_address,
+            creation_selector: factory.creation_selector,
+            child_address: child,
+            block_number: block,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn factory_children_persist_restart_and_rollback() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_identity_state(&db).await?;
+        sqlx::query("DELETE FROM _sieve_factory_children")
+            .execute(db.pool())
+            .await
+            .wrap_err("clear children failed")?;
+
+        let config = crate::config::usdc_transfer_config()?;
+        let factory = test_factory("USDC", 0)?;
+        let child = Address::repeat_byte(0xC1);
+
+        // Persist a child discovered at block 500, bound to the identity.
+        let mut tx = db.begin().await?;
+        store_factory_child(&mut tx, &test_discovery(&factory, child, 500)).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        // Restart path: loading registers it in-memory.
+        assert_eq!(
+            load_factory_children(&db, &config, std::slice::from_ref(&factory)).await?,
+            1
+        );
+        assert!(config.contract_for_address(&child).is_some());
+
+        // A DIFFERENT factory identity with the same display name must
+        // never inherit the persisted children.
+        let impostor = test_factory_at(0xFB, "USDC", 0)?;
+        let result = load_factory_children(&db, &config, std::slice::from_ref(&impostor)).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("DIFFERENT factory identity"));
+
+        // Reorg rollback below the discovery removes and unregisters it.
+        let mut tx = db.begin().await?;
+        let removed = rollback_factory_children(&mut tx, BlockNumber::new(400), &config).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+        assert_eq!(removed, vec![child]);
+        assert!(config.contract_for_address(&child).is_none());
+        assert_eq!(
+            load_factory_children(&db, &config, std::slice::from_ref(&factory)).await?,
+            0
+        );
+
+        reset_identity_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn load_factory_children_unknown_name_is_fatal() -> eyre::Result<()> {
+        let db = test_db().await?;
+        sqlx::query("DELETE FROM _sieve_factory_children")
+            .execute(db.pool())
+            .await
+            .wrap_err("clear children failed")?;
+
+        let config = crate::config::usdc_transfer_config()?;
+        let gone = test_factory("RenamedAway", 0)?;
+        let mut tx = db.begin().await?;
+        store_factory_child(
+            &mut tx,
+            &test_discovery(&gone, Address::repeat_byte(0xC2), 10),
+        )
+        .await?;
+        tx.commit().await.wrap_err("commit failed")?;
+
+        let current = test_factory("USDC", 0)?;
+        let result = load_factory_children(&db, &config, std::slice::from_ref(&current)).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("RenamedAway"));
+
+        sqlx::query("DELETE FROM _sieve_factory_children")
+            .execute(db.pool())
+            .await
+            .wrap_err("cleanup failed")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn legacy_children_bound_on_adoption() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_coverage_state(&db).await?;
+        sqlx::query("DELETE FROM _sieve_factory_children")
+            .execute(db.pool())
+            .await
+            .wrap_err("clear children failed")?;
+
+        let config = crate::config::usdc_transfer_config()?;
+        let factory = test_factory("USDC", 0)?;
+
+        // Simulate a pre-identity-tracking row: no identity columns.
+        sqlx::query(
+            "INSERT INTO _sieve_factory_children (factory_name, child_address, block_number) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind("USDC")
+        .bind(Address::repeat_byte(0xC3).as_slice())
+        .bind(100_i64)
+        .execute(db.pool())
+        .await
+        .wrap_err("insert legacy child failed")?;
+
+        // Unbound legacy rows refuse to load and point at the flag.
+        let result = load_factory_children(&db, &config, std::slice::from_ref(&factory)).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("assume-factory-coverage"));
+
+        // A real legacy database has an advanced checkpoint (that is what
+        // forces the operator through the flag in the first place).
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 1000 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("set checkpoint failed")?;
+
+        // Adoption binds them to the asserted identity; loading then works.
+        ensure_factory_coverage(&db, std::slice::from_ref(&factory), 0, true).await?;
+        assert_eq!(
+            load_factory_children(&db, &config, std::slice::from_ref(&factory)).await?,
+            1
+        );
+
+        sqlx::query("DELETE FROM _sieve_factory_children")
+            .execute(db.pool())
+            .await
+            .wrap_err("cleanup failed")?;
+        reset_coverage_state(&db).await
     }
 
     /// Clear coverage rows and identity state before/after a coverage test.

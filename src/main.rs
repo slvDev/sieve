@@ -295,7 +295,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
     );
 
     if !startup.factories.is_empty() {
-        db::load_factory_children(db, &index_config).await?;
+        db::load_factory_children(db, &index_config, &startup.factories).await?;
     }
     let factories = Arc::new(startup.factories);
 

@@ -16,6 +16,7 @@ use alloy_consensus::transaction::TxHashRef;
 use alloy_consensus::TxReceipt;
 use alloy_dyn_abi::{DynSolValue, EventExt};
 use alloy_primitives::{Address, BloomInput, Log, LogData, B256};
+use eyre::WrapErr;
 use reth_primitives_traits::Header;
 use std::collections::HashMap;
 use tracing::{debug, warn};
@@ -159,10 +160,17 @@ pub fn filter_block<C: ChainTypes>(
 // ── Factory discovery ────────────────────────────────────────────────
 
 /// A discovered factory-created child contract.
+///
+/// Carries the full factory identity so the child is persisted bound to
+/// the exact factory that discovered it — never just a display name.
 #[derive(Debug)]
 pub struct FactoryDiscovery {
     /// Name of the child contract (for handler/table lookup).
     pub child_contract_name: String,
+    /// On-chain address of the factory that emitted the creation event.
+    pub factory_address: Address,
+    /// Topic0 selector of the creation event.
+    pub creation_selector: B256,
     /// Address of the newly created child contract.
     pub child_address: Address,
     /// Block number where the creation event was emitted.
@@ -171,24 +179,43 @@ pub struct FactoryDiscovery {
 
 /// Scan a block's logs for factory creation events.
 ///
-/// Returns discovered child addresses. Zero overhead if `factories` is empty.
-#[must_use]
+/// Returns discovered child addresses. Zero overhead if `factories` is
+/// empty. Factories whose `start_block` is above this block are skipped —
+/// discovery must not begin before the configured start, and the coverage
+/// registry only certifies ranges from `start_block` onward.
+///
+/// FAIL-CLOSED: once a log matches a factory's address and creation
+/// selector, it IS a creation event — a decode or extraction failure
+/// means a child may exist that cannot be registered, so the scan errors
+/// (aborting the run) instead of advancing coverage past it.
+///
+/// # Errors
+///
+/// Returns an error if a matching creation log cannot be decoded.
 pub fn scan_factory_events<C: ChainTypes>(
     payload: &BlockPayload<C>,
     factories: &[ResolvedFactory],
-) -> Vec<FactoryDiscovery> {
+) -> eyre::Result<Vec<FactoryDiscovery>> {
     if factories.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    let block_number = payload.header().number;
 
-    // Build lookup: (factory_address, creation_selector) → &ResolvedFactory
+    // Build lookup: (factory_address, creation_selector) → &ResolvedFactory.
+    // Config resolution rejects duplicate keys, so entries never collide.
     let mut lookup: HashMap<(Address, B256), &ResolvedFactory> =
         HashMap::with_capacity(factories.len());
     for factory in factories {
+        if block_number < factory.start_block {
+            continue;
+        }
         lookup.insert(
             (factory.factory_address, factory.creation_selector),
             factory,
         );
+    }
+    if lookup.is_empty() {
+        return Ok(Vec::new());
     }
 
     let mut discoveries = Vec::new();
@@ -204,28 +231,43 @@ pub fn scan_factory_events<C: ChainTypes>(
                 continue;
             };
 
-            if let Some(child_addr) = decode_child_address(log, factory) {
-                debug!(
-                    factory = %factory.child_contract_name,
-                    child = ?child_addr,
-                    block = payload.header().number,
-                    "discovered factory child"
-                );
-                discoveries.push(FactoryDiscovery {
-                    child_contract_name: factory.child_contract_name.clone(),
-                    child_address: child_addr,
-                    block_number: payload.header().number,
-                });
-            }
+            let child_addr = decode_child_address(log, factory).wrap_err_with(|| {
+                format!(
+                    "creation event for factory \"{}\" at block {block_number} matched \
+                     address {} and selector but could not be decoded; a child contract may \
+                     exist that cannot be registered, so the run must not continue",
+                    factory.child_contract_name, factory.factory_address,
+                )
+            })?;
+            debug!(
+                factory = %factory.child_contract_name,
+                child = ?child_addr,
+                block = block_number,
+                "discovered factory child"
+            );
+            discoveries.push(FactoryDiscovery {
+                child_contract_name: factory.child_contract_name.clone(),
+                factory_address: factory.factory_address,
+                creation_selector: factory.creation_selector,
+                child_address: child_addr,
+                block_number,
+            });
         }
     }
 
-    discoveries
+    Ok(discoveries)
 }
 
 /// Decode a creation log to extract the child contract address.
-fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> Option<Address> {
-    let decoded = factory.creation_event.decode_log(&log.data).ok()?;
+///
+/// Fail-closed: every failure mode is an error, never a silent skip —
+/// the caller aborts the run so coverage cannot certify a block whose
+/// creation event was unreadable.
+fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> eyre::Result<Address> {
+    let decoded = factory
+        .creation_event
+        .decode_log(&log.data)
+        .map_err(|err| eyre::eyre!("log does not decode against the configured ABI: {err}"))?;
 
     // Search indexed params first, then body params
     for (i, input) in factory.creation_event.inputs.iter().enumerate() {
@@ -240,7 +282,7 @@ fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> Option
                     .filter(|p| p.indexed)
                     .count()
                     - 1;
-                decoded.indexed.get(indexed_pos)?
+                decoded.indexed.get(indexed_pos)
             } else {
                 // Find position among body params
                 let body_pos = factory
@@ -251,16 +293,29 @@ fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> Option
                     .filter(|p| !p.indexed)
                     .count()
                     - 1;
-                decoded.body.get(body_pos)?
+                decoded.body.get(body_pos)
             };
+            let value = value.ok_or_else(|| {
+                eyre::eyre!(
+                    "decoded event is missing a value for param \"{}\"",
+                    factory.child_address_param
+                )
+            })?;
 
             if let DynSolValue::Address(addr) = value {
-                return Some(*addr);
+                return Ok(*addr);
             }
+            return Err(eyre::eyre!(
+                "param \"{}\" decoded to a non-address value",
+                factory.child_address_param
+            ));
         }
     }
 
-    None
+    Err(eyre::eyre!(
+        "param \"{}\" is not among the creation event's inputs",
+        factory.child_address_param
+    ))
 }
 
 #[cfg(test)]
@@ -536,7 +591,7 @@ mod tests {
             withdrawals: None,
         };
         let payload = BlockPayload::<EthereumChain>::new(header, body, vec![]);
-        let discoveries = scan_factory_events(&payload, &[]);
+        let discoveries = scan_factory_events(&payload, &[]).unwrap_or_default();
         assert!(discoveries.is_empty());
     }
 
@@ -588,11 +643,128 @@ mod tests {
         };
         let payload = BlockPayload::<EthereumChain>::new(header, body, vec![receipt]);
 
-        let discoveries = scan_factory_events(&payload, &[factory]);
+        let discoveries = scan_factory_events(&payload, std::slice::from_ref(&factory))?;
         assert_eq!(discoveries.len(), 1);
         assert_eq!(discoveries[0].child_address, child_addr);
         assert_eq!(discoveries[0].child_contract_name, "UniswapV3Pool");
+        assert_eq!(discoveries[0].factory_address, factory.factory_address);
+        assert_eq!(discoveries[0].creation_selector, factory.creation_selector);
         assert_eq!(discoveries[0].block_number, 12_369_700);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_factory_events_fails_closed_on_undecodable_match() -> eyre::Result<()> {
+        let abi_json = r#"[
+            {"anonymous":false,"inputs":[
+                {"indexed":true,"internalType":"address","name":"pool","type":"address"}
+            ],"name":"PoolCreated","type":"event"}
+        ]"#;
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(abi_json).map_err(|e| eyre::eyre!("parse: {e}"))?;
+        let creation_event = abi
+            .events
+            .get("PoolCreated")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no PoolCreated event"))?;
+
+        let factory_addr = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
+        let factory = ResolvedFactory {
+            factory_address: factory_addr,
+            creation_event: creation_event.clone(),
+            creation_selector: creation_event.selector(),
+            child_address_param: "pool".to_string(),
+            child_contract_name: "UniswapV3Pool".to_string(),
+            start_block: 0,
+        };
+
+        // Address and selector match, but the expected indexed child topic
+        // is missing — the log cannot be a decodable creation event. That
+        // must abort, never silently skip.
+        let log = make_log(factory_addr, vec![creation_event.selector()], Bytes::new());
+        let receipt = make_receipt(vec![log]);
+        let payload = BlockPayload::<EthereumChain>::new(
+            Header {
+                number: 100,
+                ..Default::default()
+            },
+            BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: None,
+            },
+            vec![receipt],
+        );
+
+        let result = scan_factory_events(&payload, &[factory]);
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("could not be decoded"));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_factory_events_respects_start_block() -> eyre::Result<()> {
+        let abi_json = r#"[
+            {"anonymous":false,"inputs":[
+                {"indexed":true,"internalType":"address","name":"pool","type":"address"}
+            ],"name":"PoolCreated","type":"event"}
+        ]"#;
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(abi_json).map_err(|e| eyre::eyre!("parse: {e}"))?;
+        let creation_event = abi
+            .events
+            .get("PoolCreated")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no PoolCreated event"))?;
+
+        let factory_addr = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
+        let child_addr = address!("8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8");
+
+        let factory = ResolvedFactory {
+            factory_address: factory_addr,
+            creation_event: creation_event.clone(),
+            creation_selector: creation_event.selector(),
+            child_address_param: "pool".to_string(),
+            child_contract_name: "UniswapV3Pool".to_string(),
+            start_block: 12_369_621,
+        };
+
+        let child_topic = B256::left_padding_from(child_addr.as_slice());
+        let log = make_log(
+            factory_addr,
+            vec![creation_event.selector(), child_topic],
+            Bytes::new(),
+        );
+        let receipt = make_receipt(vec![log]);
+
+        // A matching creation event BEFORE the factory's start_block must
+        // not be discovered — scanning begins at start_block.
+        let header = Header {
+            number: 12_369_620,
+            ..Default::default()
+        };
+        let body = BlockBody {
+            transactions: vec![],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![receipt.clone()]);
+        assert!(scan_factory_events(&payload, std::slice::from_ref(&factory))?.is_empty());
+
+        // Exactly AT start_block it is discovered.
+        let header = Header {
+            number: 12_369_621,
+            ..Default::default()
+        };
+        let body = BlockBody {
+            transactions: vec![],
+            ommers: vec![],
+            withdrawals: None,
+        };
+        let payload = BlockPayload::<EthereumChain>::new(header, body, vec![receipt]);
+        let discoveries = scan_factory_events(&payload, &[factory])?;
+        assert_eq!(discoveries.len(), 1);
+        assert_eq!(discoveries[0].block_number, 12_369_621);
         Ok(())
     }
 

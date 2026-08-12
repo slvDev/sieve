@@ -236,6 +236,8 @@ event = "PoolCreated"
 param = "pool"
 ```
 
+Sieve tracks which block ranges each factory was active for. Adding a factory to a database already indexed past its `start_block`, lowering its `start_block`, changing its creation event or `param`, starting sync past its uncovered range, or re-adding a factory that was removed while indexing continued would all silently miss children or their events -- Sieve refuses to start instead and tells you to use a fresh database or `sieve reset`. When upgrading a database created before coverage tracking, run once with `--assume-factory-coverage` to record the current state as covered; it only applies to factories with no coverage record (asserting they were configured continuously) -- every other refusal stands.
+
 ### Receipt Context Fields
 
 `include_receipts = true` on a contract or transfer auto-adds these columns:

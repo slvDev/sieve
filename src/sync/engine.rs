@@ -374,7 +374,7 @@ pub async fn run_sync<C: ChainTypes>(
     let stats = match (consumer_result, worker_failure) {
         (Ok(stats), None) => stats,
         (Err(err), _) | (Ok(_), Some(err)) => {
-            return Err(finish_rejected_run(&ctx.db, &ctx.config, err).await);
+            return Err(finish_rejected_run(&ctx.db, &ctx.config, &ctx.factories, err).await);
         }
     };
 
@@ -971,7 +971,16 @@ async fn run_sequencer<C: ChainTypes>(
         for item in std::mem::take(&mut ready) {
             let out = match item {
                 FetchItem::Payload(payload) => {
-                    let factory_discoveries = scan_and_register(&payload, &config, &factories);
+                    // FAIL-CLOSED: an undecodable matching creation event
+                    // aborts the run — coverage must not advance past it.
+                    let factory_discoveries = match scan_and_register(&payload, &config, &factories)
+                    {
+                        Ok(discoveries) => discoveries,
+                        Err(err) => {
+                            let _ = abort_tx.send(true);
+                            return Err(err);
+                        }
+                    };
                     OrderedItem::Payload {
                         payload,
                         factory_discoveries,
@@ -1217,12 +1226,12 @@ fn scan_and_register<C: ChainTypes>(
     payload: &BlockPayload<C>,
     config: &IndexConfig,
     factories: &[ResolvedFactory],
-) -> Vec<filter::FactoryDiscovery> {
-    let discoveries = filter::scan_factory_events(payload, factories);
+) -> eyre::Result<Vec<filter::FactoryDiscovery>> {
+    let discoveries = filter::scan_factory_events(payload, factories)?;
     for discovery in &discoveries {
         register_factory_child_in_memory(config, discovery);
     }
-    discoveries
+    Ok(discoveries)
 }
 
 /// Register a factory child in-memory only (no DB write).
@@ -1416,9 +1425,10 @@ async fn join_pipeline_stages(
 async fn finish_rejected_run(
     db: &Database,
     config: &IndexConfig,
+    factories: &[ResolvedFactory],
     err: eyre::Report,
 ) -> eyre::Report {
-    match db::rebuild_factory_children(db, config).await {
+    match db::rebuild_factory_children(db, config, factories).await {
         Ok(children) => {
             debug!(
                 children,
@@ -1633,10 +1643,10 @@ async fn prepare_block_outcome<'a, C: ChainTypes>(
 ) -> eyre::Result<ProcessOutcome> {
     // Block hashes are batched in flush_batch_inner via store_block_hashes_batch.
 
-    // Persist factory discoveries within the batch transaction
+    // Persist factory discoveries within the batch transaction, bound to
+    // the full factory identity that discovered them.
     for d in &block.factory_discoveries {
-        db::store_factory_child(tx, &d.child_contract_name, &d.child_address, d.block_number)
-            .await?;
+        db::store_factory_child(tx, d).await?;
     }
 
     let mut stored_count = 0u64;
@@ -2525,7 +2535,7 @@ mod tests {
         // 100's child happens before block 101 is filtered.
         let mut matched_in_child_block = 0;
         for payload in &ready {
-            let disc = scan_and_register(payload, &config, std::slice::from_ref(&factory));
+            let disc = scan_and_register(payload, &config, std::slice::from_ref(&factory))?;
             if payload.header().number == 100 {
                 assert_eq!(disc.len(), 1, "block 100 must discover the child");
                 assert!(
