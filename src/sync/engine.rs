@@ -323,6 +323,7 @@ pub async fn run_sync<C: ChainTypes>(
     let consumer_handle = tokio::spawn(consume_payloads(
         processed_rx,
         Arc::clone(&ctx.config),
+        Arc::clone(&ctx.factories),
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.handlers),
         Arc::clone(&ctx.metrics),
@@ -996,6 +997,7 @@ async fn run_sequencer<C: ChainTypes>(
 async fn consume_payloads<C: ChainTypes>(
     mut processed_rx: mpsc::Receiver<ProcessedItem<C>>,
     config: Arc<IndexConfig>,
+    factories: Arc<Vec<ResolvedFactory>>,
     db: Arc<Database>,
     handlers: Arc<HandlerRegistry>,
     metrics: Arc<SieveMetrics>,
@@ -1019,6 +1021,7 @@ async fn consume_payloads<C: ChainTypes>(
     let mut max_indexed_block: u64 = 0;
     let mut batch: Vec<ProcessedItem<C>> = Vec::with_capacity(BATCH_SIZE);
     let mut reorder = ReorderBuffer::new(start_block);
+    let coverage_keys = db::FactoryCoverageKeys::new(&factories);
 
     let ctx = ProcessContext {
         config: &config,
@@ -1029,6 +1032,7 @@ async fn consume_payloads<C: ChainTypes>(
         event_table_map: &event_table_map,
         has_streams: stream_dispatcher.is_some(),
         receipt_tables: &receipt_tables,
+        coverage_keys: &coverage_keys,
     };
 
     loop {
@@ -1134,6 +1138,8 @@ struct ProcessContext<'a> {
     has_streams: bool,
     /// Table names with `include_receipts = true` (for streaming enrichment).
     receipt_tables: &'a HashSet<String>,
+    /// Configured factory identities whose coverage advances with the checkpoint.
+    coverage_keys: &'a db::FactoryCoverageKeys,
 }
 
 /// Log sync progress every 2 seconds.
@@ -1596,9 +1602,13 @@ async fn flush_batch_inner<C: ChainTypes>(
             .await?;
     }
 
-    // Phase 3: checkpoint (contiguous prefix only) + commit
+    // Phase 3: checkpoint (contiguous prefix only) + commit. Factory
+    // coverage advances in the same transaction so it always matches
+    // what the checkpoint claims was indexed with these factories active.
     if let Some(checkpoint) = checkpoint_to {
         db::update_checkpoint(&mut tx, BlockNumber::new(checkpoint)).await?;
+        db::advance_factory_coverage(&mut tx, ctx.coverage_keys, BlockNumber::new(checkpoint))
+            .await?;
     }
 
     tx.commit()

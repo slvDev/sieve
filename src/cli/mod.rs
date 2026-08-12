@@ -5,6 +5,10 @@ use clap::{Parser, Subcommand};
 /// Ethereum event indexer over P2P.
 #[derive(Debug, Parser)]
 #[command(name = "sieve", version, about = "Ethereum event indexer over P2P")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI flags are naturally independent booleans"
+)]
 pub struct Cli {
     /// Path to the TOML config file.
     #[arg(long, default_value = "sieve.toml", global = true)]
@@ -37,6 +41,15 @@ pub struct Cli {
     /// Drop and recreate all tables before indexing. Use to start fresh.
     #[arg(long)]
     pub fresh: bool,
+
+    /// Record factories that have no coverage record as covered through
+    /// the current checkpoint, instead of refusing to start. Use once
+    /// when upgrading a database created before factory coverage
+    /// tracking, and only if the factory was configured continuously
+    /// since its start_block. Recorded coverage gaps and identity
+    /// changes are still refused.
+    #[arg(long)]
+    pub assume_factory_coverage: bool,
 
     /// Enable verbose tracing output (default: pretty UI).
     #[arg(short = 'v', long)]
@@ -171,6 +184,20 @@ mod tests {
     fn fresh_flag_parsed() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["sieve", "--fresh"])?;
         assert!(cli.fresh);
+        Ok(())
+    }
+
+    #[test]
+    fn assume_factory_coverage_defaults_to_false() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve"])?;
+        assert!(!cli.assume_factory_coverage);
+        Ok(())
+    }
+
+    #[test]
+    fn assume_factory_coverage_flag_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "--assume-factory-coverage"])?;
+        assert!(cli.assume_factory_coverage);
         Ok(())
     }
 

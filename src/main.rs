@@ -149,6 +149,19 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     // them (an interrupted pre-contiguity run may have left some behind).
     prune_beyond_checkpoint(&db, &startup).await?;
 
+    // Refuse factory configurations whose history this database has not
+    // actually covered — their creation events would silently never be
+    // scanned. --assume-factory-coverage adopts factories with no
+    // coverage record (the upgrade path for databases from before
+    // coverage tracking); every other refusal stands.
+    db::ensure_factory_coverage(
+        &db,
+        &startup.factories,
+        startup.start_block.as_u64(),
+        cli.assume_factory_coverage,
+    )
+    .await?;
+
     // Metrics
     let metrics = Arc::new(metrics::SieveMetrics::new());
 

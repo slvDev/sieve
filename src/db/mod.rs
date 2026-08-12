@@ -12,14 +12,14 @@
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
 use crate::config::IndexConfig;
-use crate::toml_config::{ResolvedCall, ResolvedEvent, ResolvedTransfer};
+use crate::toml_config::{ResolvedCall, ResolvedEvent, ResolvedFactory, ResolvedTransfer};
 use crate::types::BlockNumber;
 use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
 
 /// PostgreSQL database wrapper.
 #[derive(Debug)]
@@ -242,6 +242,15 @@ pub async fn rollback_to(
         .await
         .wrap_err("failed to reset checkpoint after rollback")?;
 
+    // Factory coverage may never claim blocks the checkpoint does not.
+    // Clamp every row — lowering inactive factories' coverage too is
+    // always conservative.
+    sqlx::query("UPDATE _sieve_factories SET covered_through = LEAST(covered_through, $1)")
+        .bind(block_number.as_u64() as i64)
+        .execute(&mut **tx)
+        .await
+        .wrap_err("failed to clamp factory coverage after rollback")?;
+
     Ok(())
 }
 
@@ -273,6 +282,295 @@ pub async fn load_factory_children(db: &Database, config: &IndexConfig) -> eyre:
         info!(count, "loaded factory children from database");
     }
     Ok(count)
+}
+
+/// Validate that every configured factory's history is actually covered
+/// by this database, and record coverage rows for new factories.
+///
+/// Coverage is keyed by factory identity — address, creation-event
+/// selector, and child contract name — not display name, and tracks
+/// `covered_through`: the highest block indexed while the factory was
+/// active. Startup refuses any factory whose creation events could have
+/// been skipped:
+///
+/// - an identity new to a database already indexed to or past the
+///   factory's `start_block` (resume continues one past the checkpoint,
+///   so "to" is a gap too),
+/// - a known factory whose `start_block` changed in either direction
+///   (immutable: lowering leaves earlier creation events unscanned,
+///   raising breaks reorg rediscovery below the new start),
+/// - a known factory whose extraction rule changed — the full creation
+///   event layout (names, types, `indexed` flags) plus selected
+///   parameter, not just the selector (which hashes types only),
+/// - a known factory that was inactive while the checkpoint advanced
+///   into its range (removed and later re-added) — that range is missing
+///   both creation events AND events from already-known children, so it
+///   cannot be asserted away,
+/// - a sync that would begin past the factory's next uncovered block
+///   (e.g. a `--start-block` override jumping over the factory's range),
+///   which would otherwise let `covered_through` certify skipped blocks.
+///
+/// `configured_start` is the block sync will begin at before checkpoint
+/// resume (CLI override or config minimum).
+///
+/// With `assume_coverage` (`--assume-factory-coverage`), ONLY the
+/// missing-record refusal is downgraded to a recorded assertion: the
+/// factory is marked covered through the current checkpoint. This is the
+/// explicit upgrade path for databases created before coverage tracking,
+/// where the operator asserts the factory was configured continuously
+/// since its `start_block`. Every other refusal stands regardless of the
+/// flag.
+///
+/// # Errors
+///
+/// Returns an error on a coverage gap or query failure.
+pub async fn ensure_factory_coverage(
+    db: &Database,
+    factories: &[ResolvedFactory],
+    configured_start: u64,
+    assume_coverage: bool,
+) -> eyre::Result<()> {
+    if factories.is_empty() {
+        return Ok(());
+    }
+    let checkpoint_opt = db.last_checkpoint().await?;
+    let checkpoint = checkpoint_opt.map_or(0, BlockNumber::as_u64);
+    let prior_state = has_prior_sieve_state(db).await?;
+    // Mirror of `resolve_effective_start`: the first block this run will
+    // actually process.
+    let sync_start = match checkpoint_opt {
+        Some(cp) if cp.as_u64() >= configured_start => cp.as_u64().saturating_add(1),
+        _ => configured_start,
+    };
+
+    for factory in factories {
+        check_factory_coverage(
+            db,
+            factory,
+            checkpoint,
+            prior_state,
+            sync_start,
+            assume_coverage,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Refuse a sync that would begin past the factory's next uncovered block.
+///
+/// `covered_through` only ever advances to the committed checkpoint, so if
+/// the run starts beyond `max(start_block, covered_through + 1)` the
+/// skipped range would be certified as covered without ever being scanned.
+fn check_sync_start(
+    factory: &ResolvedFactory,
+    covered_through: u64,
+    sync_start: u64,
+) -> eyre::Result<()> {
+    let required_next = factory.start_block.max(covered_through.saturating_add(1));
+    if sync_start > required_next {
+        return Err(eyre::eyre!(
+            "factory \"{}\": sync would begin at block {sync_start}, skipping blocks \
+             {required_next}..={} that the factory has not covered; creation events there \
+             would never be scanned — lower --start-block (or the configured start_blocks) so \
+             sync begins at or before block {required_next}, or use a fresh database",
+            factory.child_contract_name,
+            sync_start.saturating_sub(1),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one factory against its stored coverage row, inserting the
+/// row when the identity is new. See [`ensure_factory_coverage`].
+async fn check_factory_coverage(
+    db: &Database,
+    factory: &ResolvedFactory,
+    checkpoint: u64,
+    prior_state: bool,
+    sync_start: u64,
+    assume_coverage: bool,
+) -> eyre::Result<()> {
+    let row: Option<(String, i64, i64)> = sqlx::query_as(
+        "SELECT extraction_fingerprint, start_block, covered_through FROM _sieve_factories \
+         WHERE factory_address = $1 AND creation_selector = $2 AND child_contract_name = $3",
+    )
+    .bind(factory.factory_address.as_slice())
+    .bind(factory.creation_selector.as_slice())
+    .bind(&factory.child_contract_name)
+    .fetch_optional(db.pool())
+    .await
+    .wrap_err("failed to read factory coverage")?;
+
+    let Some((stored_fingerprint, stored_start, covered_through)) = row else {
+        // A new row starts covered through the checkpoint.
+        check_sync_start(factory, checkpoint, sync_start)?;
+        return register_new_factory(db, factory, checkpoint, prior_state, assume_coverage).await;
+    };
+
+    let fingerprint = factory.extraction_fingerprint();
+    if stored_fingerprint != fingerprint {
+        return Err(eyre::eyre!(
+            "factory \"{}\": the child-extraction rule changed from \"{stored_fingerprint}\" \
+             to \"{fingerprint}\"; children persisted under the old rule may be wrong and \
+             past blocks were scanned with different extraction — use a fresh database or run \
+             `sieve reset`",
+            factory.child_contract_name,
+        ));
+    }
+    if (factory.start_block as i64) != stored_start {
+        return Err(eyre::eyre!(
+            "factory \"{}\": start_block changed from {stored_start} to {}; start_block is \
+             immutable for an indexed factory — lowering would leave earlier creation events \
+             unscanned, and raising would stop reorg recovery from rediscovering children \
+             created below the new start — use a fresh database or run `sieve reset`",
+            factory.child_contract_name,
+            factory.start_block,
+        ));
+    }
+    let covered_through = u64::try_from(covered_through).unwrap_or(0);
+    if checkpoint > covered_through && checkpoint >= factory.start_block {
+        let gap_start = factory.start_block.max(covered_through.saturating_add(1));
+        return Err(eyre::eyre!(
+            "factory \"{}\": this database advanced to block {checkpoint} while the factory \
+             was not active (coverage ends at block {covered_through}); blocks \
+             {gap_start}..={checkpoint} are missing both creation events and events from \
+             already-known children, and cannot be backfilled — use a fresh database or run \
+             `sieve reset`",
+            factory.child_contract_name,
+        ));
+    }
+    check_sync_start(factory, covered_through, sync_start)
+}
+
+/// Insert the coverage row for a factory identity seen for the first time.
+///
+/// Refused when the database has already indexed to or into the factory's
+/// range, unless the operator asserts coverage with
+/// `--assume-factory-coverage`. The row always carries the CURRENT
+/// config's identity fields — there is no stored state to overwrite.
+async fn register_new_factory(
+    db: &Database,
+    factory: &ResolvedFactory,
+    checkpoint: u64,
+    prior_state: bool,
+    assume_coverage: bool,
+) -> eyre::Result<()> {
+    if prior_state && checkpoint >= factory.start_block {
+        if !assume_coverage {
+            return Err(eyre::eyre!(
+                "factory \"{}\" (factory {}, event \"{}\") has no coverage record, but this \
+                 database is already indexed to block {checkpoint} and the factory starts at \
+                 block {}; creation events in blocks {}..={checkpoint} were never scanned, so \
+                 existing children would be silently missing — use a fresh database, run \
+                 `sieve reset`, or rerun once with --assume-factory-coverage if this factory \
+                 was in fact indexed continuously (e.g. a database from before coverage \
+                 tracking)",
+                factory.child_contract_name,
+                factory.factory_address,
+                factory.creation_event.name,
+                factory.start_block,
+                factory.start_block,
+            ));
+        }
+        warn!(
+            factory = %factory.child_contract_name,
+            covered_through = checkpoint,
+            "recording assumed factory coverage (--assume-factory-coverage)"
+        );
+    }
+    sqlx::query(
+        "INSERT INTO _sieve_factories (factory_address, creation_selector, \
+         child_contract_name, extraction_fingerprint, start_block, covered_through) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(factory.factory_address.as_slice())
+    .bind(factory.creation_selector.as_slice())
+    .bind(&factory.child_contract_name)
+    .bind(factory.extraction_fingerprint())
+    .bind(factory.start_block as i64)
+    .bind(checkpoint as i64)
+    .execute(db.pool())
+    .await
+    .wrap_err("failed to record factory coverage")?;
+    Ok(())
+}
+
+/// Bind-ready identity keys for the configured factories, precomputed
+/// once so every batch commit can advance coverage without re-deriving
+/// them.
+#[derive(Debug, Default)]
+pub struct FactoryCoverageKeys {
+    addresses: Vec<Vec<u8>>,
+    selectors: Vec<Vec<u8>>,
+    names: Vec<String>,
+}
+
+impl FactoryCoverageKeys {
+    /// Build identity keys from the resolved factory configs.
+    #[must_use]
+    pub fn new(factories: &[ResolvedFactory]) -> Self {
+        Self {
+            addresses: factories
+                .iter()
+                .map(|f| f.factory_address.as_slice().to_vec())
+                .collect(),
+            selectors: factories
+                .iter()
+                .map(|f| f.creation_selector.as_slice().to_vec())
+                .collect(),
+            names: factories
+                .iter()
+                .map(|f| f.child_contract_name.clone())
+                .collect(),
+        }
+    }
+
+    /// Whether no factories are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+}
+
+/// Advance `covered_through` for the given factory identities.
+///
+/// Must run inside the same transaction as [`update_checkpoint`]: a
+/// checkpoint advance while a factory is active has to advance its
+/// coverage atomically, otherwise a later restart would misread the
+/// factory as having been inactive over those blocks. Rows not named in
+/// `keys` (factories removed from the config) deliberately stay behind —
+/// that widening gap is what makes a later re-add refusable. Uses
+/// `GREATEST` (like the checkpoint) so it never moves backward here;
+/// rollbacks lower it via [`rollback_to`].
+///
+/// # Errors
+///
+/// Returns an error if the UPDATE query fails.
+pub async fn advance_factory_coverage(
+    tx: &mut Transaction<'_, Postgres>,
+    keys: &FactoryCoverageKeys,
+    block_number: BlockNumber,
+) -> eyre::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE _sieve_factories AS f SET covered_through = GREATEST(f.covered_through, $4) \
+         FROM UNNEST($1::BYTEA[], $2::BYTEA[], $3::TEXT[]) \
+         AS k(factory_address, creation_selector, child_contract_name) \
+         WHERE f.factory_address = k.factory_address \
+           AND f.creation_selector = k.creation_selector \
+           AND f.child_contract_name = k.child_contract_name",
+    )
+    .bind(&keys.addresses)
+    .bind(&keys.selectors)
+    .bind(&keys.names)
+    .bind(block_number.as_u64() as i64)
+    .execute(&mut **tx)
+    .await
+    .wrap_err("failed to advance factory coverage")?;
+    Ok(())
 }
 
 /// Discard all in-memory factory children and reload the committed set.
@@ -477,6 +775,7 @@ pub async fn drop_all_tables(
         "_sieve_checkpoints",
         "_sieve_chain",
         "_sieve_tables",
+        "_sieve_factories",
         "_sqlx_migrations",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
@@ -525,6 +824,28 @@ CREATE TABLE IF NOT EXISTS _sieve_chain (
     id SMALLINT PRIMARY KEY DEFAULT 1,
     chain TEXT NOT NULL,
     genesis_hash BYTEA NOT NULL
+)";
+
+/// DDL for the `_sieve_factories` coverage registry.
+///
+/// One row per factory identity `(factory_address, creation_selector,
+/// child_contract_name)` — the on-chain facts that determine which
+/// children get discovered, not the display name. `covered_through` is
+/// the highest block this database has indexed WITH the factory active;
+/// it advances atomically with every checkpoint update while the factory
+/// is configured and is clamped by rollbacks. Any range the checkpoint
+/// crossed without the factory active is a coverage gap — creation events
+/// there were never scanned — and startup refuses the factory instead of
+/// silently missing children.
+pub const FACTORY_COVERAGE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _sieve_factories (
+    factory_address BYTEA NOT NULL,
+    creation_selector BYTEA NOT NULL,
+    child_contract_name TEXT NOT NULL,
+    extraction_fingerprint TEXT NOT NULL,
+    start_block BIGINT NOT NULL,
+    covered_through BIGINT NOT NULL,
+    PRIMARY KEY (factory_address, creation_selector, child_contract_name)
 )";
 
 /// DDL for the `_sieve_tables` registry of Sieve-owned user tables.
@@ -580,6 +901,11 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
         .execute(db.pool())
         .await
         .wrap_err("failed to create _sieve_tables")?;
+
+    sqlx::raw_sql(&format!("{FACTORY_COVERAGE_DDL};"))
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to create _sieve_factories")?;
 
     info!("internal tables ready");
     Ok(())
@@ -907,6 +1233,241 @@ mod tests {
         ensure_chain_identity(&db, "mainnet", main_genesis).await?;
 
         reset_identity_state(&db).await
+    }
+
+    /// Build a minimal `ResolvedFactory` for coverage tests.
+    fn test_factory(
+        name: &str,
+        start_block: u64,
+    ) -> eyre::Result<crate::toml_config::ResolvedFactory> {
+        test_factory_at(0xFA, name, start_block)
+    }
+
+    /// Like [`test_factory`] but with a chosen factory address byte.
+    fn test_factory_at(
+        addr_byte: u8,
+        name: &str,
+        start_block: u64,
+    ) -> eyre::Result<crate::toml_config::ResolvedFactory> {
+        let abi_json = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"pool","type":"address"}],"name":"PoolCreated","type":"event"}]"#;
+        let abi: alloy_json_abi::JsonAbi =
+            serde_json::from_str(abi_json).map_err(|e| eyre::eyre!("abi parse: {e}"))?;
+        let event = abi
+            .events
+            .get("PoolCreated")
+            .and_then(|v| v.first())
+            .ok_or_else(|| eyre::eyre!("no event"))?;
+        Ok(crate::toml_config::ResolvedFactory {
+            factory_address: Address::repeat_byte(addr_byte),
+            creation_selector: event.selector(),
+            creation_event: event.clone(),
+            child_address_param: "pool".to_owned(),
+            child_contract_name: name.to_owned(),
+            start_block,
+        })
+    }
+
+    /// Clear coverage rows and identity state before/after a coverage test.
+    async fn reset_coverage_state(db: &Database) -> eyre::Result<()> {
+        sqlx::query("DELETE FROM _sieve_factories")
+            .execute(db.pool())
+            .await
+            .wrap_err("clear coverage failed")?;
+        reset_identity_state(db).await
+    }
+
+    /// Advance checkpoint and factory coverage together, as a sync run does.
+    async fn advance_covered(
+        db: &Database,
+        factories: &[crate::toml_config::ResolvedFactory],
+        block: u64,
+    ) -> eyre::Result<()> {
+        let keys = FactoryCoverageKeys::new(factories);
+        let mut tx = db.begin().await?;
+        update_checkpoint(&mut tx, BlockNumber::new(block)).await?;
+        advance_factory_coverage(&mut tx, &keys, BlockNumber::new(block)).await?;
+        tx.commit().await.wrap_err("commit failed")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn factory_coverage_new_factory_rules() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_coverage_state(&db).await?;
+
+        // Fresh database: factory registers fine.
+        let factory = test_factory("Pool", 500)?;
+        ensure_factory_coverage(&db, std::slice::from_ref(&factory), 0, false).await?;
+
+        // Progress with the factory active, then a legitimate restart.
+        advance_covered(&db, std::slice::from_ref(&factory), 1000).await?;
+        ensure_factory_coverage(&db, std::slice::from_ref(&factory), 0, false).await?;
+
+        // NEW factory whose start is below the checkpoint: refused.
+        let late = test_factory("LatePool", 500)?;
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&late), 0, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("never scanned"));
+
+        // NEW factory starting exactly AT the checkpoint: refused too —
+        // resume continues one past the checkpoint.
+        let edge = test_factory("EdgePool", 1000)?;
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&edge), 0, false).await;
+        assert!(result.is_err());
+
+        // NEW factory starting above the checkpoint: fine.
+        let future = test_factory("FuturePool", 1001)?;
+        ensure_factory_coverage(&db, std::slice::from_ref(&future), 0, false).await?;
+
+        // Same name but a different factory address is a DIFFERENT
+        // identity — the stored "Pool" row must not vouch for it.
+        let impostor = test_factory_at(0xFB, "Pool", 500)?;
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&impostor), 0, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("no coverage record"));
+
+        // With the operator's assertion, the new identity is recorded as
+        // covered and later startups pass normally.
+        ensure_factory_coverage(&db, std::slice::from_ref(&impostor), 0, true).await?;
+        ensure_factory_coverage(&db, std::slice::from_ref(&impostor), 0, false).await?;
+
+        reset_coverage_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn factory_coverage_known_factory_rules() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_coverage_state(&db).await?;
+
+        let factory = test_factory("Pool", 500)?;
+        ensure_factory_coverage(&db, std::slice::from_ref(&factory), 0, false).await?;
+        advance_covered(&db, std::slice::from_ref(&factory), 1000).await?;
+
+        // start_block is immutable: lowering AND raising are both refused
+        // (raising would break reorg rediscovery below the new start).
+        let lowered = test_factory("Pool", 100)?;
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&lowered), 0, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("immutable"));
+        let raised = test_factory("Pool", 900)?;
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&raised), 0, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("immutable"));
+
+        // Changing the child-address parameter: refused (fingerprint).
+        let mut reparam = test_factory("Pool", 500)?;
+        reparam.child_address_param = "token0".to_owned();
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&reparam), 0, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("extraction rule changed"));
+
+        // Changing only a parameter's indexed status keeps the selector
+        // AND the param name, but still changes extraction: refused.
+        let mut reindexed = test_factory("Pool", 500)?;
+        for input in &mut reindexed.creation_event.inputs {
+            input.indexed = !input.indexed;
+        }
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&reindexed), 0, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("extraction rule changed"));
+
+        // Checkpoint advancing while the factory was NOT active (removed
+        // from config) leaves a gap: re-adding it is refused — the range
+        // is missing child events too, so the flag cannot bless it.
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 2000 WHERE id = 1")
+            .execute(db.pool())
+            .await
+            .wrap_err("set checkpoint failed")?;
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&factory), 0, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("not active"));
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&factory), 0, true).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("not active"));
+
+        // The flag never blesses identity violations either.
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&lowered), 0, true).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("immutable"));
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&reparam), 0, true).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("extraction rule changed"));
+
+        reset_coverage_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn factory_coverage_sync_start_guard() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_coverage_state(&db).await?;
+
+        // Fresh database, but --start-block jumps past the factory's
+        // start: the skipped range would be falsely certified — refused,
+        // and no coverage row is written.
+        let factory = test_factory("Pool", 500)?;
+        let result = ensure_factory_coverage(&db, std::slice::from_ref(&factory), 800, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("skipping blocks"));
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sieve_factories")
+            .fetch_one(db.pool())
+            .await
+            .wrap_err("count rows failed")?;
+        assert_eq!(rows, 0);
+
+        // Starting at or before the factory's start is fine.
+        ensure_factory_coverage(&db, std::slice::from_ref(&factory), 500, false).await?;
+        advance_covered(&db, std::slice::from_ref(&factory), 1000).await?;
+
+        // A restart whose start override jumps past the covered frontier
+        // (checkpoint 1000 → next uncovered 1001) is refused.
+        let result =
+            ensure_factory_coverage(&db, std::slice::from_ref(&factory), 1500, false).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("skipping blocks"));
+
+        // Starting exactly at the covered frontier is fine.
+        ensure_factory_coverage(&db, std::slice::from_ref(&factory), 1001, false).await?;
+
+        reset_coverage_state(&db).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn factory_coverage_advance_and_rollback() -> eyre::Result<()> {
+        let db = test_db().await?;
+        reset_coverage_state(&db).await?;
+
+        let pool = test_factory("Pool", 0)?;
+        let other = test_factory_at(0xFB, "Other", 0)?;
+        ensure_factory_coverage(&db, &[pool.clone(), other.clone()], 0, false).await?;
+
+        // Advancing only Pool's keys must not touch Other's coverage.
+        advance_covered(&db, std::slice::from_ref(&pool), 900).await?;
+        assert_eq!(covered_through(&db, "Pool").await?, 900);
+        assert_eq!(covered_through(&db, "Other").await?, 0);
+
+        // Rollback clamps every row's coverage to the rollback target.
+        let mut tx = db.begin().await?;
+        rollback_to(&mut tx, BlockNumber::new(300)).await?;
+        tx.commit().await.wrap_err("commit failed")?;
+        assert_eq!(covered_through(&db, "Pool").await?, 300);
+        assert_eq!(covered_through(&db, "Other").await?, 0);
+
+        reset_coverage_state(&db).await
+    }
+
+    /// Read a factory's stored `covered_through` by child contract name.
+    async fn covered_through(db: &Database, name: &str) -> eyre::Result<i64> {
+        let (covered,): (i64,) = sqlx::query_as(
+            "SELECT covered_through FROM _sieve_factories WHERE child_contract_name = $1",
+        )
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .wrap_err("read covered_through failed")?;
+        Ok(covered)
     }
 
     #[tokio::test]
