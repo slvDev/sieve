@@ -81,6 +81,7 @@ async fn main() -> eyre::Result<()> {
             cli::Command::Peers { chain } => match resolve_config_chain(&cli, chain.as_deref())? {
                 chain::ChainKind::Mainnet => cmd_peers::<chain::EthereumChain>().await,
                 chain::ChainKind::Base => cmd_peers::<chain::BaseChain>().await,
+                chain::ChainKind::Optimism => cmd_peers::<chain::OptimismChain>().await,
             },
         };
     }
@@ -179,6 +180,12 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
         chain::ChainKind::Base => {
             let ctx = build_sync_context::<chain::BaseChain>(cli, startup, &db, &metrics, stop_rx)
                 .await?;
+            run_indexer(cli, start_block, ctx).await
+        }
+        chain::ChainKind::Optimism => {
+            let ctx =
+                build_sync_context::<chain::OptimismChain>(cli, startup, &db, &metrics, stop_rx)
+                    .await?;
             run_indexer(cli, start_block, ctx).await
         }
     }

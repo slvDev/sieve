@@ -125,35 +125,40 @@ All of it configured in one TOML file. All of it stored in PostgreSQL. All of it
 
 ### Chains
 
-Sieve indexes Ethereum mainnet by default. Base mainnet is supported too:
+Sieve indexes Ethereum mainnet by default. Base and OP mainnet are
+supported too:
 
 ```toml
-chain = "base"   # top-level key; "mainnet" (default) or "base"
+chain = "base"   # top-level key; "mainnet" (default), "base", or "optimism"
 ```
 
 A database is bound to its chain on first run — reusing a mainnet database
-with `chain = "base"` (or vice versa) is refused so chain state can never
-mix. Use a separate database per chain, or wipe with `sieve reset` /
+with `chain = "base"` (or any other mismatch) is refused so chain state can
+never mix. Use a separate database per chain, or wipe with `sieve reset` /
 `--fresh`.
 
-Base notes:
+OP-stack notes (Base and OP mainnet):
 
-- Blocks arrive over Base's devp2p network directly (no RPC, same as
-  mainnet). Sieve speaks Base's `basev0` peer discovery and follows the
-  sequencer's unsafe head, typically within a block or two (2s blocks).
+- Blocks arrive over the chain's devp2p network directly (no RPC, same as
+  mainnet). Sieve follows the sequencer's unsafe head, typically within a
+  block or two (2s blocks). Base runs its own partitioned `basev0` peer
+  discovery, which Sieve speaks; OP mainnet uses standard discovery.
 - OP-stack deposit transactions (type `0x7E`) are indexed like any other
   transaction: events decode normally, and user deposits with value show
   up in native transfer tables (the sender is the deposit's `from`
   address). The per-block L1-attributes deposit carries no value and is
   skipped by transfer indexing.
-- Most public Base nodes only serve about a month of receipt history.
+- Most public OP-stack nodes only serve about a month of receipt history.
   For deeper backfills, pin an archive node via `trusted_peers` (below);
   Sieve automatically avoids asking peers for history they advertise as
   pruned.
-- Test connectivity without a config: `sieve peers --chain base`.
+- Test connectivity without a config: `sieve peers --chain base` /
+  `sieve peers --chain optimism`.
 - Known limitation: Base's unscheduled "Cobalt" hardfork will introduce a
   new transaction type (`0x79`) and can be activated via L1 signalling.
   When it is scheduled, Sieve will need an update to keep following Base.
+  Similarly, future OP-stack hardforks that change the fork-id require a
+  Sieve update to keep the handshake current.
 
 ```toml
 [p2p]

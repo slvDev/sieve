@@ -20,7 +20,7 @@
 //! fork will add tx type 0x79 and can be activated via L1 signalling
 //! without a client release, which would shift the fork-id.
 
-use super::ChainTypes;
+use super::{op_stack, ChainTypes};
 use alloy_primitives::B256;
 use op_alloy_consensus::{OpPooledTransaction, OpReceipt, OpTxEnvelope};
 use reth_chainspec::{EthereumHardfork, ForkCondition, Hardfork};
@@ -120,40 +120,11 @@ impl ChainTypes for BaseChain {
     }
 
     fn receipts_root(receipts: &[OpReceipt], header: &Header) -> B256 {
-        reth_optimism_consensus::calculate_receipt_root_no_memo_optimism(
-            receipts,
-            Self::chain_spec().as_ref(),
-            header.timestamp,
-        )
+        op_stack::receipts_root(Self::chain_spec().as_ref(), receipts, header)
     }
 
-    /// Fork-aware OP withdrawals validation, mirroring reth's OP consensus
-    /// checks plus field-presence rules:
-    ///
-    /// - pre-Canyon: neither header nor body may carry withdrawals;
-    /// - Canyon→Isthmus: both must be present and the header root must
-    ///   match the body root (both are the empty-withdrawals root on OP);
-    /// - post-Isthmus: both must be present; the header root is repurposed
-    ///   as the `L2ToL1MessagePasser` predeploy storage root (not
-    ///   recomputable from the body), and the body root must be the empty
-    ///   root.
     fn withdrawals_valid(header: &Header, body: &alloy_consensus::BlockBody<OpTxEnvelope>) -> bool {
-        use reth_optimism_forks::OpHardforks;
-
-        let spec = Self::chain_spec();
-        let canyon = spec.is_canyon_active_at_timestamp(header.timestamp);
-        match (header.withdrawals_root, body.calculate_withdrawals_root()) {
-            (Some(header_root), Some(body_root)) => {
-                canyon
-                    && if spec.is_isthmus_active_at_timestamp(header.timestamp) {
-                        body_root == alloy_consensus::constants::EMPTY_ROOT_HASH
-                    } else {
-                        body_root == header_root
-                    }
-            }
-            (None, None) => !canyon,
-            _ => false,
-        }
+        op_stack::withdrawals_valid(Self::chain_spec().as_ref(), header, body)
     }
 
     /// Base discovery: discv4 off, discv5 with the `basev0` packet

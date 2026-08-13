@@ -7,9 +7,12 @@
 
 mod base;
 mod ethereum;
+mod op_stack;
+mod optimism;
 
 pub use base::BaseChain;
 pub use ethereum::EthereumChain;
+pub use optimism::OptimismChain;
 
 use alloy_consensus::{BlockBody, TxReceipt};
 use alloy_primitives::B256;
@@ -28,6 +31,8 @@ pub enum ChainKind {
     Mainnet,
     /// Base mainnet (OP-stack L2).
     Base,
+    /// OP mainnet (OP-stack L2).
+    Optimism,
 }
 
 impl ChainKind {
@@ -37,6 +42,7 @@ impl ChainKind {
         match self {
             Self::Mainnet => EthereumChain::NAME,
             Self::Base => BaseChain::NAME,
+            Self::Optimism => OptimismChain::NAME,
         }
     }
 
@@ -46,6 +52,7 @@ impl ChainKind {
         match self {
             Self::Mainnet => 1,
             Self::Base => 8453,
+            Self::Optimism => 10,
         }
     }
 
@@ -55,6 +62,7 @@ impl ChainKind {
         match self {
             Self::Mainnet => EthereumChain::chain_spec().genesis_hash(),
             Self::Base => BaseChain::chain_spec().genesis_hash(),
+            Self::Optimism => OptimismChain::chain_spec().genesis_hash(),
         }
     }
 
@@ -67,8 +75,9 @@ impl ChainKind {
         match name.to_ascii_lowercase().as_str() {
             "mainnet" | "ethereum" => Ok(Self::Mainnet),
             "base" => Ok(Self::Base),
+            "optimism" | "op" => Ok(Self::Optimism),
             other => Err(eyre::eyre!(
-                "unknown chain \"{other}\" (supported: mainnet, base)"
+                "unknown chain \"{other}\" (supported: mainnet, base, optimism)"
             )),
         }
     }
@@ -151,6 +160,11 @@ mod tests {
             Ok(ChainKind::Mainnet)
         ));
         assert!(matches!(ChainKind::parse("base"), Ok(ChainKind::Base)));
+        assert!(matches!(
+            ChainKind::parse("optimism"),
+            Ok(ChainKind::Optimism)
+        ));
+        assert!(matches!(ChainKind::parse("op"), Ok(ChainKind::Optimism)));
     }
 
     #[test]
