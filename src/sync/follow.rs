@@ -11,7 +11,7 @@ use crate::metrics::SieveMetrics;
 use crate::p2p::{discover_head_p2p, PeerPool};
 use crate::stream::StreamDispatcher;
 use crate::sync::reorg;
-use crate::sync::{run_sync, ReorgCheck, SyncContext};
+use crate::sync::{run_canonical_segments, ReorgCheck, SyncContext};
 use crate::toml_config::ResolvedFactory;
 use crate::types::BlockNumber;
 
@@ -364,7 +364,7 @@ async fn sync_epoch<C: ChainTypes>(
         verbose: ctx.verbose,
     };
 
-    let outcome = run_sync(
+    let outcome = run_canonical_segments(
         BlockNumber::new(next_block),
         BlockNumber::new(head),
         sync_ctx,
@@ -413,7 +413,8 @@ async fn should_rollback_reorg<C: ChainTypes>(
         return Ok(false);
     }
 
-    match reorg::preflight_reorg(db, pool, baseline).await? {
+    let policy = crate::sync::canonical::QuorumPolicy::default();
+    match reorg::preflight_reorg(db, pool, baseline, &policy).await? {
         ReorgCheck::NoReorg => Ok(false),
         ReorgCheck::Inconclusive => {
             debug!("reorg check inconclusive, retrying");
@@ -477,7 +478,11 @@ async fn execute_rollback<C: ChainTypes>(
 }
 
 /// Roll back all indexed data above `ancestor` in one DB transaction.
-async fn rollback_to_ancestor(
+///
+/// Shared by the follow-loop reorg path and the startup reorg-recovery
+/// path — `db::rollback_to` moves the checkpoint AND the verified frontier
+/// atomically, so both callers keep the marker consistent.
+pub async fn rollback_to_ancestor(
     db: &Database,
     handlers: &HandlerRegistry,
     transfer_handlers: &TransferRegistry,

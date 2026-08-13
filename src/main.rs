@@ -166,29 +166,56 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     // Metrics
     let metrics = Arc::new(metrics::SieveMetrics::new());
 
-    // GraphQL API (must be built before resolved_transfers/calls are consumed)
-    maybe_spawn_api(startup.api_port, &startup, &db, &metrics, &stop_rx)?;
-
-    let start_block = startup.start_block;
     match startup.chain {
         chain::ChainKind::Mainnet => {
-            let ctx =
-                build_sync_context::<chain::EthereumChain>(cli, startup, &db, &metrics, stop_rx)
-                    .await?;
-            run_indexer(cli, start_block, ctx).await
+            prepare_and_run::<chain::EthereumChain>(cli, startup, &db, &metrics, stop_rx).await
         }
         chain::ChainKind::Base => {
-            let ctx = build_sync_context::<chain::BaseChain>(cli, startup, &db, &metrics, stop_rx)
-                .await?;
-            run_indexer(cli, start_block, ctx).await
+            prepare_and_run::<chain::BaseChain>(cli, startup, &db, &metrics, stop_rx).await
         }
         chain::ChainKind::Optimism => {
-            let ctx =
-                build_sync_context::<chain::OptimismChain>(cli, startup, &db, &metrics, stop_rx)
-                    .await?;
-            run_indexer(cli, start_block, ctx).await
+            prepare_and_run::<chain::OptimismChain>(cli, startup, &db, &metrics, stop_rx).await
         }
     }
+}
+
+/// Connect peers, verify the committed frontier by quorum (recovering from
+/// a reorg-while-stopped), and only THEN bind the API and run the indexer.
+///
+/// Ordering is a security boundary: the GraphQL API is spawned strictly
+/// after [`sync::verify_or_recover_frontier`], so it can never serve
+/// poisoned or reorged rows during the (possibly minutes-long) quorum
+/// discovery.
+async fn prepare_and_run<C: chain::ChainTypes>(
+    cli: &cli::Cli,
+    startup: StartupConfig,
+    db: &Arc<db::Database>,
+    metrics: &Arc<metrics::SieveMetrics>,
+    stop_rx: watch::Receiver<bool>,
+) -> eyre::Result<()> {
+    // Build the API schema before `startup` is consumed, but do NOT bind
+    // the server yet.
+    let api = build_api_schema(&startup, db)?;
+    let start_block = startup.start_block;
+
+    let ctx = build_sync_context::<C>(cli, startup, db, metrics, stop_rx).await?;
+
+    // Verify committed state (and recover from a reorg while stopped)
+    // BEFORE anything can read it.
+    let policy = sync::canonical::QuorumPolicy::default();
+    sync::verify_or_recover_frontier(&ctx, &policy).await?;
+
+    // An existing database must resume at or below checkpoint + 1; a
+    // configured start ABOVE it would leave an unindexed gap the scalar
+    // checkpoint would then silently advance past.
+    enforce_no_start_gap(&ctx.db, start_block).await?;
+
+    // Frontier verified — now the API may serve.
+    if let Some((port, schema)) = api {
+        spawn_api_server(port, schema, metrics, &ctx.stop_rx);
+    }
+
+    run_indexer(cli, start_block, ctx).await
 }
 
 /// Parse and validate trusted peer URLs from config.
@@ -1104,6 +1131,10 @@ async fn run_indexer<C: chain::ChainTypes>(
     ctx: sync::SyncContext<C>,
 ) -> eyre::Result<()> {
     let verbose = ctx.verbose;
+
+    // The committed frontier was already quorum-verified (and any
+    // reorg-while-stopped recovered) in `prepare_and_run`, before the API
+    // was bound and before we reach here.
     if let Some(end_block_raw) = cli.end_block {
         let end_block = BlockNumber::new(end_block_raw);
         let effective_start = resolve_effective_start(&ctx.db, start_block, end_block).await?;
@@ -1112,7 +1143,7 @@ async fn run_indexer<C: chain::ChainTypes>(
             if !verbose {
                 ui::print_info("already indexed, nothing to do");
             }
-            info!("nothing to index");
+            info!("nothing to index (committed frontier verified)");
             ctx.metrics
                 .is_ready
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1193,7 +1224,7 @@ async fn run_historical_windows<C: chain::ChainTypes>(
             break;
         }
         let window_end = end.min(window_start.saturating_add(HISTORICAL_WINDOW_BLOCKS - 1));
-        let outcome = sync::run_sync(
+        let outcome = sync::run_canonical_segments(
             BlockNumber::new(window_start),
             BlockNumber::new(window_end),
             ctx.clone(),
@@ -1251,6 +1282,37 @@ async fn setup_database(cli: &cli::Cli, startup: &StartupConfig) -> eyre::Result
     Ok(db)
 }
 
+/// Refuse a configured start that would leave a gap above an existing
+/// database's checkpoint.
+///
+/// An existing database's committed prefix ends at its checkpoint. Sync
+/// must continue from `checkpoint + 1`; a configured `start_block` ABOVE
+/// that would skip `checkpoint+1..start_block`, and the scalar checkpoint
+/// would later advance past the hole. A fresh database (no indexed state)
+/// may start anywhere.
+///
+/// # Errors
+///
+/// Returns an error on a gap, or if the DB read fails.
+async fn enforce_no_start_gap(db: &db::Database, start_block: BlockNumber) -> eyre::Result<()> {
+    if !db.has_indexed_state().await? {
+        return Ok(());
+    }
+    let checkpoint = db.last_checkpoint().await?.map_or(0, BlockNumber::as_u64);
+    if start_block.as_u64() > checkpoint + 1 {
+        return Err(eyre::eyre!(
+            "configured start block {} is above this database's checkpoint {checkpoint}; \
+             resuming there would leave blocks {}..={} unindexed — lower the start block to \
+             {} or below to resume, or use a fresh database",
+            start_block.as_u64(),
+            checkpoint + 1,
+            start_block.as_u64() - 1,
+            checkpoint + 1,
+        ));
+    }
+    Ok(())
+}
+
 /// Determine the effective start block, accounting for checkpoint resume.
 ///
 /// # Errors
@@ -1304,15 +1366,15 @@ async fn shutdown_handler(stop_tx: watch::Sender<bool>, verbose: bool) {
 }
 
 /// Spawn the GraphQL API server if configured.
-fn maybe_spawn_api(
-    api_port: Option<u16>,
+/// Build the GraphQL schema from resolved config (must run before
+/// `startup` is consumed by `build_sync_context`). Returns `None` when no
+/// API port is configured.
+fn build_api_schema(
     startup: &StartupConfig,
     db: &Arc<db::Database>,
-    metrics: &Arc<metrics::SieveMetrics>,
-    stop_rx: &watch::Receiver<bool>,
-) -> eyre::Result<()> {
-    let Some(port) = api_port else {
-        return Ok(());
+) -> eyre::Result<Option<(u16, async_graphql::dynamic::Schema)>> {
+    let Some(port) = startup.api_port else {
+        return Ok(None);
     };
     let schema = api::build_schema(
         &startup.resolved_events,
@@ -1320,6 +1382,17 @@ fn maybe_spawn_api(
         &startup.resolved_calls,
         db.pool().clone(),
     )?;
+    Ok(Some((port, schema)))
+}
+
+/// Spawn the API server. Called ONLY after the committed frontier is
+/// quorum-verified, so the API never serves poisoned or reorged rows.
+fn spawn_api_server(
+    port: u16,
+    schema: async_graphql::dynamic::Schema,
+    metrics: &Arc<metrics::SieveMetrics>,
+    stop_rx: &watch::Receiver<bool>,
+) {
     let api_stop = stop_rx.clone();
     let api_metrics = Arc::clone(metrics);
     tokio::spawn(async move {
@@ -1327,7 +1400,6 @@ fn maybe_spawn_api(
             tracing::error!(error = %e, "API server error");
         }
     });
-    Ok(())
 }
 
 /// Build a bloom filter for skipping blocks with no matching contract addresses.
@@ -1449,6 +1521,10 @@ fn build_stream_sinks(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions in tests are idiomatic"
+)]
 mod tests {
     use super::*;
 
@@ -1488,5 +1564,49 @@ mod tests {
         let toml = generate_contract_toml("Empty", "0x1234", "abis/empty.json", None, &[]);
         assert!(toml.contains("name = \"Empty\""));
         assert!(!toml.contains("[[contracts.events]]"));
+    }
+
+    async fn gap_test_db() -> eyre::Result<db::Database> {
+        let url = std::env::var("DATABASE_URL").map_err(|_| eyre::eyre!("DATABASE_URL not set"))?;
+        let db = db::Database::connect(&url).await?;
+        db::create_internal_tables(&db).await?;
+        Ok(db)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL"]
+    async fn start_gap_above_checkpoint_is_refused() -> eyre::Result<()> {
+        let db = gap_test_db().await?;
+        // Simulate an existing database indexed to block 100.
+        sqlx::query("DELETE FROM _sieve_block_hashes")
+            .execute(db.pool())
+            .await?;
+        let mut tx = db.begin().await?;
+        db::store_block_hashes_batch(
+            &mut tx,
+            &[100],
+            &[[0x11u8; 32].to_vec()],
+            &[[0x10u8; 32].to_vec()],
+        )
+        .await?;
+        db::update_checkpoint(&mut tx, BlockNumber::new(100)).await?;
+        tx.commit().await?;
+
+        // Configured start 200 leaves blocks 101..=199 unindexed → refused.
+        let result = enforce_no_start_gap(&db, BlockNumber::new(200)).await;
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("unindexed"));
+
+        // Resuming at or below checkpoint+1 is fine.
+        enforce_no_start_gap(&db, BlockNumber::new(101)).await?;
+        enforce_no_start_gap(&db, BlockNumber::new(50)).await?;
+
+        sqlx::query("DELETE FROM _sieve_block_hashes")
+            .execute(db.pool())
+            .await?;
+        sqlx::query("UPDATE _sieve_checkpoints SET block_number = 0 WHERE id = 1")
+            .execute(db.pool())
+            .await?;
+        Ok(())
     }
 }

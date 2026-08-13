@@ -251,6 +251,37 @@ pub async fn rollback_to(
         .await
         .wrap_err("failed to clamp factory coverage after rollback")?;
 
+    // Move the verified frontier in lockstep with the checkpoint. Update
+    // to the stored hash of the rollback target, or clear the marker when
+    // the target has no stored hash. NEVER inserts — a legacy database
+    // (no marker) must not gain one through a rollback, so it still fails
+    // startup verification.
+    let target_hash: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT block_hash FROM _sieve_block_hashes WHERE block_number = $1")
+            .bind(block_number.as_u64() as i64)
+            .fetch_optional(&mut **tx)
+            .await
+            .wrap_err("failed to read rollback target hash")?;
+    match target_hash {
+        Some(hash) => {
+            sqlx::query(
+                "UPDATE _sieve_canonical SET verified_through = $1, verified_hash = $2 \
+                 WHERE id = 1",
+            )
+            .bind(block_number.as_u64() as i64)
+            .bind(hash)
+            .execute(&mut **tx)
+            .await
+            .wrap_err("failed to move verified frontier after rollback")?;
+        }
+        None => {
+            sqlx::query("DELETE FROM _sieve_canonical WHERE id = 1")
+                .execute(&mut **tx)
+                .await
+                .wrap_err("failed to clear verified frontier after rollback")?;
+        }
+    }
+
     Ok(())
 }
 
@@ -855,6 +886,7 @@ pub async fn drop_all_tables(
         "_sieve_chain",
         "_sieve_tables",
         "_sieve_factories",
+        "_sieve_canonical",
         "_sqlx_migrations",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
@@ -944,6 +976,19 @@ CREATE TABLE IF NOT EXISTS _sieve_tables (
     table_name TEXT PRIMARY KEY
 )";
 
+/// DDL for the `_sieve_canonical` verified-frontier marker (single row).
+///
+/// Records the highest block whose committed hash was verified against a
+/// peer quorum. Startup verification writes it after confirming the
+/// checkpoint hash is canonical; it makes "this state was quorum-verified"
+/// an explicit, inspectable fact rather than an implicit assumption.
+pub const CANONICAL_FRONTIER_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS _sieve_canonical (
+    id SMALLINT PRIMARY KEY DEFAULT 1,
+    verified_through BIGINT NOT NULL,
+    verified_hash BYTEA NOT NULL
+)";
+
 /// Create sieve-internal tables at runtime.
 ///
 /// Uses `CREATE TABLE IF NOT EXISTS` so it is safe to call on every startup.
@@ -1002,6 +1047,11 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
         .execute(db.pool())
         .await
         .wrap_err("failed to create _sieve_factories")?;
+
+    sqlx::raw_sql(&format!("{CANONICAL_FRONTIER_DDL};"))
+        .execute(db.pool())
+        .await
+        .wrap_err("failed to create _sieve_canonical")?;
 
     info!("internal tables ready");
     Ok(())
@@ -1093,6 +1143,76 @@ async fn has_prior_sieve_state(db: &Database) -> eyre::Result<bool> {
         .await
         .wrap_err("failed to check block hashes for chain identity")?;
     Ok(has_hashes)
+}
+
+impl Database {
+    /// Whether this database already holds indexed state (an advanced
+    /// checkpoint or any stored block hashes). A fresh database returns
+    /// `false` — the canonical stage requires no left seam for its first
+    /// block; an existing database requires one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn has_indexed_state(&self) -> eyre::Result<bool> {
+        has_prior_sieve_state(self).await
+    }
+
+    /// Read the quorum-verified frontier `(block, hash)`, if recorded.
+    ///
+    /// Its PRESENCE is the trust boundary: a database Sieve built through
+    /// the canonical stage always has it (advanced atomically with every
+    /// commit); a database indexed before canonical verification does not,
+    /// and startup refuses such state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn verified_frontier(&self) -> eyre::Result<Option<(u64, B256)>> {
+        let row: Option<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT verified_through, verified_hash FROM _sieve_canonical WHERE id = 1",
+        )
+        .fetch_optional(self.pool())
+        .await
+        .wrap_err("failed to read verified frontier")?;
+        match row {
+            Some((block, bytes)) => {
+                let hash = B256::try_from(bytes.as_slice())
+                    .map_err(|_| eyre::eyre!("invalid verified frontier hash length"))?;
+                Ok(Some((block.max(0) as u64, hash)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Advance the quorum-verified frontier within a commit transaction.
+///
+/// Called in the SAME transaction as [`update_checkpoint`], so the marker
+/// and the checkpoint always move together: a committed segment is
+/// verified through its highest committed block, atomically. Upserts, so
+/// the first commit on a fresh database establishes the marker.
+///
+/// # Errors
+///
+/// Returns an error if the write fails.
+pub async fn advance_verified_frontier(
+    tx: &mut Transaction<'_, Postgres>,
+    block: BlockNumber,
+    hash: &B256,
+) -> eyre::Result<()> {
+    sqlx::query(
+        "INSERT INTO _sieve_canonical (id, verified_through, verified_hash) \
+         VALUES (1, $1, $2) \
+         ON CONFLICT (id) DO UPDATE SET verified_through = EXCLUDED.verified_through, \
+         verified_hash = EXCLUDED.verified_hash",
+    )
+    .bind(block.as_u64() as i64)
+    .bind(hash.as_slice())
+    .execute(&mut **tx)
+    .await
+    .wrap_err("failed to advance verified frontier")?;
+    Ok(())
 }
 
 /// Bind this database to a chain identity, or verify an existing binding.

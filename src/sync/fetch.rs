@@ -2,10 +2,8 @@
 
 use crate::chain::ChainTypes;
 use crate::filter::BloomFilter;
-use crate::p2p::{
-    fetch_headers_for_peer, fetch_payloads_for_headers, fetch_payloads_for_peer, NetworkPeer,
-    PeerPool,
-};
+use crate::p2p::{fetch_payloads_for_headers, NetworkPeer, PeerPool};
+use crate::sync::canonical::CanonicalChain;
 use crate::sync::scheduler::{PeerHealthTracker, PeerWorkScheduler};
 use crate::sync::{BlockPayload, FetchItem, FetchMode, SkippedHeader};
 use eyre::{eyre, Result};
@@ -30,17 +28,25 @@ pub struct FetchIngestOutcome<C: ChainTypes> {
 
 /// Fetch full block payloads for a consecutive batch of blocks.
 ///
-/// When a bloom filter is provided, only blocks whose header bloom matches
-/// any configured contract address will have bodies+receipts fetched.
-/// Non-matching blocks are returned in `bloom_skipped`.
+/// Headers are NEVER taken from the peer: every header comes from the
+/// quorum-verified [`CanonicalChain`], the bloom decision is made on
+/// canonical headers, and bodies+receipts are fetched BY canonical hash
+/// (and verified downstream against canonical roots). A peer can
+/// therefore fail to serve a block, but cannot substitute its own chain.
+///
+/// When a bloom filter is provided, only blocks whose canonical header
+/// bloom matches a configured contract address have bodies+receipts
+/// fetched; non-matching blocks are returned in `bloom_skipped`.
 ///
 /// # Errors
 ///
-/// Returns an error if the block batch is not consecutive or the fetch fails.
+/// Returns an error if the block batch is not consecutive, falls outside
+/// the canonical segment, or the fetch fails.
 pub async fn fetch_ingest_batch<C: ChainTypes>(
     peer: &NetworkPeer<C>,
     blocks: &[u64],
     bloom_filter: Option<&BloomFilter>,
+    canonical: &CanonicalChain,
 ) -> Result<FetchIngestOutcome<C>> {
     if blocks.is_empty() {
         return Ok(FetchIngestOutcome {
@@ -51,34 +57,25 @@ pub async fn fetch_ingest_batch<C: ChainTypes>(
         });
     }
     ensure_consecutive(blocks)?;
-    let start = blocks[0];
-    let end = blocks[blocks.len() - 1];
 
-    // No bloom filter → fetch everything (original path)
-    let Some(bloom) = bloom_filter else {
-        let outcome = fetch_payloads_for_peer(peer, start..=end).await?;
-        return Ok(FetchIngestOutcome {
-            payloads: outcome.payloads,
-            missing_blocks: outcome.missing_blocks,
-            bloom_skipped: Vec::new(),
-            fetch_stats: outcome.fetch_stats,
-        });
-    };
-
-    // Phase 1: fetch headers only
-    let header_outcome = fetch_headers_for_peer(peer, start..=end).await?;
-
-    // Phase 2: bloom filter — partition into matching and skipped.
-    // Skipped headers keep their sealed hash + parent link so they can be
-    // stored and anchored downstream like any other block.
+    // Partition canonical headers: bloom matches get payload fetches,
+    // the rest are recorded as skipped (hash + parent link preserved).
     let mut need_fetch = Vec::new();
     let mut bloom_skipped = Vec::new();
-    for header in header_outcome.headers {
-        if bloom.header_may_match(header.header()) {
-            need_fetch.push(header);
+    for &number in blocks {
+        let header = canonical.get(number).ok_or_else(|| {
+            eyre!(
+                "block {number} is outside the canonical segment {}..={}",
+                canonical.start(),
+                canonical.end()
+            )
+        })?;
+        let matches = bloom_filter.is_none_or(|bloom| bloom.header_may_match(header.header()));
+        if matches {
+            need_fetch.push(header.clone());
         } else {
             bloom_skipped.push(SkippedHeader {
-                number: header.header().number,
+                number,
                 hash: header.hash(),
                 parent_hash: header.header().parent_hash,
             });
@@ -88,21 +85,13 @@ pub async fn fetch_ingest_batch<C: ChainTypes>(
     if need_fetch.is_empty() {
         return Ok(FetchIngestOutcome {
             payloads: Vec::new(),
-            missing_blocks: header_outcome.missing_blocks,
+            missing_blocks: Vec::new(),
             bloom_skipped,
-            fetch_stats: crate::p2p::FetchStageStats {
-                headers_ms: header_outcome.headers_ms,
-                headers_requests: header_outcome.headers_requests,
-                ..crate::p2p::FetchStageStats::default()
-            },
+            fetch_stats: crate::p2p::FetchStageStats::default(),
         });
     }
 
-    // Phase 3: fetch bodies+receipts only for matching headers
-    let mut result = fetch_payloads_for_headers(peer, need_fetch).await?;
-    result.missing_blocks.extend(header_outcome.missing_blocks);
-    result.fetch_stats.headers_ms = header_outcome.headers_ms;
-    result.fetch_stats.headers_requests = header_outcome.headers_requests;
+    let result = fetch_payloads_for_headers(peer, need_fetch).await?;
 
     Ok(FetchIngestOutcome {
         payloads: result.payloads,
@@ -131,6 +120,7 @@ pub struct FetchTaskContext<C: ChainTypes> {
     pub payload_tx: mpsc::Sender<FetchItem<C>>,
     pub ready_tx: mpsc::UnboundedSender<NetworkPeer<C>>,
     pub bloom_filter: Option<Arc<BloomFilter>>,
+    pub canonical: Arc<CanonicalChain>,
 }
 
 /// Parameters for a single fetch task invocation.
@@ -156,7 +146,8 @@ pub async fn run_fetch_task<C: ChainTypes>(ctx: FetchTaskContext<C>, params: Fet
     let _permit = permit;
 
     let fetch_started = tokio::time::Instant::now();
-    let result = fetch_ingest_batch(&peer, &blocks, ctx.bloom_filter.as_deref()).await;
+    let result =
+        fetch_ingest_batch(&peer, &blocks, ctx.bloom_filter.as_deref(), &ctx.canonical).await;
     let fetch_elapsed = fetch_started.elapsed();
 
     match result {

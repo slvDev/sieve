@@ -25,7 +25,6 @@ use reth_network_api::{
     PeerRequest, PeerRequestSender,
 };
 use reth_primitives_traits::{Header, SealedHeader};
-use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -111,6 +110,14 @@ impl<C: ChainTypes> PeerPool<C> {
         Self {
             peers: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Construct an empty pool (test-only: lets the canonical stage's
+    /// no-peer refusal path be exercised without a live network).
+    #[cfg(test)]
+    #[must_use]
+    pub const fn new_empty() -> Self {
+        Self::new()
     }
 
     /// Number of peers currently in the pool.
@@ -210,30 +217,11 @@ pub struct FetchStageStats {
     pub receipts_requests: u64,
 }
 
-/// Headers response with request count for stats tracking.
-#[derive(Debug)]
-struct HeadersChunkedResponse {
-    headers: Vec<Header>,
-    requests: u64,
-}
-
 /// Chunked response with partial results (None = missing item).
 #[derive(Debug)]
 struct ChunkedResponse<T> {
     results: Vec<Option<T>>,
     requests: u64,
-}
-
-/// Outcome of a header-only fetch for a peer.
-///
-/// Headers are sealed (hash computed once) and verified for parent-hash
-/// continuity; discontinuous headers are reported in `missing_blocks`.
-#[derive(Debug)]
-pub struct HeaderFetchOutcome {
-    pub headers: Vec<SealedHeader>,
-    pub missing_blocks: Vec<u64>,
-    pub headers_ms: u64,
-    pub headers_requests: u64,
 }
 
 /// Outcome of a full payload fetch for a peer.
@@ -799,25 +787,27 @@ pub async fn request_headers_batch<C: ChainTypes>(
     request_headers_by_number::<C>(peer.peer_id, start_block, limit, &peer.messages).await
 }
 
-async fn request_headers_chunked_with_stats<C: ChainTypes>(
+/// Fetch a consecutive run of headers, transparently chunking requests.
+///
+/// Returns whatever the peer served (possibly short); callers validate.
+///
+/// # Errors
+///
+/// Returns an error if any underlying request fails.
+pub async fn request_headers_chunked<C: ChainTypes>(
     peer: &NetworkPeer<C>,
     start_block: u64,
     count: usize,
-) -> Result<HeadersChunkedResponse> {
+) -> Result<Vec<Header>> {
     if count == 0 {
-        return Ok(HeadersChunkedResponse {
-            headers: Vec::new(),
-            requests: 0,
-        });
+        return Ok(Vec::new());
     }
     let mut headers = Vec::with_capacity(count);
     let mut current = start_block;
     let mut remaining = count;
-    let mut requests = 0u64;
     while remaining > 0 {
         let batch = remaining.min(MAX_HEADERS_PER_REQUEST);
         let mut batch_headers = request_headers_batch(peer, current, batch).await?;
-        requests = requests.saturating_add(1);
         if batch_headers.is_empty() {
             break;
         }
@@ -829,7 +819,7 @@ async fn request_headers_chunked_with_stats<C: ChainTypes>(
         current = current.saturating_add(batch as u64);
         remaining = remaining.saturating_sub(batch);
     }
-    Ok(HeadersChunkedResponse { headers, requests })
+    Ok(headers)
 }
 
 /// Fetch receipts for blocks identified by hash, using the peer's ETH version.
@@ -933,81 +923,6 @@ async fn request_receipts_chunked_partial_with_stats<C: ChainTypes>(
 }
 
 // ── High-level fetch ─────────────────────────────────────────────────
-
-/// Fetch full payloads (header + body + receipts) for a block range from a peer.
-///
-/// Fetches headers first, then bodies and receipts in parallel. Returns
-/// assembled payloads and a list of any missing blocks.
-///
-/// # Errors
-///
-/// Returns an error if the underlying P2P requests fail.
-/// Fetch only headers for a block range from a peer.
-pub async fn fetch_headers_for_peer<C: ChainTypes>(
-    peer: &NetworkPeer<C>,
-    range: std::ops::RangeInclusive<u64>,
-) -> Result<HeaderFetchOutcome> {
-    let start = *range.start();
-    let end = *range.end();
-    let count = (end - start + 1) as usize;
-
-    let headers_start = Instant::now();
-    let headers_response = request_headers_chunked_with_stats(peer, start, count).await?;
-    let headers_ms = headers_start.elapsed().as_millis() as u64;
-    let headers_requests = headers_response.requests;
-
-    let mut headers_by_number = HashMap::new();
-    for header in headers_response.headers {
-        headers_by_number.insert(header.number, header);
-    }
-
-    let (ordered_headers, missing_blocks) =
-        seal_and_verify_continuity(start, end, headers_by_number);
-
-    Ok(HeaderFetchOutcome {
-        headers: ordered_headers,
-        missing_blocks,
-        headers_ms,
-        headers_requests,
-    })
-}
-
-/// Order headers by block number, seal them, and verify parent-hash links.
-///
-/// A header whose number directly follows the previously accepted header
-/// must reference that header's hash as its parent; otherwise it is dropped
-/// and reported as missing so the scheduler retries it from another peer.
-fn seal_and_verify_continuity(
-    start: u64,
-    end: u64,
-    mut headers_by_number: HashMap<u64, Header>,
-) -> (Vec<SealedHeader>, Vec<u64>) {
-    let mut ordered_headers: Vec<SealedHeader> = Vec::new();
-    let mut missing_blocks = Vec::new();
-    for number in start..=end {
-        let Some(header) = headers_by_number.remove(&number) else {
-            missing_blocks.push(number);
-            continue;
-        };
-        let sealed = SealedHeader::seal_slow(header);
-        if let Some(prev) = ordered_headers.last() {
-            if number == prev.header().number.saturating_add(1)
-                && sealed.header().parent_hash != prev.hash()
-            {
-                debug!(
-                    block = number,
-                    parent_hash = %sealed.header().parent_hash,
-                    expected_parent = %prev.hash(),
-                    "header continuity mismatch; dropping header"
-                );
-                missing_blocks.push(number);
-                continue;
-            }
-        }
-        ordered_headers.push(sealed);
-    }
-    (ordered_headers, missing_blocks)
-}
 
 /// Validate a fetched body and receipts against the block header.
 ///
@@ -1119,44 +1034,17 @@ pub async fn fetch_payloads_for_headers<C: ChainTypes>(
     })
 }
 
-/// Fetch full block payloads (headers + bodies + receipts) for a range.
-pub async fn fetch_payloads_for_peer<C: ChainTypes>(
-    peer: &NetworkPeer<C>,
-    range: std::ops::RangeInclusive<u64>,
-) -> Result<PayloadFetchOutcome<C>> {
-    let header_outcome = fetch_headers_for_peer(peer, range).await?;
-
-    if header_outcome.headers.is_empty() {
-        return Ok(PayloadFetchOutcome {
-            payloads: Vec::new(),
-            missing_blocks: header_outcome.missing_blocks,
-            fetch_stats: FetchStageStats {
-                headers_ms: header_outcome.headers_ms,
-                headers_requests: header_outcome.headers_requests,
-                ..FetchStageStats::default()
-            },
-        });
-    }
-
-    let mut result = fetch_payloads_for_headers(peer, header_outcome.headers).await?;
-    result.missing_blocks.extend(header_outcome.missing_blocks);
-    result.fetch_stats.headers_ms = header_outcome.headers_ms;
-    result.fetch_stats.headers_requests = header_outcome.headers_requests;
-    Ok(result)
-}
-
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::{seal_and_verify_continuity, validate_payload};
+    use super::validate_payload;
     use crate::chain::EthereumChain;
     use crate::test_utils::{build_test_transaction, make_log, make_receipt};
     use alloy_consensus::proofs;
     use alloy_primitives::{Address, Bytes, B256};
     use reth_ethereum_primitives::{BlockBody, Receipt};
-    use reth_primitives_traits::{Header, SealedHeader};
-    use std::collections::HashMap;
+    use reth_primitives_traits::Header;
 
     fn validate(
         header: &Header,
@@ -1287,49 +1175,5 @@ mod tests {
         let body = BlockBody::default();
         let result = validate(&header, &body, &[]);
         assert_eq!(result, Err("withdrawals mismatch"));
-    }
-
-    #[test]
-    fn continuity_keeps_linked_headers() {
-        let h1 = consistent_header(1, B256::ZERO);
-        let h1_hash = SealedHeader::seal_slow(h1.clone()).hash();
-        let h2 = consistent_header(2, h1_hash);
-
-        let mut by_number = HashMap::new();
-        by_number.insert(1, h1);
-        by_number.insert(2, h2);
-
-        let (headers, missing) = seal_and_verify_continuity(1, 2, by_number);
-        assert_eq!(headers.len(), 2);
-        assert!(missing.is_empty());
-    }
-
-    #[test]
-    fn continuity_drops_unlinked_child() {
-        let h1 = consistent_header(1, B256::ZERO);
-        let h2 = consistent_header(2, B256::repeat_byte(0xAA));
-
-        let mut by_number = HashMap::new();
-        by_number.insert(1, h1);
-        by_number.insert(2, h2);
-
-        let (headers, missing) = seal_and_verify_continuity(1, 2, by_number);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].header().number, 1);
-        assert_eq!(missing, vec![2]);
-    }
-
-    #[test]
-    fn continuity_skips_link_check_across_gaps() {
-        let h1 = consistent_header(1, B256::ZERO);
-        let h3 = consistent_header(3, B256::repeat_byte(0xBB));
-
-        let mut by_number = HashMap::new();
-        by_number.insert(1, h1);
-        by_number.insert(3, h3);
-
-        let (headers, missing) = seal_and_verify_continuity(1, 3, by_number);
-        assert_eq!(headers.len(), 2);
-        assert_eq!(missing, vec![2]);
     }
 }

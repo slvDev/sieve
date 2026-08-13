@@ -13,6 +13,9 @@ use crate::handler::{
 };
 use crate::metrics::SieveMetrics;
 use crate::p2p::{NetworkPeer, PeerPool};
+use crate::sync::canonical::{
+    establish_canonical_chain, CanonicalChain, QuorumPolicy, CANONICAL_SEGMENT_BLOCKS,
+};
 use crate::sync::fetch::{run_fetch_task, FetchTaskContext, FetchTaskParams};
 use crate::sync::scheduler::{
     PeerHealthConfig, PeerHealthTracker, PeerWorkScheduler, SchedulerConfig,
@@ -254,7 +257,175 @@ enum OrderedItem<C: ChainTypes> {
 const _: [(); 72] = [(); core::mem::size_of::<SyncOutcome>()];
 // ProcessOutcome size varies with table_counts vec — skip assertion.
 
+/// Verify the committed frontier by quorum before the API can serve any
+/// row — and recover from a reorg that happened while stopped.
+///
+/// Must run BEFORE the API binds. The state machine:
+/// - Fresh database → nothing to verify (the first segment establishes
+///   the frontier).
+/// - Existing state with a valid canonical marker → re-check the frontier
+///   hash against a peer quorum. Match → verified, proceed. Divergence →
+///   a reorg occurred while stopped (normal near an OP unsafe tip): find
+///   the common ancestor via the SAME quorum's voters and roll back to
+///   it (checkpoint + marker move atomically), then proceed. This is the
+///   difference between a legitimate reorg and a poisoned database.
+/// - Existing state without a marker, or an inconsistent marker → refused
+///   inside [`committed_frontier_status`].
+///
+/// # Errors
+///
+/// Returns an error when the frontier cannot be verified or recovered.
+pub async fn verify_or_recover_frontier<C: ChainTypes>(
+    ctx: &SyncContext<C>,
+    policy: &QuorumPolicy,
+) -> eyre::Result<()> {
+    let (checkpoint, stored) =
+        match crate::sync::canonical::committed_frontier_status(&ctx.db).await? {
+            crate::sync::canonical::FrontierStatus::Fresh => return Ok(()),
+            crate::sync::canonical::FrontierStatus::Committed { checkpoint, hash } => {
+                (checkpoint, hash)
+            }
+        };
+
+    let winner = crate::sync::canonical::quorum_at(&ctx.pool, checkpoint, policy).await?;
+    if winner.hash == stored {
+        debug!(checkpoint, "committed frontier verified by quorum");
+        return Ok(());
+    }
+
+    // Previously verified, now divergent → reorg while stopped.
+    recover_startup_reorg(ctx, checkpoint, stored, &winner).await
+}
+
+/// Roll back a checkpoint that diverged from the canonical chain while
+/// stopped, authorized by the quorum that detected the divergence.
+async fn recover_startup_reorg<C: ChainTypes>(
+    ctx: &SyncContext<C>,
+    checkpoint: u64,
+    stored: B256,
+    winner: &crate::sync::canonical::QuorumWinner<C>,
+) -> eyre::Result<()> {
+    warn!(
+        checkpoint,
+        stored = %stored,
+        canonical = %winner.hash,
+        "startup: checkpoint diverged from canonical (reorg while stopped); rolling back"
+    );
+    let ancestor =
+        crate::sync::reorg::find_common_ancestor(&ctx.db, &winner.voters, checkpoint, winner.hash)
+            .await?
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "checkpoint {checkpoint} diverged from the canonical chain, but no peer served \
+                     a valid divergent chain to locate the common ancestor; retry with more peers \
+                     or use a fresh database"
+                )
+            })?;
+    crate::sync::follow::rollback_to_ancestor(
+        &ctx.db,
+        &ctx.handlers,
+        &ctx.transfer_handlers,
+        &ctx.call_handlers,
+        &ctx.config,
+        ancestor,
+    )
+    .await?;
+    info!(ancestor, "startup reorg recovery complete");
+    Ok(())
+}
+
+/// Run a block range in canonical segments: establish the canonical
+/// header chain for each bounded segment via strict peer quorum, verify
+/// its seam with committed state, then (and only then) run the sync
+/// pipeline over it. Nothing is fetched, committed, or notified for a
+/// segment whose canonical chain could not be established — a forged
+/// header chain from a hostile peer therefore never reaches the
+/// database or any stream sink.
+///
+/// This is the ONLY sync entry point for both historical windows and
+/// follow-mode epochs.
+///
+/// # Errors
+///
+/// Returns an error if canonicalization fails (no quorum, no honest
+/// serving peer, or committed state that does not connect to the
+/// canonical chain — a poisoned database) or the sync itself fails.
+pub async fn run_canonical_segments<C: ChainTypes>(
+    start_block: BlockNumber,
+    end_block: BlockNumber,
+    ctx: SyncContext<C>,
+) -> eyre::Result<SyncOutcome> {
+    let policy = QuorumPolicy::default();
+    let mut total = SyncOutcome::default();
+    let mut seg_start = start_block.as_u64();
+    let end = end_block.as_u64();
+
+    // An existing database MUST have a verifiable left seam for every
+    // segment; only a fresh database's very first block may lack one.
+    let mut require_seam = ctx.db.has_indexed_state().await?;
+
+    while seg_start <= end {
+        if *ctx.stop_rx.borrow() {
+            break;
+        }
+        let seg_end = end.min(seg_start.saturating_add(CANONICAL_SEGMENT_BLOCKS - 1));
+
+        // Seam anchor: the stored hash directly below the segment. On a
+        // resumed database this is the committed checkpoint block — a
+        // poisoned checkpoint fails the seam and is refused inside
+        // `establish_canonical_chain`.
+        let frontier = match seg_start.checked_sub(1) {
+            Some(parent) => ctx.db.get_block_hash(BlockNumber::new(parent)).await?,
+            None => None,
+        };
+        let canonical = establish_canonical_chain(
+            &ctx.pool,
+            seg_start,
+            seg_end,
+            frontier,
+            require_seam,
+            &policy,
+        )
+        .await?;
+
+        let outcome = run_sync(
+            BlockNumber::new(seg_start),
+            BlockNumber::new(seg_end),
+            ctx.clone(),
+            Arc::new(canonical),
+        )
+        .await?;
+        total.accumulate(&outcome);
+
+        if *ctx.stop_rx.borrow() {
+            break;
+        }
+        // Never advance past a segment that is not fully committed.
+        let checkpoint = ctx
+            .db
+            .last_checkpoint()
+            .await?
+            .map_or(0, BlockNumber::as_u64);
+        if checkpoint < seg_end {
+            return Err(eyre::eyre!(
+                "canonical segment {seg_start}..={seg_end} ended with checkpoint at \
+                 {checkpoint}; refusing to advance past an incomplete segment"
+            ));
+        }
+        // After the first committed segment, every following segment has a
+        // real stored predecessor, so the seam is now mandatory.
+        require_seam = true;
+        seg_start = seg_end.saturating_add(1);
+    }
+
+    Ok(total)
+}
+
 /// Run sync for a block range, fetching from the peer pool.
+///
+/// All headers come from `canonical` (the quorum-verified chain for this
+/// exact range) — peers only serve bodies and receipts, fetched by
+/// canonical hash and verified against canonical roots.
 ///
 /// The `stop_rx` watch channel (inside `ctx`) allows external callers
 /// (follow loop, shutdown handler) to signal an early stop.
@@ -267,6 +438,7 @@ pub async fn run_sync<C: ChainTypes>(
     start_block: BlockNumber,
     end_block: BlockNumber,
     ctx: SyncContext<C>,
+    canonical: Arc<CanonicalChain>,
 ) -> eyre::Result<SyncOutcome> {
     let started = Instant::now();
     let total_blocks = end_block.as_u64().saturating_sub(start_block.as_u64()) + 1;
@@ -357,6 +529,7 @@ pub async fn run_sync<C: ChainTypes>(
         ready_tx: &ready_tx,
         bloom_filter: &ctx.bloom_filter,
         head_seen_rx: &ctx.head_seen_rx,
+        canonical: &canonical,
     };
     run_fetch_loop(&fetch_ctx, ready_rx, &ctx.stop_rx, &abort_rx).await;
 
@@ -443,6 +616,7 @@ struct FetchLoopContext<'a, C: ChainTypes> {
     ready_tx: &'a mpsc::UnboundedSender<NetworkPeer<C>>,
     bloom_filter: &'a Option<Arc<crate::filter::BloomFilter>>,
     head_seen_rx: &'a Option<watch::Receiver<u64>>,
+    canonical: &'a Arc<CanonicalChain>,
 }
 
 /// Mutable state carried across fetch loop iterations.
@@ -655,6 +829,7 @@ async fn dispatch_best_peer<C: ChainTypes>(
         payload_tx: ctx.payload_tx.clone(),
         ready_tx: ctx.ready_tx.clone(),
         bloom_filter: ctx.bloom_filter.clone(),
+        canonical: Arc::clone(ctx.canonical),
     };
     let params = FetchTaskParams {
         peer,
@@ -1613,11 +1788,23 @@ async fn flush_batch_inner<C: ChainTypes>(
     }
 
     // Phase 3: checkpoint (contiguous prefix only) + commit. Factory
-    // coverage advances in the same transaction so it always matches
-    // what the checkpoint claims was indexed with these factories active.
+    // coverage AND the quorum-verified frontier advance in the same
+    // transaction, so both always match what the checkpoint claims was
+    // indexed. The frontier records the checkpoint block's canonical
+    // hash — its presence proves this state was built through canonical
+    // verification.
     if let Some(checkpoint) = checkpoint_to {
         db::update_checkpoint(&mut tx, BlockNumber::new(checkpoint)).await?;
         db::advance_factory_coverage(&mut tx, ctx.coverage_keys, BlockNumber::new(checkpoint))
+            .await?;
+        let checkpoint_hash = batch
+            .iter()
+            .find(|item| item.number() == checkpoint)
+            .map(ProcessedItem::hash)
+            .ok_or_else(|| {
+                eyre::eyre!("checkpoint block {checkpoint} not found in committed batch")
+            })?;
+        db::advance_verified_frontier(&mut tx, BlockNumber::new(checkpoint), &checkpoint_hash)
             .await?;
     }
 

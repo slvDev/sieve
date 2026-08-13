@@ -7,6 +7,7 @@
 use crate::chain::ChainTypes;
 use crate::db::Database;
 use crate::p2p::{request_headers_batch, NetworkPeer, PeerPool};
+use crate::sync::canonical::{quorum_at, QuorumPolicy};
 use crate::types::BlockNumber;
 
 use eyre::Result;
@@ -16,15 +17,6 @@ use tracing::{debug, info, warn};
 
 /// Maximum reorg depth we handle. If the fork is deeper than this, bail.
 const MAX_REORG_DEPTH: u64 = 64;
-
-/// Maximum number of peers to probe during reorg preflight.
-const MAX_PROBE_PEERS: usize = 5;
-
-/// Number of agreeing peers required for a reorg decision.
-///
-/// Degrades to the pool size when fewer peers are connected, so a
-/// single-peer setup can still make progress.
-const QUORUM: usize = 2;
 
 /// Outcome of the reorg preflight check.
 #[derive(Debug)]
@@ -45,10 +37,17 @@ pub enum ReorgCheck<C: ChainTypes> {
 
 /// Check whether the last indexed block is still on the canonical chain.
 ///
-/// Probes up to [`MAX_PROBE_PEERS`] peers, fetching the header at
-/// `last_indexed` and comparing its hash to the stored value. A decision
-/// (no-reorg or reorg) requires [`QUORUM`] agreeing peers, so a single
-/// malicious peer cannot trigger a rollback or mask a real reorg.
+/// The stored hash for `last_indexed` is compared against the hash a
+/// canonical peer QUORUM reports for that height — the SAME fixed-threshold
+/// policy that authorizes header commits. A rollback is therefore only ever
+/// authorized by the same multi-peer agreement as a write:
+///
+/// - quorum confirms the stored hash → no reorg;
+/// - quorum agrees on a DIFFERENT hash → reorg to it (the voters become the
+///   anchors whose divergent chain the ancestor walk validates);
+/// - no quorum forms (sparse or split) → inconclusive, and NOTHING is
+///   rolled back. One hostile peer can no longer trigger destructive
+///   rollback of valid committed data.
 ///
 /// # Errors
 ///
@@ -57,6 +56,7 @@ pub async fn preflight_reorg<C: ChainTypes>(
     db: &Database,
     pool: &PeerPool<C>,
     last_indexed: u64,
+    policy: &QuorumPolicy,
 ) -> Result<ReorgCheck<C>> {
     let Some(stored_hash) = db.get_block_hash(BlockNumber::new(last_indexed)).await? else {
         debug!(
@@ -66,165 +66,36 @@ pub async fn preflight_reorg<C: ChainTypes>(
         return Ok(ReorgCheck::NoReorg);
     };
 
-    let peers = pool.snapshot();
-    if peers.is_empty() {
-        return Ok(ReorgCheck::Inconclusive);
-    }
-
-    let result = probe_peers_for_hash(&peers, last_indexed, stored_hash).await;
-    Ok(result)
-}
-
-/// Result of probing a single peer for a block hash.
-enum ProbeResult {
-    /// Peer returned a header — its sealed hash.
-    Hash(alloy_primitives::B256),
-    /// Peer responded but header was empty — counts as probed.
-    Empty,
-    /// Request failed — doesn't count toward the probe limit.
-    Failed,
-}
-
-/// Decision reached once enough peers agree.
-#[derive(Debug, PartialEq, Eq)]
-enum TallyDecision {
-    /// Quorum confirmed the stored hash — no reorg.
-    NoReorg,
-    /// Quorum agreed on a different hash for the block.
-    Reorg(alloy_primitives::B256),
-}
-
-/// Accumulates per-peer hash votes until a quorum is reached.
-struct VoteTally {
-    quorum: usize,
-    matches: usize,
-    divergent: HashMap<alloy_primitives::B256, usize>,
-}
-
-impl VoteTally {
-    fn new(quorum: usize) -> Self {
-        Self {
-            quorum: quorum.max(1),
-            matches: 0,
-            divergent: HashMap::new(),
-        }
-    }
-
-    /// Record one peer's hash vote; returns a decision once a quorum of
-    /// peers agrees on the same answer.
-    fn record(
-        &mut self,
-        network_hash: alloy_primitives::B256,
-        stored_hash: alloy_primitives::B256,
-    ) -> Option<TallyDecision> {
-        if network_hash == stored_hash {
-            self.matches += 1;
-            if self.matches >= self.quorum {
-                return Some(TallyDecision::NoReorg);
-            }
-        } else {
-            let count = self.divergent.entry(network_hash).or_insert(0);
-            *count += 1;
-            if *count >= self.quorum {
-                return Some(TallyDecision::Reorg(network_hash));
-            }
-        }
-        None
-    }
-}
-
-/// Probe up to [`MAX_PROBE_PEERS`] peers for the header hash at
-/// `block_number` and tally votes until a quorum agrees.
-async fn probe_peers_for_hash<C: ChainTypes>(
-    peers: &[NetworkPeer<C>],
-    block_number: u64,
-    stored_hash: alloy_primitives::B256,
-) -> ReorgCheck<C> {
-    let mut tally = VoteTally::new(QUORUM.min(peers.len()));
-    let mut divergent_anchors: HashMap<alloy_primitives::B256, Vec<NetworkPeer<C>>> =
-        HashMap::new();
-    let mut probed = 0usize;
-
-    for peer in peers {
-        if probed >= MAX_PROBE_PEERS {
-            break;
-        }
-
-        match probe_single_peer(peer, block_number).await {
-            ProbeResult::Hash(network_hash) => {
-                probed += 1;
-                if network_hash == stored_hash {
-                    debug!(
-                        block = block_number,
-                        peer_id = ?peer.peer_id,
-                        "reorg preflight: hash matches"
-                    );
-                } else {
-                    warn!(
-                        block = block_number,
-                        peer_id = ?peer.peer_id,
-                        stored = %stored_hash,
-                        network = %network_hash,
-                        "reorg preflight: hash mismatch reported"
-                    );
-                    divergent_anchors
-                        .entry(network_hash)
-                        .or_default()
-                        .push(peer.clone());
-                }
-                match tally.record(network_hash, stored_hash) {
-                    Some(TallyDecision::NoReorg) => return ReorgCheck::NoReorg,
-                    Some(TallyDecision::Reorg(hash)) => {
-                        if let Some(anchors) = divergent_anchors.remove(&hash) {
-                            return ReorgCheck::ReorgDetected {
-                                anchors,
-                                expected_tip: hash,
-                            };
-                        }
-                        return ReorgCheck::Inconclusive;
-                    }
-                    None => {}
-                }
-            }
-            ProbeResult::Empty => probed += 1,
-            ProbeResult::Failed => {}
-        }
-    }
-
-    ReorgCheck::Inconclusive
-}
-
-/// Probe a single peer for the header hash at `block_number`.
-///
-/// The response must contain exactly one header at exactly the requested
-/// height — a peer replaying an unrelated (but stored) header must not be
-/// able to cast a vote for a different block.
-async fn probe_single_peer<C: ChainTypes>(peer: &NetworkPeer<C>, block_number: u64) -> ProbeResult {
-    let headers = match request_headers_batch(peer, block_number, 1).await {
-        Ok(h) => h,
-        Err(e) => {
-            debug!(peer_id = ?peer.peer_id, error = %e, "reorg probe failed");
-            return ProbeResult::Failed;
+    // No degradation: a rollback needs the full canonical quorum. If it
+    // cannot form, treat it as inconclusive and leave committed data
+    // untouched rather than trusting too few peers.
+    let winner = match quorum_at(pool, last_indexed, policy).await {
+        Ok(winner) => winner,
+        Err(err) => {
+            debug!(
+                block = last_indexed,
+                error = %err,
+                "reorg preflight: no canonical quorum; leaving data untouched"
+            );
+            return Ok(ReorgCheck::Inconclusive);
         }
     };
 
-    if headers.len() != 1 {
-        return ProbeResult::Empty;
-    }
-    let Some(header) = headers.into_iter().next() else {
-        return ProbeResult::Empty;
-    };
-    if header.number != block_number {
-        debug!(
-            peer_id = ?peer.peer_id,
-            requested = block_number,
-            got = header.number,
-            "reorg probe returned wrong height; ignoring"
-        );
-        return ProbeResult::Empty;
+    if winner.hash == stored_hash {
+        return Ok(ReorgCheck::NoReorg);
     }
 
-    ProbeResult::Hash(SealedHeader::seal_slow(header).hash())
+    warn!(
+        block = last_indexed,
+        stored = %stored_hash,
+        network = %winner.hash,
+        voters = winner.voters.len(),
+        "reorg preflight: canonical quorum diverges from stored hash"
+    );
+    Ok(ReorgCheck::ReorgDetected {
+        anchors: winner.voters,
+        expected_tip: winner.hash,
+    })
 }
 
 /// Walk backward from `last_indexed` to find the highest block where stored
@@ -357,7 +228,7 @@ fn validate_anchor_chain(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_anchor_chain, TallyDecision, VoteTally};
+    use super::validate_anchor_chain;
     use alloy_primitives::B256;
     use reth_primitives_traits::{Header, SealedHeader};
 
@@ -414,43 +285,5 @@ mod tests {
         let (mut headers, tip) = build_chain(10, 3);
         headers[2].number = 99;
         assert!(validate_anchor_chain(headers, 10, 12, tip).is_none());
-    }
-
-    #[test]
-    fn tally_confirms_no_reorg_at_quorum() {
-        let stored = B256::repeat_byte(0x01);
-        let mut tally = VoteTally::new(2);
-        assert_eq!(tally.record(stored, stored), None);
-        assert_eq!(tally.record(stored, stored), Some(TallyDecision::NoReorg));
-    }
-
-    #[test]
-    fn tally_detects_reorg_at_quorum() {
-        let stored = B256::repeat_byte(0x01);
-        let fork = B256::repeat_byte(0x02);
-        let mut tally = VoteTally::new(2);
-        assert_eq!(tally.record(fork, stored), None);
-        assert_eq!(tally.record(fork, stored), Some(TallyDecision::Reorg(fork)));
-    }
-
-    #[test]
-    fn tally_disagreeing_peers_reach_no_decision() {
-        let stored = B256::repeat_byte(0x01);
-        let fork_a = B256::repeat_byte(0x02);
-        let fork_b = B256::repeat_byte(0x03);
-        let mut tally = VoteTally::new(2);
-        // A lone divergent peer, a second peer on a different fork, and a
-        // single match: nothing reaches quorum.
-        assert_eq!(tally.record(fork_a, stored), None);
-        assert_eq!(tally.record(fork_b, stored), None);
-        assert_eq!(tally.record(stored, stored), None);
-    }
-
-    #[test]
-    fn tally_quorum_one_decides_immediately() {
-        let stored = B256::repeat_byte(0x01);
-        let fork = B256::repeat_byte(0x02);
-        let mut tally = VoteTally::new(1);
-        assert_eq!(tally.record(fork, stored), Some(TallyDecision::Reorg(fork)));
     }
 }
