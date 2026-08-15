@@ -5824,6 +5824,7 @@ dependencies = [
  "miniz_oxide",
  "op-alloy-consensus",
  "op-alloy-rpc-types",
+ "paste",
  "reth-chainspec",
  "reth-ethereum-forks",
  "reth-network-peers",
@@ -5832,6 +5833,7 @@ dependencies = [
  "reth-primitives-traits",
  "serde",
  "serde_json",
+ "tar-no-std",
  "thiserror 2.0.18",
 ]
 
@@ -7452,6 +7454,17 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "tar-no-std"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac9ee8b664c9f1740cd813fea422116f8ba29997bb7c878d1940424889802897"
+dependencies = [
+ "bitflags 2.11.0",
+ "log",
+ "num-traits",
+]
 
 [[package]]
 name = "tcp-stream"

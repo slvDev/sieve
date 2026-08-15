@@ -51,8 +51,16 @@ async fn main() -> eyre::Result<()> {
     let default_level = if cli.verbose { "info" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // `tar_no_std` warns once per startup while reth reads the
+                // embedded OP superchain-registry archive (unichain chain
+                // spec); the skipped directory entries are harmless.
+                let filter = tracing_subscriber::EnvFilter::new(default_level);
+                match "tar_no_std=off".parse() {
+                    Ok(directive) => filter.add_directive(directive),
+                    Err(_) => filter,
+                }
+            }),
         )
         .init();
 
@@ -82,6 +90,7 @@ async fn main() -> eyre::Result<()> {
                 chain::ChainKind::Mainnet => cmd_peers::<chain::EthereumChain>().await,
                 chain::ChainKind::Base => cmd_peers::<chain::BaseChain>().await,
                 chain::ChainKind::Optimism => cmd_peers::<chain::OptimismChain>().await,
+                chain::ChainKind::Unichain => cmd_peers::<chain::UnichainChain>().await,
             },
         };
     }
@@ -175,6 +184,9 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
         }
         chain::ChainKind::Optimism => {
             prepare_and_run::<chain::OptimismChain>(cli, startup, &db, &metrics, stop_rx).await
+        }
+        chain::ChainKind::Unichain => {
+            prepare_and_run::<chain::UnichainChain>(cli, startup, &db, &metrics, stop_rx).await
         }
     }
 }

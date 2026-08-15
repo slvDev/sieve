@@ -125,11 +125,11 @@ All of it configured in one TOML file. All of it stored in PostgreSQL. All of it
 
 ### Chains
 
-Sieve indexes Ethereum mainnet by default. Base and OP mainnet are
-supported too:
+Sieve indexes Ethereum mainnet by default. Base, OP mainnet, and Unichain
+are supported too:
 
 ```toml
-chain = "base"   # top-level key; "mainnet" (default), "base", or "optimism"
+chain = "base"   # top-level key: "mainnet" (default), "base", "optimism", "unichain"
 ```
 
 A database is bound to its chain on first run — reusing a mainnet database
@@ -137,12 +137,13 @@ with `chain = "base"` (or any other mismatch) is refused so chain state can
 never mix. Use a separate database per chain, or wipe with `sieve reset` /
 `--fresh`.
 
-OP-stack notes (Base and OP mainnet):
+OP-stack notes (Base, OP mainnet, and Unichain):
 
 - Blocks arrive over the chain's devp2p network directly (no RPC, same as
   mainnet). Sieve follows the sequencer's unsafe head, typically within a
-  block or two (2s blocks). Base runs its own partitioned `basev0` peer
-  discovery, which Sieve speaks; OP mainnet uses standard discovery.
+  block or two (~1-2s blocks). Base runs its own partitioned `basev0` peer
+  discovery, which Sieve speaks; OP mainnet and Unichain use standard
+  superchain discovery.
 - OP-stack deposit transactions (type `0x7E`) are indexed like any other
   transaction: events decode normally, and user deposits with value show
   up in native transfer tables (the sender is the deposit's `from`
@@ -153,7 +154,7 @@ OP-stack notes (Base and OP mainnet):
   Sieve automatically avoids asking peers for history they advertise as
   pruned.
 - Test connectivity without a config: `sieve peers --chain base` /
-  `sieve peers --chain optimism`.
+  `sieve peers --chain optimism` / `sieve peers --chain unichain`.
 - Known limitation: Base's unscheduled "Cobalt" hardfork will introduce a
   new transaction type (`0x79`) and can be activated via L1 signalling.
   When it is scheduled, Sieve will need an update to keep following Base.

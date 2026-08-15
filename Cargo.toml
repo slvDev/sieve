@@ -18,7 +18,7 @@ reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38
 reth-network-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["secp256k1"] }
 reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
-reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["superchain-configs"] }
 reth-optimism-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["serde"] }
 reth-optimism-forks = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 reth-optimism-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }

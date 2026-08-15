@@ -9,10 +9,12 @@ mod base;
 mod ethereum;
 mod op_stack;
 mod optimism;
+mod unichain;
 
 pub use base::BaseChain;
 pub use ethereum::EthereumChain;
 pub use optimism::OptimismChain;
+pub use unichain::UnichainChain;
 
 use alloy_consensus::{BlockBody, TxReceipt};
 use alloy_primitives::B256;
@@ -33,6 +35,8 @@ pub enum ChainKind {
     Base,
     /// OP mainnet (OP-stack L2).
     Optimism,
+    /// Unichain mainnet (OP-stack L2).
+    Unichain,
 }
 
 impl ChainKind {
@@ -43,6 +47,7 @@ impl ChainKind {
             Self::Mainnet => EthereumChain::NAME,
             Self::Base => BaseChain::NAME,
             Self::Optimism => OptimismChain::NAME,
+            Self::Unichain => UnichainChain::NAME,
         }
     }
 
@@ -53,6 +58,7 @@ impl ChainKind {
             Self::Mainnet => 1,
             Self::Base => 8453,
             Self::Optimism => 10,
+            Self::Unichain => 130,
         }
     }
 
@@ -63,6 +69,7 @@ impl ChainKind {
             Self::Mainnet => EthereumChain::chain_spec().genesis_hash(),
             Self::Base => BaseChain::chain_spec().genesis_hash(),
             Self::Optimism => OptimismChain::chain_spec().genesis_hash(),
+            Self::Unichain => UnichainChain::chain_spec().genesis_hash(),
         }
     }
 
@@ -76,8 +83,9 @@ impl ChainKind {
             "mainnet" | "ethereum" => Ok(Self::Mainnet),
             "base" => Ok(Self::Base),
             "optimism" | "op" => Ok(Self::Optimism),
+            "unichain" | "uni" => Ok(Self::Unichain),
             other => Err(eyre::eyre!(
-                "unknown chain \"{other}\" (supported: mainnet, base, optimism)"
+                "unknown chain \"{other}\" (supported: mainnet, base, optimism, unichain)"
             )),
         }
     }
@@ -165,6 +173,11 @@ mod tests {
             Ok(ChainKind::Optimism)
         ));
         assert!(matches!(ChainKind::parse("op"), Ok(ChainKind::Optimism)));
+        assert!(matches!(
+            ChainKind::parse("unichain"),
+            Ok(ChainKind::Unichain)
+        ));
+        assert!(matches!(ChainKind::parse("uni"), Ok(ChainKind::Unichain)));
     }
 
     #[test]
