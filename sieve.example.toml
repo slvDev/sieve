@@ -5,7 +5,7 @@
 #   WEBHOOK_URL   — webhook endpoint (required if [[streams]] type = "webhook")
 #   RABBITMQ_URL  — RabbitMQ connection string (required if [[streams]] type = "rabbitmq")
 
-# Which chain to index: "mainnet" (default), "base", "optimism", or "unichain".
+# Which chain to index: "mainnet" (default), "base", "optimism", "unichain", or "world".
 # A database is bound to its chain on first run; use a separate database
 # (or `sieve reset`) when switching chains.
 # chain = "mainnet"

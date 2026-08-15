@@ -10,11 +10,13 @@ mod ethereum;
 mod op_stack;
 mod optimism;
 mod unichain;
+mod world;
 
 pub use base::BaseChain;
 pub use ethereum::EthereumChain;
 pub use optimism::OptimismChain;
 pub use unichain::UnichainChain;
+pub use world::WorldChain;
 
 use alloy_consensus::{BlockBody, TxReceipt};
 use alloy_primitives::B256;
@@ -37,6 +39,8 @@ pub enum ChainKind {
     Optimism,
     /// Unichain mainnet (OP-stack L2).
     Unichain,
+    /// World Chain mainnet (OP-stack L2).
+    World,
 }
 
 impl ChainKind {
@@ -48,6 +52,7 @@ impl ChainKind {
             Self::Base => BaseChain::NAME,
             Self::Optimism => OptimismChain::NAME,
             Self::Unichain => UnichainChain::NAME,
+            Self::World => WorldChain::NAME,
         }
     }
 
@@ -59,6 +64,7 @@ impl ChainKind {
             Self::Base => 8453,
             Self::Optimism => 10,
             Self::Unichain => 130,
+            Self::World => 480,
         }
     }
 
@@ -70,6 +76,7 @@ impl ChainKind {
             Self::Base => BaseChain::chain_spec().genesis_hash(),
             Self::Optimism => OptimismChain::chain_spec().genesis_hash(),
             Self::Unichain => UnichainChain::chain_spec().genesis_hash(),
+            Self::World => WorldChain::chain_spec().genesis_hash(),
         }
     }
 
@@ -84,8 +91,9 @@ impl ChainKind {
             "base" => Ok(Self::Base),
             "optimism" | "op" => Ok(Self::Optimism),
             "unichain" | "uni" => Ok(Self::Unichain),
+            "world" | "worldchain" => Ok(Self::World),
             other => Err(eyre::eyre!(
-                "unknown chain \"{other}\" (supported: mainnet, base, optimism, unichain)"
+                "unknown chain \"{other}\" (supported: mainnet, base, optimism, unichain, world)"
             )),
         }
     }
@@ -178,6 +186,11 @@ mod tests {
             Ok(ChainKind::Unichain)
         ));
         assert!(matches!(ChainKind::parse("uni"), Ok(ChainKind::Unichain)));
+        assert!(matches!(ChainKind::parse("world"), Ok(ChainKind::World)));
+        assert!(matches!(
+            ChainKind::parse("worldchain"),
+            Ok(ChainKind::World)
+        ));
     }
 
     #[test]

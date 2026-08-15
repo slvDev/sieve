@@ -91,6 +91,7 @@ async fn main() -> eyre::Result<()> {
                 chain::ChainKind::Base => cmd_peers::<chain::BaseChain>().await,
                 chain::ChainKind::Optimism => cmd_peers::<chain::OptimismChain>().await,
                 chain::ChainKind::Unichain => cmd_peers::<chain::UnichainChain>().await,
+                chain::ChainKind::World => cmd_peers::<chain::WorldChain>().await,
             },
         };
     }
@@ -187,6 +188,9 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
         }
         chain::ChainKind::Unichain => {
             prepare_and_run::<chain::UnichainChain>(cli, startup, &db, &metrics, stop_rx).await
+        }
+        chain::ChainKind::World => {
+            prepare_and_run::<chain::WorldChain>(cli, startup, &db, &metrics, stop_rx).await
         }
     }
 }
