@@ -260,6 +260,55 @@ Also enriches streaming payloads with `tx_value`, `tx_gas_price`, `gas_used`, `n
 
 Individual receipt fields can be added without the flag: `context = ["tx_gas_used", "tx_nonce"]`.
 
+### Splitting Config Across Files
+
+Indexing many protocols in one `sieve.toml` gets unwieldy. You can split each
+protocol into its own `*.sieve.toml` file next to the root config. Sieve
+automatically finds every `*.sieve.toml` file in the **same directory** as the
+config passed to `--config` (default `sieve.toml`) and merges them.
+
+```
+project/
+  sieve.toml          # globals + optional contracts
+  aave.sieve.toml     # [[contracts]] / [[transfers]]
+  uniswap.sieve.toml  # [[contracts]] / [[transfers]]
+  abis/
+    erc20.json
+    pool.json
+```
+
+- **Globals live in the root only.** `chain`, `[api]`, `[p2p]`, and
+  `[[streams]]` may appear only in the root config. A protocol fragment may
+  contain only `[[contracts]]` and `[[transfers]]` — any global key in a
+  fragment is a startup error.
+- **The root may still hold contracts.** A single-file `sieve.toml` keeps
+  working exactly as before; fragments are purely additive. The root can be
+  globals-only, with every contract in fragments.
+- **Names must be unique across all files.** A contract name defined in two
+  files is a startup error naming both files; duplicate table names are also
+  rejected at startup.
+- **ABI paths resolve relative to the config directory** (the shared `abis/`
+  above), the same as in a single file.
+- Merging applies to the indexer and the config-resolving commands: `sieve
+  schema`, `sieve inspect`, and `sieve reset`. (`sieve peers` and `sieve
+  add-contract` intentionally read only the root config.)
+
+```toml
+# aave.sieve.toml -- no chain/api/p2p/streams here
+[[contracts]]
+name = "AavePool"
+address = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+abi = "abis/aave_pool.json"
+start_block = 16_291_127
+
+[[contracts.events]]
+name = "Supply"
+table = "aave_supplies"
+```
+
+> `sieve add-contract` still appends to the root config file; move the entry
+> into a fragment by hand if you want it grouped with a protocol.
+
 ## Streaming
 
 ### Webhooks

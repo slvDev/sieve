@@ -429,7 +429,7 @@ struct ResolvedStartup {
 /// Returns an error if the config file cannot be read, parsed, or resolved.
 fn load_resolved_config(cli: &cli::Cli) -> eyre::Result<ResolvedStartup> {
     let config_path = Path::new(&cli.config);
-    let sieve_config = toml_config::load_config(config_path)?;
+    let sieve_config = toml_config::load_merged_config(config_path)?;
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let resolved = toml_config::resolve_config(&sieve_config, config_dir)?;
     Ok(ResolvedStartup {

@@ -9,7 +9,7 @@ use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 // ── TOML serde types ──────────────────────────────────────────────────
@@ -23,7 +23,9 @@ pub struct SieveConfig {
     pub api: Option<ApiConfig>,
     /// Optional P2P configuration.
     pub p2p: Option<P2pConfig>,
-    /// Contracts to index.
+    /// Contracts to index. May be empty in the root config when every
+    /// contract lives in a `*.sieve.toml` protocol fragment.
+    #[serde(default)]
     pub contracts: Vec<TomlContract>,
     /// Native ETH transfer definitions.
     #[serde(default)]
@@ -1143,6 +1145,131 @@ pub fn load_config(config_path: &Path) -> eyre::Result<SieveConfig> {
     Ok(config)
 }
 
+/// A protocol fragment: a `*.sieve.toml` file sitting beside the root config.
+///
+/// Fragments carry only per-protocol definitions. Global singletons (`chain`,
+/// `api`, `p2p`, `streams`) belong to the root config alone — `deny_unknown_fields`
+/// turns any of them appearing in a fragment into a parse error.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FragmentConfig {
+    #[serde(default)]
+    contracts: Vec<TomlContract>,
+    #[serde(default)]
+    transfers: Vec<TomlTransfer>,
+}
+
+/// A fragment file is any sibling whose name ends in `.sieve.toml`.
+///
+/// `sieve.toml` (10 chars) does not end in `.sieve.toml` (11 chars), so the
+/// conventional root name is never picked up as its own fragment.
+fn is_fragment_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".sieve.toml"))
+}
+
+/// Short, human-readable label for a config file in error/log messages.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<config>")
+        .to_string()
+}
+
+/// Load the root config and merge in every sibling `*.sieve.toml` protocol
+/// fragment found in the same directory.
+///
+/// Contracts and transfers from each fragment are appended to the root's;
+/// global settings come from the root alone. Fragment files are merged in
+/// sorted filename order for deterministic results. Contract-name collisions
+/// across files are reported with their source filenames.
+///
+/// # Errors
+///
+/// Returns an error if the root or any fragment cannot be read or parsed, if a
+/// fragment declares a global setting, if two files define the same contract
+/// name, or if the merged config indexes nothing.
+pub fn load_merged_config(root_path: &Path) -> eyre::Result<SieveConfig> {
+    let mut root = load_config(root_path)?;
+
+    let dir = match root_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let root_canon = std::fs::canonicalize(root_path).ok();
+
+    // Collect sibling fragment files, excluding the root itself.
+    let mut fragments: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .wrap_err_with(|| format!("failed to read config directory {}", dir.display()))?
+    {
+        let path = entry?.path();
+        if !is_fragment_file(&path) {
+            continue;
+        }
+        let is_root = match (root_canon.as_ref(), std::fs::canonicalize(&path).ok()) {
+            (Some(a), Some(b)) => a == &b,
+            _ => path.file_name() == root_path.file_name(),
+        };
+        if !is_root {
+            fragments.push(path);
+        }
+    }
+    fragments.sort();
+
+    // Track which file each contract name came from for clear collision errors.
+    let mut sources: HashMap<String, String> = HashMap::new();
+    let root_label = file_label(root_path);
+    for contract in &root.contracts {
+        sources.insert(contract.name.clone(), root_label.clone());
+    }
+
+    for frag_path in &fragments {
+        let content = std::fs::read_to_string(frag_path)
+            .wrap_err_with(|| format!("failed to read config fragment {}", frag_path.display()))?;
+        let fragment: FragmentConfig = toml::from_str(&content).wrap_err_with(|| {
+            format!(
+                "failed to parse fragment {}; fragments may only contain [[contracts]] and \
+                 [[transfers]] — put chain/api/p2p/streams in the root config {}",
+                frag_path.display(),
+                root_path.display()
+            )
+        })?;
+
+        let label = file_label(frag_path);
+        for contract in fragment.contracts {
+            if let Some(prev) = sources.insert(contract.name.clone(), label.clone()) {
+                return Err(eyre::eyre!(
+                    "duplicate contract name \"{}\" defined in both {prev} and {label}; \
+                     contract names must be unique across all config files",
+                    contract.name
+                ));
+            }
+            root.contracts.push(contract);
+        }
+        root.transfers.extend(fragment.transfers);
+    }
+
+    if root.contracts.is_empty() && root.transfers.is_empty() {
+        return Err(eyre::eyre!(
+            "no contracts or transfers configured in {} or any *.sieve.toml fragment",
+            root_path.display()
+        ));
+    }
+
+    if !fragments.is_empty() {
+        info!(
+            fragments = fragments.len(),
+            contracts = root.contracts.len(),
+            transfers = root.transfers.len(),
+            "merged protocol fragments"
+        );
+    }
+
+    Ok(root)
+}
+
 /// Resolve a parsed TOML config into `IndexConfig` + `Vec<ResolvedEvent>`.
 ///
 /// Reads ABI files, validates event/param names, builds SQL, and produces
@@ -2191,6 +2318,243 @@ table = "usdc_approvals"
         std::fs::create_dir_all(&abi_dir)?;
         std::fs::write(abi_dir.join("erc20.json"), abi_json)?;
         Ok(dir)
+    }
+
+    /// Create a fresh, unique temp dir for fragment-merge tests.
+    fn merge_test_dir(suffix: &str) -> eyre::Result<std::path::PathBuf> {
+        let dir = std::env::temp_dir().join(format!("sieve_merge_{suffix}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn load_merged_config_merges_fragments() -> eyre::Result<()> {
+        let dir = merge_test_dir("merge")?;
+        std::fs::write(
+            dir.join("sieve.toml"),
+            r#"chain = "mainnet"
+[[contracts]]
+name = "USDC"
+abi = "abis/erc20.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+        std::fs::write(
+            dir.join("aave.sieve.toml"),
+            r#"[[contracts]]
+name = "AavePool"
+abi = "abis/pool.json"
+events = []
+address = "0x0000000000000000000000000000000000000002"
+
+[[transfers]]
+name = "eth"
+table = "eth_transfers"
+"#,
+        )?;
+
+        let merged = load_merged_config(&dir.join("sieve.toml"))?;
+        assert_eq!(merged.contracts.len(), 2);
+        let names: Vec<&str> = merged.contracts.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"USDC"));
+        assert!(names.contains(&"AavePool"));
+        assert_eq!(merged.transfers.len(), 1);
+        assert_eq!(merged.chain.as_deref(), Some("mainnet"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn load_merged_config_rejects_globals_in_fragment() -> eyre::Result<()> {
+        let dir = merge_test_dir("reject")?;
+        std::fs::write(
+            dir.join("sieve.toml"),
+            r#"chain = "mainnet"
+[[contracts]]
+name = "USDC"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+        std::fs::write(
+            dir.join("bad.sieve.toml"),
+            r#"chain = "base"
+[[contracts]]
+name = "X"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000002"
+"#,
+        )?;
+
+        let result = load_merged_config(&dir.join("sieve.toml"));
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("bad.sieve.toml"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn load_merged_config_detects_duplicate_contract_name() -> eyre::Result<()> {
+        let dir = merge_test_dir("dup")?;
+        std::fs::write(
+            dir.join("sieve.toml"),
+            r#"chain = "mainnet"
+[[contracts]]
+name = "USDC"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+        std::fs::write(
+            dir.join("other.sieve.toml"),
+            r#"[[contracts]]
+name = "USDC"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000002"
+"#,
+        )?;
+
+        let result = load_merged_config(&dir.join("sieve.toml"));
+        assert!(result.is_err());
+        let msg = format!("{result:?}");
+        assert!(msg.contains("USDC"));
+        assert!(msg.contains("both sieve.toml and other.sieve.toml"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn load_merged_config_without_fragments_matches_single_file() -> eyre::Result<()> {
+        let dir = merge_test_dir("single")?;
+        std::fs::write(
+            dir.join("sieve.toml"),
+            r#"chain = "mainnet"
+[[contracts]]
+name = "USDC"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+
+        let merged = load_merged_config(&dir.join("sieve.toml"))?;
+        assert_eq!(merged.contracts.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn load_merged_config_root_globals_only_with_fragments() -> eyre::Result<()> {
+        // The primary intended layout: root holds only globals, and every
+        // contract/transfer comes from fragments.
+        let dir = merge_test_dir("globals_only")?;
+        std::fs::write(
+            dir.join("sieve.toml"),
+            r#"chain = "mainnet"
+[api]
+port = 4000
+"#,
+        )?;
+        std::fs::write(
+            dir.join("aave.sieve.toml"),
+            r#"[[contracts]]
+name = "AavePool"
+abi = "abis/pool.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+        std::fs::write(
+            dir.join("uniswap.sieve.toml"),
+            r#"[[contracts]]
+name = "UniswapPool"
+abi = "abis/pool.json"
+events = []
+address = "0x0000000000000000000000000000000000000002"
+
+[[transfers]]
+name = "eth"
+table = "eth_transfers"
+"#,
+        )?;
+
+        let merged = load_merged_config(&dir.join("sieve.toml"))?;
+        assert_eq!(merged.contracts.len(), 2);
+        assert_eq!(merged.transfers.len(), 1);
+        assert_eq!(merged.chain.as_deref(), Some("mainnet"));
+        assert!(merged.api.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn load_merged_config_excludes_root_named_like_fragment() -> eyre::Result<()> {
+        // When the root config itself matches `*.sieve.toml`, it must not be
+        // re-read as one of its own fragments (which would duplicate its
+        // contracts). A genuine sibling fragment is still merged.
+        let dir = merge_test_dir("root_fragment_name")?;
+        std::fs::write(
+            dir.join("foo.sieve.toml"),
+            r#"chain = "mainnet"
+[[contracts]]
+name = "Foo"
+abi = "abis/foo.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+        std::fs::write(
+            dir.join("bar.sieve.toml"),
+            r#"[[contracts]]
+name = "Bar"
+abi = "abis/bar.json"
+events = []
+address = "0x0000000000000000000000000000000000000002"
+"#,
+        )?;
+
+        let merged = load_merged_config(&dir.join("foo.sieve.toml"))?;
+        let names: Vec<&str> = merged.contracts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            merged.contracts.len(),
+            2,
+            "root must not be re-read: {names:?}"
+        );
+        assert!(names.contains(&"Foo"));
+        assert!(names.contains(&"Bar"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn load_merged_config_errors_when_nothing_to_index() -> eyre::Result<()> {
+        let dir = merge_test_dir("empty")?;
+        std::fs::write(
+            dir.join("sieve.toml"),
+            r#"chain = "mainnet"
+[api]
+port = 4000
+"#,
+        )?;
+
+        let result = load_merged_config(&dir.join("sieve.toml"));
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("no contracts or transfers"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     const ERC20_ABI: &str = r#"[
