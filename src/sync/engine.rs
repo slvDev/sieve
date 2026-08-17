@@ -475,7 +475,8 @@ pub async fn run_sync<C: ChainTypes>(
         spawn_peer_feeder(Arc::clone(&ctx.pool), ready_tx.clone(), feeder_shutdown_rx);
 
     // Spawn N parallel processing workers (CPU: filter + decode)
-    let worker_set = spawn_processing_workers(ordered_rx, processed_tx, Arc::clone(&ctx.config));
+    let cfg = Arc::clone(&ctx.config);
+    let worker_set = spawn_processing_workers(ordered_rx, processed_tx, cfg, ctx.worker_count);
 
     // Abort signal: fired by the DB writer on fatal integrity errors so the
     // fetch loop stops promptly instead of draining the whole range.
@@ -1048,8 +1049,9 @@ fn spawn_processing_workers<C: ChainTypes>(
     ordered_rx: mpsc::Receiver<OrderedItem<C>>,
     processed_tx: mpsc::Sender<ProcessedItem<C>>,
     config: Arc<IndexConfig>,
+    num_workers: usize,
 ) -> JoinSet<()> {
-    let num_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let num_workers = num_workers.max(1);
 
     info!(num_workers, "spawning block processing workers");
 

@@ -99,6 +99,8 @@ pub struct SyncContext<C: ChainTypes> {
     pub head_seen_rx: Option<watch::Receiver<u64>>,
     /// Whether to use verbose tracing output (vs pretty UI).
     pub verbose: bool,
+    /// Number of parallel block-processing workers.
+    pub worker_count: usize,
 }
 
 // Manual Clone: every field is a cheap handle; `C` itself need not be Clone.
@@ -121,6 +123,7 @@ impl<C: ChainTypes> Clone for SyncContext<C> {
             bloom_filter: self.bloom_filter.clone(),
             head_seen_rx: self.head_seen_rx.clone(),
             verbose: self.verbose,
+            worker_count: self.worker_count,
         }
     }
 }

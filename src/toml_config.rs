@@ -23,6 +23,8 @@ pub struct SieveConfig {
     pub api: Option<ApiConfig>,
     /// Optional P2P configuration.
     pub p2p: Option<P2pConfig>,
+    /// Optional sync/processing configuration.
+    pub sync: Option<SyncConfig>,
     /// Contracts to index. May be empty in the root config when every
     /// contract lives in a `*.sieve.toml` protocol fragment.
     #[serde(default)]
@@ -40,6 +42,15 @@ pub struct SieveConfig {
 pub struct ApiConfig {
     /// Port for the GraphQL API server (default: 4000).
     pub port: Option<u16>,
+}
+
+/// Sync/processing section.
+#[derive(Debug, Deserialize)]
+pub struct SyncConfig {
+    /// Number of parallel block-processing workers. Defaults to the CPU
+    /// count. Lower it to co-locate several Sieve instances on one host
+    /// without oversubscribing cores. The `--workers` CLI flag overrides it.
+    pub workers: Option<usize>,
 }
 
 /// P2P section.
@@ -1148,8 +1159,9 @@ pub fn load_config(config_path: &Path) -> eyre::Result<SieveConfig> {
 /// A protocol fragment: a `*.sieve.toml` file sitting beside the root config.
 ///
 /// Fragments carry only per-protocol definitions. Global singletons (`chain`,
-/// `api`, `p2p`, `streams`) belong to the root config alone — `deny_unknown_fields`
-/// turns any of them appearing in a fragment into a parse error.
+/// `api`, `p2p`, `sync`, `streams`) belong to the root config alone —
+/// `deny_unknown_fields` turns any of them appearing in a fragment into a
+/// parse error.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FragmentConfig {
@@ -1231,7 +1243,7 @@ pub fn load_merged_config(root_path: &Path) -> eyre::Result<SieveConfig> {
         let fragment: FragmentConfig = toml::from_str(&content).wrap_err_with(|| {
             format!(
                 "failed to parse fragment {}; fragments may only contain [[contracts]] and \
-                 [[transfers]] — put chain/api/p2p/streams in the root config {}",
+                 [[transfers]] — put chain/api/p2p/sync/streams in the root config {}",
                 frag_path.display(),
                 root_path.display()
             )
@@ -2326,6 +2338,57 @@ table = "usdc_approvals"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+
+    #[test]
+    fn parse_sync_workers() -> eyre::Result<()> {
+        let config: SieveConfig = toml::from_str(
+            r#"chain = "mainnet"
+[sync]
+workers = 2
+[[contracts]]
+name = "USDC"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+        assert_eq!(config.sync.and_then(|s| s.workers), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn fragment_rejects_sync_section() -> eyre::Result<()> {
+        // [sync] is a global; it must not appear in a protocol fragment.
+        let dir = merge_test_dir("frag_sync")?;
+        std::fs::write(
+            dir.join("sieve.toml"),
+            r#"chain = "mainnet"
+[[contracts]]
+name = "USDC"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000001"
+"#,
+        )?;
+        std::fs::write(
+            dir.join("bad.sieve.toml"),
+            r#"[sync]
+workers = 2
+[[contracts]]
+name = "X"
+abi = "a.json"
+events = []
+address = "0x0000000000000000000000000000000000000002"
+"#,
+        )?;
+
+        let result = load_merged_config(&dir.join("sieve.toml"));
+        assert!(result.is_err());
+        assert!(format!("{result:?}").contains("bad.sieve.toml"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

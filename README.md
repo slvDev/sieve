@@ -168,6 +168,33 @@ OP-stack notes (Base, OP mainnet, Unichain, and World Chain):
 trusted_peers = ["enode://<pubkey>@<ip>:<port>"]
 ```
 
+### Running Several Instances on One Host
+
+Sieve indexes exactly one chain per process (the pipeline is compiled for the
+chain in `chain =`). To index multiple chains, run one instance per chain —
+each with all the protocols you want on that chain (see *Splitting Config
+Across Files* below). Two things need distinct values so co-located instances
+don't collide:
+
+- **Ports.** Each instance binds RLPx/discovery on its P2P port (and discv5 on
+  `port + 1` for OP-stack chains) plus its API port. Give each a distinct
+  `--p2p-port` (space them by 2) and `--api-port`, or run one container per
+  instance so each gets its own network namespace. The port number itself has
+  no effect on sync speed — discovery advertises whatever port you pick.
+- **Workers.** Each instance spawns one block-processing worker per CPU core by
+  default. Packing several instances on one box oversubscribes the cores, so
+  cap the count per instance:
+
+  ```toml
+  [sync]
+  workers = 4      # default: CPU count. Also settable via --workers.
+  ```
+
+  Rule of thumb: keep the sum of `workers` across co-located instances at or
+  below the host's core count. The remaining shared resource is egress
+  bandwidth — sync speed still depends on peer count and how many peers serve
+  receipts, not on the port.
+
 ### Contracts and Events
 
 ```toml
@@ -277,7 +304,7 @@ project/
     pool.json
 ```
 
-- **Globals live in the root only.** `chain`, `[api]`, `[p2p]`, and
+- **Globals live in the root only.** `chain`, `[api]`, `[p2p]`, `[sync]`, and
   `[[streams]]` may appear only in the root config. A protocol fragment may
   contain only `[[contracts]]` and `[[transfers]]` — any global key in a
   fragment is a startup error.
@@ -294,7 +321,7 @@ project/
   add-contract` intentionally read only the root config.)
 
 ```toml
-# aave.sieve.toml -- no chain/api/p2p/streams here
+# aave.sieve.toml -- no chain/api/p2p/sync/streams here
 [[contracts]]
 name = "AavePool"
 address = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
@@ -408,6 +435,7 @@ Options:
   --database-url <URL>    PostgreSQL URL (or DATABASE_URL in .env)
   --api-port <PORT>       Override GraphQL API port (configurable in TOML)
   --p2p-port <PORT>       Override P2P listen port [default: 30303]
+  --workers <NUM>         Block-processing workers [default: CPU count]
   --fresh                 Drop and recreate all tables before indexing
   -v, --verbose           Use tracing logs instead of pretty UI
   -V, --version           Print version

@@ -38,6 +38,12 @@ pub struct Cli {
     #[arg(long)]
     pub p2p_port: Option<u16>,
 
+    /// Number of parallel block-processing workers (default: CPU count).
+    /// Lower it to co-locate several Sieve instances on one host without
+    /// oversubscribing cores. Configurable in TOML as `[sync] workers`.
+    #[arg(long)]
+    pub workers: Option<usize>,
+
     /// Drop and recreate all tables before indexing. Use to start fresh.
     #[arg(long)]
     pub fresh: bool,
@@ -133,6 +139,20 @@ mod tests {
     fn config_defaults_to_sieve_toml() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["sieve"])?;
         assert_eq!(cli.config, "sieve.toml");
+        Ok(())
+    }
+
+    #[test]
+    fn workers_flag_parses() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve", "--workers", "4"])?;
+        assert_eq!(cli.workers, Some(4));
+        Ok(())
+    }
+
+    #[test]
+    fn workers_defaults_to_none() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["sieve"])?;
+        assert!(cli.workers.is_none());
         Ok(())
     }
 

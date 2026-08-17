@@ -41,6 +41,7 @@ struct FollowContext<C: ChainTypes> {
     bloom_filter: Option<Arc<crate::filter::BloomFilter>>,
     head_seen_rx: watch::Receiver<u64>,
     verbose: bool,
+    worker_count: usize,
 }
 
 /// Run the follow loop: discover head, preflight reorg, sync gap, repeat.
@@ -86,6 +87,7 @@ pub async fn run_follow_loop<C: ChainTypes>(
         bloom_filter: ctx.bloom_filter,
         head_seen_rx,
         verbose: ctx.verbose,
+        worker_count: ctx.worker_count,
     };
 
     let mut last_heartbeat = Instant::now();
@@ -362,6 +364,7 @@ async fn sync_epoch<C: ChainTypes>(
         bloom_filter: ctx.bloom_filter.clone(),
         head_seen_rx: Some(ctx.head_seen_rx.clone()),
         verbose: ctx.verbose,
+        worker_count: ctx.worker_count,
     };
 
     let outcome = run_canonical_segments(

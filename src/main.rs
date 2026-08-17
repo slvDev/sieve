@@ -338,6 +338,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
     let (handlers, transfer_handlers, call_handlers, has_transfers, has_calls) =
         build_registries(&startup);
 
+    let worker_count = startup.worker_count;
     let index_config = Arc::new(startup.index_config);
     info!(
         contracts = index_config.contracts.len(),
@@ -396,6 +397,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
         bloom_filter,
         head_seen_rx: None,
         verbose: cli.verbose,
+        worker_count,
     })
 }
 
@@ -414,6 +416,7 @@ struct StartupConfig {
     resolved_calls: Vec<toml_config::ResolvedCall>,
     resolved_streams: Vec<toml_config::ResolvedStream>,
     start_block: BlockNumber,
+    worker_count: usize,
 }
 
 /// Parsed + resolved config (no DB URL needed).
@@ -454,6 +457,28 @@ fn resolve_database_url(cli: &cli::Cli) -> eyre::Result<String> {
     cli.database_url.clone().ok_or_else(|| {
         eyre::eyre!("no database URL provided. Set DATABASE_URL in .env or use --database-url")
     })
+}
+
+/// Resolve the block-processing worker count.
+///
+/// Precedence: `--workers` (CLI) overrides `[sync] workers` (TOML), which
+/// falls back to `cpu_default` (the host CPU count).
+///
+/// # Errors
+///
+/// Returns an error if an explicit count of zero is configured.
+fn resolve_worker_count(
+    cli_workers: Option<usize>,
+    toml_workers: Option<usize>,
+    cpu_default: usize,
+) -> eyre::Result<usize> {
+    match cli_workers.or(toml_workers) {
+        Some(0) => Err(eyre::eyre!(
+            "workers must be at least 1 (set --workers or [sync] workers to a positive value)"
+        )),
+        Some(n) => Ok(n),
+        None => Ok(cpu_default),
+    }
 }
 
 /// Load TOML config, resolve ABI files, and compute startup parameters.
@@ -515,6 +540,14 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         .as_deref()
         .map_or(Ok(chain::ChainKind::default()), chain::ChainKind::parse)?;
 
+    // Resolve worker count: CLI > TOML > CPU count. Zero is rejected.
+    let cpu_default = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let worker_count = resolve_worker_count(
+        cli.workers,
+        startup.sieve_config.sync.as_ref().and_then(|s| s.workers),
+        cpu_default,
+    )?;
+
     Ok(StartupConfig {
         chain: chain_kind,
         database_url,
@@ -528,6 +561,7 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         resolved_calls: startup.resolved.calls,
         resolved_streams: startup.resolved.streams,
         start_block,
+        worker_count,
     })
 }
 
@@ -1580,6 +1614,33 @@ mod tests {
         let toml = generate_contract_toml("Empty", "0x1234", "abis/empty.json", None, &[]);
         assert!(toml.contains("name = \"Empty\""));
         assert!(!toml.contains("[[contracts.events]]"));
+    }
+
+    #[test]
+    fn worker_count_cli_overrides_toml() -> eyre::Result<()> {
+        assert_eq!(resolve_worker_count(Some(2), Some(8), 16)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_count_falls_back_to_toml() -> eyre::Result<()> {
+        assert_eq!(resolve_worker_count(None, Some(8), 16)?, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_count_falls_back_to_cpu() -> eyre::Result<()> {
+        assert_eq!(resolve_worker_count(None, None, 16)?, 16);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_count_rejects_zero() {
+        assert!(resolve_worker_count(Some(0), None, 16).is_err());
+        // A zero from TOML is rejected even when CLI is absent.
+        assert!(resolve_worker_count(None, Some(0), 16).is_err());
+        // CLI override still wins: an explicit CLI zero rejects a valid TOML value.
+        assert!(resolve_worker_count(Some(0), Some(8), 16).is_err());
     }
 
     async fn gap_test_db() -> eyre::Result<db::Database> {
