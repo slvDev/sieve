@@ -694,6 +694,7 @@ fn write_docker_compose() -> eyre::Result<()> {
       - "4000:4000"
       - "30303:30303"
       - "30303:30303/udp"
+      - "30304:30304/udp"  # discv5 on OP Mainnet / Unichain / World Chain
     depends_on:
       db:
         condition: service_healthy
