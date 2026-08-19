@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.2.0] - 2026-08-19
+
+Multichain release. Sieve now indexes four OP-Stack chains alongside Ethereum
+mainnet, and every block is verified against a multi-peer canonical quorum
+before it is committed.
+
+### Breaking
+
+- Databases created by 0.1.x are refused. 0.2.0 pins each database to its chain
+  and requires a verified-frontier marker that older databases do not have. Use
+  a fresh database (or `sieve reset`) when upgrading. Schema changes on a 0.2.0
+  database migrate automatically from then on.
+
+### Added
+
+- **Multichain support** via a `chain` config key: Base (8453), OP Mainnet (10),
+  Unichain (130), and World Chain (480), alongside Ethereum mainnet (default).
+  Each syncs over its own devp2p network — Base uses `basev0` discovery; OP,
+  Unichain, and World use discv5.
+- **Canonical-header verification** before any commit: a segment's tip hash is
+  confirmed by an absolute quorum of distinct peers (default 3), the full header
+  chain to that tip is validated link by link, and transaction, receipt, ommer,
+  and chain-specific withdrawals roots are recomputed from each block body and
+  checked against the header. No quorum, no commit.
+- **Contiguous commits and a verified frontier**: blocks are committed strictly
+  in order, the checkpoint always equals the highest committed block, and the
+  verified-frontier marker advances atomically with it. Startup re-verifies the
+  frontier and recovers from a reorg that happened while Sieve was stopped.
+- **Chain-bound database identity**: a database is pinned to its chain on first
+  run; reusing it for a different chain is refused.
+- **Factory coverage tracking**: Sieve records the block range each factory was
+  active for and refuses to start when adding a factory to a database already
+  indexed past its start block, lowering a start block, or changing a factory's
+  creation event or parameter — cases that would silently miss children.
+  `--assume-factory-coverage` adopts factories with no coverage record when
+  upgrading. Factory discovery is sequenced ahead of the parallel workers so
+  same-block child events are never lost.
+- **Multi-file config**: split protocols into `*.sieve.toml` fragments beside the
+  root config; Sieve discovers and merges them (globals stay in the root).
+- **Configurable worker count**: `--workers` CLI flag / `[sync] workers` — cap
+  block-processing workers to co-locate several instances on one host.
+- Chain-aware `add-contract` (per-chain Etherscan) and `sieve peers --chain`.
+- `[p2p] trusted_peers` config to pin always-connected archive/serving nodes.
+
+### Changed
+
+- The whole sync pipeline is generic over chain types, dispatched once at startup
+  from the `chain` key.
+- Reorg detection is now quorum-authorized (an absolute peer threshold), replacing
+  the single-peer probe.
+- `sieve init --docker` exposes the discv5 UDP port (30304) that OP Mainnet,
+  Unichain, and World Chain need for peer discovery.
+- README reworked around the multichain scope and the integrity model.
+
+### Fixed
+
+- Factory child events emitted in or shortly after the child's creation block are
+  no longer dropped under parallel processing — discovery is sequenced ahead of
+  the workers.
+- Withdrawals fields are validated per chain and fork for OP-Stack headers.
+
 ## [0.1.5] - 2026-03-15
 
 ### Added

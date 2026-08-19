@@ -1,13 +1,13 @@
 <h1 align="center">Sieve</h1>
 
 <p align="center">
-  <em>"I'm not like the rest of you. I'm stronger. I'm smarter. I'm better." — The Boys</em>
+  <strong>Self-hosted indexer for Ethereum and the OP-Stack. Connects straight to the P2P network — no RPC provider.</strong><br>
+  ~1000 blocks/sec on mainnet. No RPC keys. No rate limits. No bills.<br>
+  Just Sieve, Postgres, and an internet connection.
 </p>
 
 <p align="center">
-  <strong>Ethereum indexer that connects directly to P2P. No RPC provider needed.</strong><br>
-  ~1000 blocks/sec. No API keys. No rate limits. No bills.<br>
-  Just Sieve, Postgres, and an internet connection.
+  Ethereum · Base · OP Mainnet · Unichain · World Chain
 </p>
 
 ---
@@ -23,12 +23,13 @@ Sieve fetches the ABI, creates your tables, syncs the chain over P2P, and serves
 
 |                 | Other indexers                     | Sieve                     |
 | --------------- | ---------------------------------- | ------------------------- |
-| **Data source** | RPC provider ($225-$900/mo)        | Ethereum P2P network ($0) |
-| **Speed**       | Provider's rate limit              | ~1000 blocks/sec        |
+| **Data source** | RPC provider ($225-$900/mo)        | P2P network ($0)          |
+| **Speed**       | Provider's rate limit              | ~1000 blocks/sec (mainnet) |
 | **Setup**       | API keys, accounts, billing        | One-line install          |
 | **Config**      | TypeScript / YAML / AssemblyScript | One TOML file             |
+| **Chains**      | Per-provider                       | Ethereum + OP-Stack (5)   |
 
-*Benchmarked on Hetzner dedicated server (Germany), 11 contracts, 29 events, RabbitMQ streaming active.*
+*Benchmarked on a Hetzner dedicated server, Ethereum mainnet, 11 contracts, 29 events, RabbitMQ streaming active.*
 
 ## Quick Start
 
@@ -113,23 +114,43 @@ Open `http://localhost:4000/graphql` for the GraphiQL IDE.
 
 **Event logs** -- filter by contract address, event signature, and indexed parameter values. The bread and butter.
 
-**Function calls** -- decode transaction calldata for specific function selectors. Only successful (non-reverted) calls.
+**Function calls** -- decode top-level transaction calldata for specific function selectors. Only successful (non-reverted) calls.
 
-**Native ETH transfers** -- track value transfers with optional sender/receiver address filters. No ABI needed.
+**Native ETH transfers** -- track top-level transaction value with optional sender/receiver address filters. No ABI needed.
 
 **Factory contracts** -- dynamically discover and index child contracts as they're deployed.
 
 All of it configured in one TOML file. All of it stored in PostgreSQL. All of it queryable via GraphQL.
 
+## Integrity
+
+Sieve fetches blocks from anonymous P2P peers, so it never trusts any single one. Before a block is committed:
+
+- **Multi-peer header quorum** — the canonical hash of each segment is confirmed by an absolute number of distinct peers (default 3). Empty or timed-out replies never count toward the quorum.
+- **Canonical-chain validation** — the full header chain up to the agreed tip is fetched and checked link by link (every parent hash, ending on the quorum hash).
+- **Payload verification** — transaction, receipt, ommer, and chain-specific withdrawals roots are recomputed from the block body and matched against the header. A forged body is rejected and re-fetched from another peer.
+- **Contiguous commits** — blocks are written in strict order and the checkpoint always equals the highest committed block, so a crash or kill never leaves holes or half-written ranges.
+- **Chain-bound database** — a database is pinned to its chain on first run; reusing it for a different chain is refused.
+- **Quorum-authorized reorgs** — reorgs (up to 64 blocks) roll back only when a peer quorum agrees on the new canonical tip.
+
+No quorum, no commit — Sieve stops rather than write unverified data.
+
 ## Configuration Reference
 
 ### Chains
 
-Sieve indexes Ethereum mainnet by default. Base, OP mainnet, Unichain, and
-World Chain are supported too:
+Sieve indexes Ethereum mainnet by default, plus four OP-Stack chains:
+
+| Chain      | ID   | `chain =`               | Discovery            |
+| ---------- | ---- | ----------------------- | -------------------- |
+| Ethereum   | 1    | `"mainnet"` (default)   | discv4 / discv5      |
+| Base       | 8453 | `"base"`                | `basev0` discv5      |
+| OP Mainnet | 10   | `"optimism"` / `"op"`   | discv4 + discv5      |
+| Unichain   | 130  | `"unichain"` / `"uni"`  | discv4 + discv5      |
+| World Chain| 480  | `"world"`               | discv4 + discv5      |
 
 ```toml
-chain = "base"   # "mainnet" (default), "base", "optimism", "unichain", "world"
+chain = "base"   # default: "mainnet"
 ```
 
 A database is bound to its chain on first run — reusing a mainnet database
@@ -149,10 +170,10 @@ OP-stack notes (Base, OP mainnet, Unichain, and World Chain):
   up in native transfer tables (the sender is the deposit's `from`
   address). The per-block L1-attributes deposit carries no value and is
   skipped by transfer indexing.
-- Most public OP-stack nodes only serve about a month of receipt history.
-  For deeper backfills, pin an archive node via `trusted_peers` (below);
-  Sieve automatically avoids asking peers for history they advertise as
-  pruned.
+- Peer sets on OP-Stack chains are thinner than mainnet, and many public nodes
+  prune receipts (on Base, to roughly a month). For historical backfills, pin
+  archive/serving nodes via `trusted_peers` (below) — Sieve automatically avoids
+  asking peers for history they advertise as pruned.
 - Test connectivity without a config: `sieve peers --chain base` /
   `sieve peers --chain optimism` / `sieve peers --chain unichain` /
   `sieve peers --chain world`.
@@ -176,11 +197,12 @@ each with all the protocols you want on that chain (see *Splitting Config
 Across Files* below). Two things need distinct values so co-located instances
 don't collide:
 
-- **Ports.** Each instance binds RLPx/discovery on its P2P port (and discv5 on
-  `port + 1` for OP-stack chains) plus its API port. Give each a distinct
-  `--p2p-port` (space them by 2) and `--api-port`, or run one container per
-  instance so each gets its own network namespace. The port number itself has
-  no effect on sync speed — discovery advertises whatever port you pick.
+- **Ports.** Each instance binds RLPx (TCP) and discovery (UDP) on its P2P port,
+  plus its API port. OP Mainnet, Unichain, and World Chain also bind discv5 on
+  UDP `port + 1`; Base runs `basev0` discv5 on the same UDP port. Give each
+  instance a distinct `--p2p-port` (space them by 2) and `--api-port`, or run one
+  container per instance so each gets its own network namespace. The port number
+  itself has no effect on sync speed — discovery advertises whatever port you pick.
 - **Workers.** Each instance spawns one block-processing worker per CPU core by
   default. Packing several instances on one box oversubscribes the cores, so
   cap the count per instance:
@@ -262,12 +284,18 @@ from = ["0x28C6c06298d514Db089934071355E5743bf21d60"]  # Binance hot wallet
 [[contracts]]
 name = "UniswapV3Pool"
 abi = "abis/uniswap_v3_pool.json"
-start_block = 12_369_621
 
+# Discover child pools from the factory's creation event. start_block
+# belongs here (the children inherit it) — not on [[contracts]].
 [contracts.factory]
 address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 event = "PoolCreated"
 param = "pool"
+start_block = 12_369_621
+
+[[contracts.events]]
+name = "Swap"
+table = "uniswap_v3_swaps"
 ```
 
 Sieve tracks which block ranges each factory was active for. Adding a factory to a database already indexed past its `start_block`, lowering its `start_block`, changing its creation event or `param`, starting sync past its uncovered range, or re-adding a factory that was removed while indexing continued would all silently miss children or their events -- Sieve refuses to start instead and tells you to use a fresh database or `sieve reset`. When upgrading a database created before coverage tracking, run once with `--assume-factory-coverage` to record the current state as covered; it only applies to factories with no coverage record (asserting they were configured continuously) -- every other refusal stands.
@@ -426,19 +454,20 @@ sieve schema                   Print generated SQL DDL
 sieve reset                    Drop and recreate all tables
 sieve inspect                  Dry-run: show tables, columns, and filters
 sieve add-contract <ADDRESS>   Fetch ABI from Etherscan and add to config
-sieve peers                    Test P2P connectivity (no DB or config needed)
+sieve peers [--chain <NAME>]   Test P2P connectivity (no DB or config needed)
 
 Options:
-  --config <PATH>         Path to TOML config [default: sieve.toml]
-  --start-block <NUM>     Override start block
-  --end-block <NUM>       Stop at this block (omit for follow mode)
-  --database-url <URL>    PostgreSQL URL (or DATABASE_URL in .env)
-  --api-port <PORT>       Override GraphQL API port (configurable in TOML)
-  --p2p-port <PORT>       Override P2P listen port [default: 30303]
-  --workers <NUM>         Block-processing workers [default: CPU count]
-  --fresh                 Drop and recreate all tables before indexing
-  -v, --verbose           Use tracing logs instead of pretty UI
-  -V, --version           Print version
+  --config <PATH>             Path to TOML config [default: sieve.toml]
+  --start-block <NUM>         Override start block
+  --end-block <NUM>           Stop at this block (omit for follow mode)
+  --database-url <URL>        PostgreSQL URL (or DATABASE_URL in .env)
+  --api-port <PORT>           Override GraphQL API port (configurable in TOML)
+  --p2p-port <PORT>           Override P2P listen port [default: 30303]
+  --workers <NUM>             Block-processing workers [default: CPU count]
+  --fresh                     Drop and recreate all tables before indexing
+  --assume-factory-coverage   Adopt factories with no coverage record (DB upgrade)
+  -v, --verbose               Use tracing logs instead of pretty UI
+  -V, --version               Print version
 ```
 
 ### API Endpoints
@@ -512,12 +541,19 @@ docker run \
   -v ./sieve.toml:/app/sieve.toml:ro \
   -v ./abis:/app/abis:ro \
   -p 4000:4000 -p 30303:30303 -p 30303:30303/udp \
+  -p 30304:30304/udp \
   sieve --database-url postgres://... --api-port 4000
 ```
 
 Config and ABIs are mounted as volumes, not baked into the image. One image works for dev, staging, and production.
 
-> **Note:** Port 30303 (TCP + UDP) must be reachable from the internet for Ethereum P2P peer discovery.
+> **Ports:** 30303 (TCP + UDP) carries RLPx and discovery. OP Mainnet, Unichain,
+> and World Chain also use UDP 30304 for discv5; Base uses 30303/UDP for its
+> `basev0` discovery. Expose the ports your chain needs for peer discovery.
+>
+> **Public API:** the GraphQL server has open CORS and no built-in auth. Put it
+> behind a reverse proxy (TLS, access control, rate limiting) before exposing it
+> to the internet.
 
 ## How It Works
 
@@ -543,10 +579,10 @@ Ethereum P2P Network
                    GraphQL API
 ```
 
-Sieve syncs block headers and receipts over Ethereum's devp2p protocol, filters logs against your TOML config at sync time, decodes matched events, and writes to PostgreSQL. Everything else is discarded — you only store what you asked for.
+Sieve syncs block headers and receipts over the chain's devp2p protocol, filters logs against your TOML config at sync time, decodes matched events, and writes to PostgreSQL. Unmatched log and payload data is discarded — you store the events you asked for, plus the block hashes and checkpoints Sieve keeps to verify the chain and resume cleanly.
 
-- **Checkpoint/resume** — restarts from where it left off
-- **Reorg handling** — detects reorganizations (up to 64 blocks) and rolls back affected data
+- **One command** — backfill, catch-up, and live head-following, no separate modes
+- **Checkpoint/resume** — restarts exactly where it left off (see [Integrity](#integrity))
 - **Follow mode** — after historical sync, follows the chain head in real-time
 - **Graceful shutdown** — Ctrl+C stops cleanly, progress is saved
 
