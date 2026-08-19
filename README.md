@@ -1,7 +1,7 @@
 <h1 align="center">Sieve</h1>
 
 <p align="center">
-  <strong>Self-hosted indexer for Ethereum and the OP-Stack. Connects straight to the P2P network — no RPC provider.</strong><br>
+  <strong>Self-hosted indexer for Ethereum and the OP-Stack. Connects straight to the P2P network, no RPC provider.</strong><br>
   ~1000 blocks/sec on mainnet. No RPC keys. No rate limits. No bills.<br>
   Just Sieve, Postgres, and an internet connection.
 </p>
@@ -48,7 +48,7 @@ sieve init                        # creates sieve.toml, .env, abis/erc20.json (U
 sieve add-contract 0xA0b8...      # or fetch any contract ABI from Etherscan
 ```
 
-`sieve init` creates a working USDC Transfer config out of the box — plug and play. Add `--docker` to also generate a `docker-compose.yml` with PostgreSQL.
+`sieve init` creates a working USDC Transfer config out of the box, plug and play. Add `--docker` to also generate a `docker-compose.yml` with PostgreSQL.
 
 Set `ETHERSCAN_API_KEY` in `.env` for `add-contract` to work.
 
@@ -81,7 +81,7 @@ Columns are auto-generated from the ABI. Solidity camelCase is converted to snak
 sieve
 ```
 
-That's it. Sieve backfills from each contract's `start_block`, catches up to the chain head, then follows new blocks in real-time. One command — no separate "historical sync" and "follow mode" steps.
+That's it. Sieve backfills from each contract's `start_block`, catches up to the chain head, then follows new blocks in real-time. One command, no separate "historical sync" and "follow mode" steps.
 
 ### 4. Query
 
@@ -126,14 +126,14 @@ All of it configured in one TOML file. All of it stored in PostgreSQL. All of it
 
 Sieve fetches blocks from anonymous P2P peers, so it never trusts any single one. Before a block is committed:
 
-- **Multi-peer header quorum** — the canonical hash of each segment is confirmed by an absolute number of distinct peers (default 3). Empty or timed-out replies never count toward the quorum.
-- **Canonical-chain validation** — the full header chain up to the agreed tip is fetched and checked link by link (every parent hash, ending on the quorum hash).
-- **Payload verification** — transaction, receipt, ommer, and chain-specific withdrawals roots are recomputed from the block body and matched against the header. A forged body is rejected and re-fetched from another peer.
-- **Contiguous commits** — blocks are written in strict order and the checkpoint always equals the highest committed block, so a crash or kill never leaves holes or half-written ranges.
-- **Chain-bound database** — a database is pinned to its chain on first run; reusing it for a different chain is refused.
-- **Quorum-authorized reorgs** — reorgs (up to 64 blocks) roll back only when a peer quorum agrees on the new canonical tip.
+- **Multi-peer header quorum.** The canonical hash of each segment is confirmed by an absolute number of distinct peers (default 3). Empty or timed-out replies never count toward the quorum.
+- **Canonical-chain validation.** The full header chain up to the agreed tip is fetched and checked link by link (every parent hash, ending on the quorum hash).
+- **Payload verification.** Transaction, receipt, ommer, and chain-specific withdrawals roots are recomputed from the block body and matched against the header. A forged body is rejected and re-fetched from another peer.
+- **Contiguous commits.** Blocks are written in strict order and the checkpoint always equals the highest committed block, so a crash or kill never leaves holes or half-written ranges.
+- **Chain-bound database.** A database is pinned to its chain on first run; reusing it for a different chain is refused.
+- **Quorum-authorized reorgs.** Reorgs (up to 64 blocks) roll back only when a peer quorum agrees on the new canonical tip.
 
-No quorum, no commit — Sieve stops rather than write unverified data.
+No quorum, no commit. Sieve stops rather than write unverified data.
 
 ## Configuration Reference
 
@@ -153,8 +153,8 @@ Sieve indexes Ethereum mainnet by default, plus four OP-Stack chains:
 chain = "base"   # default: "mainnet"
 ```
 
-A database is bound to its chain on first run — reusing a mainnet database
-with `chain = "base"` (or any other mismatch) is refused so chain state can
+A database is bound to its chain on first run. Reusing a mainnet database
+with `chain = "base"` (or any other mismatch) is refused, so chain state can
 never mix. Use a separate database per chain, or wipe with `sieve reset` /
 `--fresh`.
 
@@ -172,7 +172,7 @@ OP-stack notes (Base, OP mainnet, Unichain, and World Chain):
   skipped by transfer indexing.
 - Peer sets on OP-Stack chains are thinner than mainnet, and many public nodes
   prune receipts (on Base, to roughly a month). For historical backfills, pin
-  archive/serving nodes via `trusted_peers` (below) — Sieve automatically avoids
+  archive/serving nodes via `trusted_peers` (below). Sieve automatically avoids
   asking peers for history they advertise as pruned.
 - Test connectivity without a config: `sieve peers --chain base` /
   `sieve peers --chain optimism` / `sieve peers --chain unichain` /
@@ -192,7 +192,7 @@ trusted_peers = ["enode://<pubkey>@<ip>:<port>"]
 ### Running Several Instances on One Host
 
 Sieve indexes exactly one chain per process (the pipeline is compiled for the
-chain in `chain =`). To index multiple chains, run one instance per chain —
+chain in `chain =`). To index multiple chains, run one instance per chain,
 each with all the protocols you want on that chain (see *Splitting Config
 Across Files* below). Two things need distinct values so co-located instances
 don't collide:
@@ -202,7 +202,7 @@ don't collide:
   UDP `port + 1`; Base runs `basev0` discv5 on the same UDP port. Give each
   instance a distinct `--p2p-port` (space them by 2) and `--api-port`, or run one
   container per instance so each gets its own network namespace. The port number
-  itself has no effect on sync speed — discovery advertises whatever port you pick.
+  itself has no effect on sync speed; discovery advertises whatever port you pick.
 - **Workers.** Each instance spawns one block-processing worker per CPU core by
   default. Packing several instances on one box oversubscribes the cores, so
   cap the count per instance:
@@ -214,7 +214,7 @@ don't collide:
 
   Rule of thumb: keep the sum of `workers` across co-located instances at or
   below the host's core count. The remaining shared resource is egress
-  bandwidth — sync speed still depends on peer count and how many peers serve
+  bandwidth. Sync speed still depends on peer count and how many peers serve
   receipts, not on the port.
 
 ### Contracts and Events
@@ -286,7 +286,7 @@ name = "UniswapV3Pool"
 abi = "abis/uniswap_v3_pool.json"
 
 # Discover child pools from the factory's creation event. start_block
-# belongs here (the children inherit it) — not on [[contracts]].
+# belongs here (children inherit it), not on [[contracts]].
 [contracts.factory]
 address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 event = "PoolCreated"
@@ -334,7 +334,7 @@ project/
 
 - **Globals live in the root only.** `chain`, `[api]`, `[p2p]`, `[sync]`, and
   `[[streams]]` may appear only in the root config. A protocol fragment may
-  contain only `[[contracts]]` and `[[transfers]]` — any global key in a
+  contain only `[[contracts]]` and `[[transfers]]`. Any global key in a
   fragment is a startup error.
 - **The root may still hold contracts.** A single-file `sieve.toml` keeps
   working exactly as before; fragments are purely additive. The root can be
@@ -489,8 +489,8 @@ All sensitive URLs live in `.env` (auto-loaded at startup via `dotenvy`). Never 
 | Variable             | Purpose                   | Override          |
 | -------------------- | ------------------------- | ----------------- |
 | `DATABASE_URL`       | PostgreSQL connection URL | `--database-url`  |
-| `WEBHOOK_URL`        | Webhook endpoint URL      | —                 |
-| `RABBITMQ_URL`       | RabbitMQ connection URL   | —                 |
+| `WEBHOOK_URL`        | Webhook endpoint URL      | n/a               |
+| `RABBITMQ_URL`       | RabbitMQ connection URL   | n/a               |
 | `ETHERSCAN_API_KEY`  | Etherscan API key         | `--etherscan-api-key` |
 
 ### `sieve add-contract`
@@ -579,12 +579,12 @@ Ethereum P2P Network
                    GraphQL API
 ```
 
-Sieve syncs block headers and receipts over the chain's devp2p protocol, filters logs against your TOML config at sync time, decodes matched events, and writes to PostgreSQL. Unmatched log and payload data is discarded — you store the events you asked for, plus the block hashes and checkpoints Sieve keeps to verify the chain and resume cleanly.
+Sieve syncs block headers and receipts over the chain's devp2p protocol, filters logs against your TOML config at sync time, decodes matched events, and writes to PostgreSQL. Unmatched log and payload data is discarded. You store the events you asked for, plus the block hashes and checkpoints Sieve keeps to verify the chain and resume cleanly.
 
-- **One command** — backfill, catch-up, and live head-following, no separate modes
-- **Checkpoint/resume** — restarts exactly where it left off (see [Integrity](#integrity))
-- **Follow mode** — after historical sync, follows the chain head in real-time
-- **Graceful shutdown** — Ctrl+C stops cleanly, progress is saved
+- **One command:** backfill, catch-up, and live head-following, no separate modes
+- **Checkpoint/resume:** restarts exactly where it left off (see [Integrity](#integrity))
+- **Follow mode:** after historical sync, follows the chain head in real-time
+- **Graceful shutdown:** Ctrl+C stops cleanly, progress is saved
 
 ## FAQ
 
@@ -594,11 +594,11 @@ Not currently. Sieve filters at sync time using Ethereum log topics (topic0–to
 
 **What happens if two contracts emit events with the same name but different parameters?**
 
-No collision. Topic0 is the keccak256 hash of the full event signature including parameter types — `Transfer(address,address,uint256)` and `Transfer(address,address,uint256,uint256)` produce different topic0 hashes. Sieve also filters by contract address first, so even identical events on different contracts are fully isolated. If you see decode warnings, it's likely a mismatched ABI (e.g., a proxy contract forwarding events with a different signature than the ABI specifies).
+No collision. Topic0 is the keccak256 hash of the full event signature including parameter types, so `Transfer(address,address,uint256)` and `Transfer(address,address,uint256,uint256)` produce different topic0 hashes. Sieve also filters by contract address first, so even identical events on different contracts are fully isolated. If you see decode warnings, it's likely a mismatched ABI (e.g., a proxy contract forwarding events with a different signature than the ABI specifies).
 
 **Can I run multiple Sieve instances on the same machine?**
 
-Yes. Each instance needs its own P2P port, database, and config. Use `--p2p-port` or `[p2p] port` in TOML to avoid port conflicts. Speed is not affected — Sieve discovers peers outbound.
+Yes. Each instance needs its own P2P port, database, and config. Use `--p2p-port` or `[p2p] port` in TOML to avoid port conflicts. Speed is not affected; Sieve discovers peers outbound.
 
 ## Acknowledgments
 

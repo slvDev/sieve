@@ -17,7 +17,7 @@ before it is committed.
 
 - **Multichain support** via a `chain` config key: Base (8453), OP Mainnet (10),
   Unichain (130), and World Chain (480), alongside Ethereum mainnet (default).
-  Each syncs over its own devp2p network — Base uses `basev0` discovery; OP,
+  Each syncs over its own devp2p network. Base uses `basev0` discovery; OP,
   Unichain, and World use discv5.
 - **Canonical-header verification** before any commit: a segment's tip hash is
   confirmed by an absolute quorum of distinct peers (default 3), the full header
@@ -33,14 +33,14 @@ before it is committed.
 - **Factory coverage tracking**: Sieve records the block range each factory was
   active for and refuses to start when adding a factory to a database already
   indexed past its start block, lowering a start block, or changing a factory's
-  creation event or parameter — cases that would silently miss children.
+  creation event or parameter, all of which would silently miss children.
   `--assume-factory-coverage` adopts factories with no coverage record when
   upgrading. Factory discovery is sequenced ahead of the parallel workers so
   same-block child events are never lost.
 - **Multi-file config**: split protocols into `*.sieve.toml` fragments beside the
   root config; Sieve discovers and merges them (globals stay in the root).
-- **Configurable worker count**: `--workers` CLI flag / `[sync] workers` — cap
-  block-processing workers to co-locate several instances on one host.
+- **Configurable worker count**: `--workers` CLI flag / `[sync] workers` to cap
+  block-processing workers when co-locating several instances on one host.
 - Chain-aware `add-contract` (per-chain Etherscan) and `sieve peers --chain`.
 - `[p2p] trusted_peers` config to pin always-connected archive/serving nodes.
 
@@ -57,7 +57,7 @@ before it is committed.
 ### Fixed
 
 - Factory child events emitted in or shortly after the child's creation block are
-  no longer dropped under parallel processing — discovery is sequenced ahead of
+  no longer dropped under parallel processing; discovery is sequenced ahead of
   the workers.
 - Withdrawals fields are validated per chain and fork for OP-Stack headers.
 
