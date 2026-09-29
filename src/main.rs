@@ -107,7 +107,7 @@ async fn main() -> eyre::Result<()> {
 ///
 /// Returns an error on config, database, P2P, or sync failures.
 async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
-    let startup = load_toml_config(cli)?;
+    let mut startup = load_toml_config(cli)?;
 
     // Validate --end-block if provided
     if let Some(end_block) = cli.end_block {
@@ -137,18 +137,14 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
             &cli.config,
             &startup.database_url,
             &table_names,
-            startup.api_port,
+            startup.api_port.filter(|_| startup.archive.is_none()),
         );
     }
 
     info!(
         start_block = startup.start_block.as_u64(),
         end_block = cli.end_block,
-        mode = if cli.end_block.is_some() {
-            "historical"
-        } else {
-            "follow"
-        },
+        mode = startup.mode(cli.end_block),
         "sieve starting"
     );
 
@@ -156,6 +152,7 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(shutdown_handler(stop_tx, cli.verbose));
 
+    let _writer_lease = db::archive_job::writer_lease(&startup.database_url).await?;
     let db = Arc::new(setup_database(cli, &startup).await?);
 
     // Prune orphaned rows beyond the checkpoint BEFORE the API can serve
@@ -177,6 +174,12 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
 
     // Metrics
     let metrics = Arc::new(metrics::SieveMetrics::new());
+
+    if let Some(import) = startup.archive.take() {
+        enforce_no_start_gap(&db, startup.start_block).await?;
+        let ctx = build_archive_context(cli, startup, &db, &metrics, stop_rx).await?;
+        return Box::pin(import.run(ctx)).await;
+    }
 
     match startup.chain {
         chain::ChainKind::Mainnet => {
@@ -403,6 +406,45 @@ async fn build_sync_context<C: chain::ChainTypes>(
     })
 }
 
+async fn build_archive_context(
+    cli: &cli::Cli,
+    startup: StartupConfig,
+    db: &Arc<db::Database>,
+    metrics: &Arc<metrics::SieveMetrics>,
+    stop_rx: watch::Receiver<bool>,
+) -> eyre::Result<sync::ingestion::IngestionContext> {
+    let event_table_map = Arc::new(build_event_table_map(&startup.resolved_events));
+    let receipt_tables = Arc::new(build_receipt_tables(
+        &startup.resolved_events,
+        &startup.resolved_transfers,
+        &startup.resolved_calls,
+    ));
+    let (handlers, transfer_handlers, call_handlers, has_transfers, has_calls) =
+        build_registries(&startup);
+    let config = Arc::new(startup.index_config);
+    db::load_factory_children(db, &config, &startup.factories).await?;
+    let factories = Arc::new(startup.factories);
+    let bloom_filter = build_bloom_filter(&config, has_transfers, has_calls, &factories);
+    Ok(sync::ingestion::IngestionContext {
+        config,
+        db: Arc::clone(db),
+        handlers,
+        metrics: Arc::clone(metrics),
+        stop_rx,
+        factories,
+        transfer_handlers,
+        call_handlers,
+        stream_dispatcher: build_stream_dispatcher(&startup.resolved_streams),
+        event_table_map,
+        is_backfill: true,
+        receipt_tables,
+        bloom_filter,
+        verbose: cli.verbose,
+        worker_count: startup.worker_count,
+        peer_count: Arc::new(|| 0),
+    })
+}
+
 /// Resolved startup parameters from TOML config + CLI.
 #[derive(Debug)]
 struct StartupConfig {
@@ -419,6 +461,17 @@ struct StartupConfig {
     resolved_streams: Vec<toml_config::ResolvedStream>,
     start_block: BlockNumber,
     worker_count: usize,
+    archive: Option<Box<archive::PreparedImport>>,
+}
+
+impl StartupConfig {
+    const fn mode(&self, end_block: Option<u64>) -> &'static str {
+        match (self.archive.is_some(), end_block.is_some()) {
+            (true, _) => "archive",
+            (_, true) => "historical",
+            _ => "follow",
+        }
+    }
 }
 
 /// Parsed + resolved config (no DB URL needed).
@@ -550,7 +603,27 @@ fn load_toml_config(cli: &cli::Cli) -> eyre::Result<StartupConfig> {
         cpu_default,
     )?;
 
+    let archive = startup
+        .sieve_config
+        .archive
+        .clone()
+        .map(|config| {
+            let dir = Path::new(&cli.config)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let fingerprint = archive::config_fingerprint(&startup.sieve_config, dir)?;
+            archive::PreparedImport::new(
+                config,
+                dir,
+                chain_kind,
+                start_block.as_u64(),
+                cli.end_block,
+                &fingerprint,
+            )
+        })
+        .transpose()?;
     Ok(StartupConfig {
+        archive: archive.map(Box::new),
         chain: chain_kind,
         database_url,
         api_port,
