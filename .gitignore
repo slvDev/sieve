@@ -1,6 +1,9 @@
 # Rust
 target/
 
+# Local credentials
+.env
+
 # IDE
 .idea/
 .vscode/

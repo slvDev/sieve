@@ -27,6 +27,15 @@ reth-discv5 = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
 discv5 = "0.10.2"
 
+# Base V2 static-file archive reader (same pinned producer codec family)
+reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+reth-codecs = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca", features = ["op"] }
+reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", rev = "a74cb9cbc38a5590b2596c67e64a3c7642024aca" }
+zstd = "0.13"
+blake3 = "1.8"
+tar = "0.4"
+fs2 = "0.4"
+
 # Alloy (Ethereum types + ABI decoding)
 alloy-primitives = "1.5.2"
 alloy-rlp = "0.3.12"
@@ -56,6 +65,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 toml = "0.8"
 
 # Logging
@@ -67,7 +77,7 @@ prometheus-client = "0.22"
 base64 = "0.22"
 
 # HTTP client (webhook notifications)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 # AMQP client (RabbitMQ streaming)
 lapin = "2.5"
