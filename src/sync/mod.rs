@@ -22,6 +22,7 @@ pub mod canonical;
 pub mod engine;
 pub mod fetch;
 pub mod follow;
+pub mod ingestion;
 pub mod reorg;
 pub mod scheduler;
 pub mod validation;
@@ -181,14 +182,15 @@ pub struct SkippedHeader {
     pub parent_hash: alloy_primitives::B256,
 }
 
-/// Item flowing from fetch tasks to the processing workers.
+/// Commitment-checked payload or skipped header submitted to shared ingestion.
+/// Header authentication is enforced by the sequencer before processing.
 ///
 /// Payloads are boxed: the enum would otherwise be as large as its
 /// biggest variant for every skipped-header record.
 #[derive(Debug)]
 pub enum FetchItem<C: ChainTypes> {
     /// Full payload for filtering/decoding.
-    Payload(Box<BlockPayload<C>>),
+    Payload(Box<validation::ValidatedPayload<C>>),
     /// Bloom-skipped block: hash record only.
     Skipped(SkippedHeader),
 }

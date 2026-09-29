@@ -5,7 +5,7 @@
 //! Generic over [`ChainTypes`] so the same engine serves every supported
 //! chain.
 
-use alloy_consensus::{proofs, BlockBody};
+use alloy_consensus::BlockBody;
 use alloy_primitives::B256;
 use eyre::{eyre, Result, WrapErr};
 use futures::StreamExt;
@@ -34,7 +34,7 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 use tracing::{debug, info};
 
 use crate::chain::ChainTypes;
-use crate::sync::BlockPayload;
+use crate::sync::{validation::ValidatedPayload, BlockPayload};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const MIN_PEER_START: usize = 1;
@@ -227,7 +227,7 @@ struct ChunkedResponse<T> {
 /// Outcome of a full payload fetch for a peer.
 #[derive(Debug)]
 pub struct PayloadFetchOutcome<C: ChainTypes> {
-    pub payloads: Vec<BlockPayload<C>>,
+    pub payloads: Vec<ValidatedPayload<C>>,
     pub missing_blocks: Vec<u64>,
     pub fetch_stats: FetchStageStats,
 }
@@ -924,34 +924,6 @@ async fn request_receipts_chunked_partial_with_stats<C: ChainTypes>(
 
 // ── High-level fetch ─────────────────────────────────────────────────
 
-/// Validate a fetched body and receipts against the block header.
-///
-/// Recomputes the transaction, ommers, withdrawals, and receipt roots from
-/// the fetched data and compares them to the header commitments. Receipt
-/// blooms are recomputed from logs, never trusted from the peer.
-fn validate_payload<C: ChainTypes>(
-    header: &Header,
-    body: &BlockBody<C::SignedTx>,
-    receipts: &[C::Receipt],
-) -> Result<(), &'static str> {
-    if body.transactions.len() != receipts.len() {
-        return Err("transaction/receipt count mismatch");
-    }
-    if proofs::calculate_transaction_root(&body.transactions) != header.transactions_root {
-        return Err("transactions root mismatch");
-    }
-    if proofs::calculate_ommers_root(&body.ommers) != header.ommers_hash {
-        return Err("ommers root mismatch");
-    }
-    if !C::withdrawals_valid(header, body) {
-        return Err("withdrawals mismatch");
-    }
-    if C::receipts_root(receipts, header) != header.receipts_root {
-        return Err("receipts root mismatch");
-    }
-    Ok(())
-}
-
 /// Fetch bodies and receipts for a set of headers from a peer.
 ///
 /// Headers must already be fetched and sealed; this uses their hashes to
@@ -997,22 +969,17 @@ pub async fn fetch_payloads_for_headers<C: ChainTypes>(
 
         match (body, block_receipts) {
             (Some(body), Some(block_receipts)) => {
-                if let Err(reason) = validate_payload::<C>(sealed.header(), &body, &block_receipts)
-                {
-                    debug!(
-                        peer_id = ?peer.peer_id,
-                        block = number,
-                        reason,
-                        "payload validation failed; dropping block"
-                    );
-                    missing_blocks.push(number);
-                    continue;
-                }
-                payloads.push(BlockPayload::new(
+                match ValidatedPayload::new(BlockPayload::new(
                     sealed.into_header(),
                     body,
                     block_receipts,
-                ));
+                )) {
+                    Ok(payload) => payloads.push(payload),
+                    Err(reason) => {
+                        debug!(peer_id = ?peer.peer_id, block = number, reason, "payload validation failed; dropping block");
+                        missing_blocks.push(number);
+                    }
+                }
             }
             _ => {
                 missing_blocks.push(number);
@@ -1038,8 +1005,8 @@ pub async fn fetch_payloads_for_headers<C: ChainTypes>(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_payload;
     use crate::chain::EthereumChain;
+    use crate::sync::validation::validate_payload;
     use crate::test_utils::{build_test_transaction, make_log, make_receipt};
     use alloy_consensus::proofs;
     use alloy_primitives::{Address, Bytes, B256};

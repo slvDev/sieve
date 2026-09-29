@@ -1,4 +1,4 @@
-//! Canonical-header verification — the single source of chain authority.
+//! Peer-quorum header verification and persisted-frontier classification.
 //!
 //! A Status handshake proves nothing about DATA: chain id, genesis, and
 //! fork-id are copyable, and a hostile peer can serve a fully fabricated,
@@ -128,6 +128,21 @@ impl CanonicalChain {
             .checked_sub(self.start)
             .and_then(|idx| self.headers.get(idx as usize))
     }
+}
+
+#[cfg(test)]
+pub(super) fn fixture_chain(headers: Vec<Header>) -> eyre::Result<CanonicalChain> {
+    let start = headers
+        .first()
+        .ok_or_else(|| eyre::eyre!("empty fixture"))?
+        .number;
+    let last = headers.last().ok_or_else(|| eyre::eyre!("empty fixture"))?;
+    let end = last.number;
+    let tip = SealedHeader::seal_slow(last.clone()).hash();
+    Ok(CanonicalChain {
+        start,
+        headers: validate_canonical_chain(start, end, headers, tip, None, false)?,
+    })
 }
 
 // ── Pure quorum + validation core (fully unit-tested) ────────────────
@@ -442,6 +457,8 @@ pub enum FrontierStatus {
     /// with its marker. The tip still needs a quorum re-check (a reorg may
     /// have happened while stopped).
     Committed { checkpoint: u64, hash: B256 },
+    /// Archive-backed state requires replay of retained headers to its trusted anchor.
+    Archive(super::validation::ArchiveFrontier),
 }
 
 /// Classify a database's committed frontier — the trust boundary.
@@ -459,14 +476,20 @@ pub enum FrontierStatus {
 ///   partial migration);
 /// - indexed state whose marker disagrees with the checkpoint or the
 ///   stored checkpoint hash → refused as torn/poisoned;
-/// - otherwise → [`FrontierStatus::Committed`], to be tip-verified by
-///   quorum.
+/// - peer-quorum marker → [`FrontierStatus::Committed`], to be tip-verified by quorum;
+/// - archive marker → [`FrontierStatus::Archive`], to be reverified using retained
+///   header evidence, never by silently substituting a peer decision.
 ///
 /// # Errors
 ///
 /// Returns an error on refused state or a query failure.
 pub async fn committed_frontier_status(db: &Database) -> eyre::Result<FrontierStatus> {
+    let archive = crate::db::verification::archive_frontier(db).await?;
     if !db.has_indexed_state().await? {
+        eyre::ensure!(
+            archive.is_none(),
+            "archive provenance exists without indexed state"
+        );
         return Ok(FrontierStatus::Fresh);
     }
     let checkpoint = db.last_checkpoint().await?.map_or(0, BlockNumber::as_u64);
@@ -497,10 +520,32 @@ pub async fn committed_frontier_status(db: &Database) -> eyre::Result<FrontierSt
         ));
     }
 
-    Ok(FrontierStatus::Committed {
-        checkpoint,
-        hash: stored,
-    })
+    if let Some(archive) = &archive {
+        eyre::ensure!(
+            archive.block <= checkpoint
+                && db.get_block_hash(BlockNumber::new(archive.block)).await? == Some(archive.hash),
+            "archive provenance does not match committed state"
+        );
+    }
+    match crate::db::verification::frontier_source(db)
+        .await?
+        .as_deref()
+    {
+        Some("peer_quorum") => Ok(FrontierStatus::Committed {
+            checkpoint,
+            hash: stored,
+        }),
+        Some("archive_checkpoint") => {
+            let archive = archive
+                .ok_or_else(|| eyre::eyre!("archive frontier has no retained evidence metadata"))?;
+            eyre::ensure!(
+                archive.block == checkpoint && archive.hash == stored,
+                "archive provenance does not match frontier"
+            );
+            Ok(FrontierStatus::Archive(archive))
+        }
+        _ => eyre::bail!("unsupported frontier verification source"),
+    }
 }
 
 /// Collect one full round of votes: ask every panel peer for the header

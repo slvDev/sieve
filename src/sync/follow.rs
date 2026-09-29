@@ -496,6 +496,7 @@ pub async fn rollback_to_ancestor(
     info!(ancestor, "rolling back to common ancestor");
     let ancestor_block = BlockNumber::new(ancestor);
     let mut tx = db.begin().await?;
+    db::verification::ensure_rollback_above_archive(&mut tx, ancestor_block).await?;
     handlers.rollback_all(ancestor_block, &mut tx).await?;
     transfer_handlers
         .rollback_all(ancestor_block, &mut tx)

@@ -5,7 +5,8 @@ use crate::filter::BloomFilter;
 use crate::p2p::{fetch_payloads_for_headers, NetworkPeer, PeerPool};
 use crate::sync::canonical::CanonicalChain;
 use crate::sync::scheduler::{PeerHealthTracker, PeerWorkScheduler};
-use crate::sync::{BlockPayload, FetchItem, FetchMode, SkippedHeader};
+use crate::sync::validation::ValidatedPayload;
+use crate::sync::{FetchItem, FetchMode, SkippedHeader};
 use eyre::{eyre, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use tracing::instrument;
 
 #[derive(Debug)]
 pub struct FetchIngestOutcome<C: ChainTypes> {
-    pub payloads: Vec<BlockPayload<C>>,
+    pub payloads: Vec<ValidatedPayload<C>>,
     pub missing_blocks: Vec<u64>,
     pub bloom_skipped: Vec<SkippedHeader>,
     #[expect(
