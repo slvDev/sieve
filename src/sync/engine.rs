@@ -113,8 +113,8 @@ pub async fn verify_or_recover_frontier<C: ChainTypes>(
     verify_or_recover_frontier_with_archive(ctx, policy, None).await
 }
 
-/// The retained-jar adapter supplies headers on restart; until it is wired by
-/// phase 3, archive-backed state fails closed before the API can start.
+/// Reauthenticate the retained archive boundary before verifying any P2P tail.
+/// An archive-backed database without its reader fails closed before API startup.
 pub async fn verify_or_recover_frontier_with_archive<C: ChainTypes>(
     ctx: &SyncContext<C>,
     policy: &QuorumPolicy,

@@ -1,5 +1,6 @@
 //! Offline planning and explicitly configured Base V2 archive ingestion.
 
+pub mod handoff;
 mod manifest;
 mod plan;
 mod reader;

@@ -177,6 +177,12 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
 
     if let Some(import) = startup.archive.take() {
         enforce_no_start_gap(&db, startup.start_block).await?;
+        if import.handoff() && cli.end_block != Some(import.bridge().end) {
+            return Box::pin(prepare_archive_and_run(
+                cli, startup, *import, &db, &metrics, stop_rx,
+            ))
+            .await;
+        }
         let ctx = build_archive_context(cli, startup, &db, &metrics, stop_rx).await?;
         return Box::pin(import.run(ctx)).await;
     }
@@ -198,6 +204,86 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
             prepare_and_run::<chain::WorldChain>(cli, startup, &db, &metrics, stop_rx).await
         }
     }
+}
+
+async fn connect_archive_context(
+    ctx: sync::ingestion::IngestionContext,
+    port: Option<u16>,
+    trusted: &[reth_network_peers::TrustedPeer],
+) -> eyre::Result<Option<sync::SyncContext<chain::BaseChain>>> {
+    let mut stop = ctx.stop_rx.clone();
+    if *stop.borrow() {
+        return Ok(None);
+    }
+    let session = tokio::select! {
+        _ = stop.wait_for(|stopped| *stopped) => return Ok(None),
+        result = p2p::connect_peers::<chain::BaseChain>(port, trusted) => result?,
+    };
+    Ok(Some(ctx.into_sync(session.pool)))
+}
+
+async fn prepare_archive_and_run(
+    cli: &cli::Cli,
+    startup: StartupConfig,
+    import: archive::PreparedImport,
+    db: &Arc<db::Database>,
+    metrics: &Arc<metrics::SieveMetrics>,
+    stop_rx: watch::Receiver<bool>,
+) -> eyre::Result<()> {
+    let mut api = build_api_schema(&startup, db)?;
+    let start = startup.start_block;
+    let port = startup.p2p_port;
+    let trusted = startup.trusted_peers.clone();
+    let bridge = import.bridge();
+    let archive_ctx = build_archive_context(cli, startup, db, metrics, stop_rx).await?;
+    // Archive download and indexing never depend on peer availability.
+    let retained = import.run_retained(archive_ctx.clone()).await?;
+    let archived_frontier = matches!(
+        sync::canonical::committed_frontier_status(db).await?,
+        sync::canonical::FrontierStatus::Archive(_)
+    );
+    if archived_frontier {
+        if let Some((port, schema)) = api.take() {
+            spawn_api_server(port, schema, metrics, &archive_ctx.stop_rx);
+        }
+    }
+    info!(
+        archive_end = bridge.end,
+        "archive complete; connecting ordinary Base peers for recent-history backfill"
+    );
+    let Some(ctx) = connect_archive_context(archive_ctx, port, &trusted).await? else {
+        return Ok(());
+    };
+    let result = run_archive_tail(cli, start, ctx, bridge, retained.reader(), api).await;
+    // Keep retained evidence and its staging lease alive through peer sync.
+    drop(retained);
+    result
+}
+
+async fn run_archive_tail(
+    cli: &cli::Cli,
+    start: BlockNumber,
+    ctx: sync::SyncContext<chain::BaseChain>,
+    bridge: archive::handoff::Bridge,
+    reader: &dyn sync::validation::ArchiveRecoveryReader,
+    api: Option<(u16, async_graphql::dynamic::Schema)>,
+) -> eyre::Result<()> {
+    let policy = sync::canonical::QuorumPolicy::default();
+    if !bridge.verify_tail(&ctx, reader, &policy).await? {
+        return Ok(());
+    }
+    if let Some((port, schema)) = api {
+        spawn_api_server(port, schema, &ctx.metrics, &ctx.stop_rx);
+    }
+    info!(archive_end = bridge.end, "archive transition: HISTORY");
+    if cli.end_block.is_none() {
+        archive::handoff::catch_up(ctx.clone()).await?;
+        if *ctx.stop_rx.borrow() {
+            return Ok(());
+        }
+        info!("archive transition: FOLLOW");
+    }
+    run_indexer(cli, start, ctx).await
 }
 
 /// Connect peers, verify the committed frontier by quorum (recovering from

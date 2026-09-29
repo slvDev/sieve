@@ -120,6 +120,13 @@ impl<C: ChainTypes> PeerPool<C> {
         Self::new()
     }
 
+    #[cfg(test)]
+    pub const fn fixture(peers: Vec<NetworkPeer<C>>) -> Self {
+        Self {
+            peers: RwLock::new(peers),
+        }
+    }
+
     /// Number of peers currently in the pool.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -118,7 +118,16 @@ pub async fn find_common_ancestor<C: ChainTypes>(
     last_indexed: u64,
     expected_tip: alloy_primitives::B256,
 ) -> Result<Option<u64>> {
-    let low = last_indexed.saturating_sub(MAX_REORG_DEPTH);
+    let archive_boundary = crate::db::verification::archive_frontier(db)
+        .await?
+        .map(|f| f.block);
+    let low = last_indexed
+        .saturating_sub(MAX_REORG_DEPTH)
+        .max(archive_boundary.unwrap_or(0));
+    eyre::ensure!(
+        low <= last_indexed,
+        "checkpoint precedes trusted archive boundary"
+    );
     let count = (last_indexed - low + 1) as usize;
 
     for anchor in anchors {
@@ -141,6 +150,9 @@ pub async fn find_common_ancestor<C: ChainTypes>(
         };
 
         let Some(ancestor) = walk_to_ancestor(db, &network_hashes, low, last_indexed).await? else {
+            if archive_boundary == Some(low) {
+                return Err(eyre::eyre!("canonical chain conflicts with trusted archive boundary at {low}; explicit recovery required"));
+            }
             return Err(eyre::eyre!(
                 "reorg exceeds max depth ({MAX_REORG_DEPTH} blocks) — cannot find common ancestor"
             ));

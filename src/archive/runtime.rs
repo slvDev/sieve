@@ -32,6 +32,11 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveConfig {
+    /// Continue through peer history into follow mode after the pinned endpoint.
+    #[serde(default)]
+    pub handoff: bool,
+    #[serde(default = "default_handoff_retry")]
+    pub handoff_retry_secs: u64,
     pub manifest: PathBuf,
     pub manifest_sha256: String,
     pub end_block: u64,
@@ -49,6 +54,9 @@ pub struct ArchiveConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_transactions")]
     pub max_transactions_per_block: u32,
+}
+const fn default_handoff_retry() -> u64 {
+    15
 }
 const fn default_reserve() -> u64 {
     5_368_709_120
@@ -75,6 +83,18 @@ pub struct PreparedImport {
     evidence: ArchiveEvidence,
 }
 
+/// Keeps both retained evidence and its staging lease alive through P2P sync.
+pub struct RetainedArchive {
+    reader: Arc<HeaderReader>,
+    _staging: Arc<Staging>,
+}
+
+impl RetainedArchive {
+    pub fn reader(&self) -> &dyn ArchiveRecoveryReader {
+        self.reader.as_ref()
+    }
+}
+
 impl PreparedImport {
     /// Validate the entire job before connecting to PostgreSQL or downloading.
     pub fn new(
@@ -90,8 +110,14 @@ impl PreparedImport {
             "archive import is supported only for Base"
         );
         ensure!(
-            cli_end.is_none_or(|end| end == config.end_block),
-            "--end-block must match archive.end_block (the trusted checkpoint)"
+            cli_end.is_none_or(|end| {
+                end == config.end_block || (config.handoff && end > config.end_block)
+            }),
+            "--end-block must match archive.end_block, or exceed it with archive.handoff enabled"
+        );
+        ensure!(
+            config.handoff_retry_secs > 0,
+            "archive handoff_retry_secs must be positive"
         );
         ensure!(
             config.timeout_secs > 0 && config.max_transactions_per_block > 0,
@@ -169,11 +195,32 @@ impl PreparedImport {
     }
 
     pub async fn run(self, ctx: IngestionContext) -> Result<()> {
+        self.run_retained(ctx).await.map(|_| ())
+    }
+
+    pub const fn handoff(&self) -> bool {
+        self.config.handoff
+    }
+
+    pub const fn bridge(&self) -> super::handoff::Bridge {
+        super::handoff::Bridge {
+            end: self.evidence.anchor_block,
+            hash: self.evidence.anchor_hash,
+            retry_secs: self.config.handoff_retry_secs,
+        }
+    }
+
+    pub async fn run_retained(self, ctx: IngestionContext) -> Result<RetainedArchive> {
         let start = self.plan.requested_range[0];
         let end = self.plan.requested_range[1];
         db::archive_job::prepare(&ctx.db, &self.identity, &self.evidence, start, end).await?;
         let state = canonical::committed_frontier_status(&ctx.db).await?;
         let progress = db::archive_job::progress(&ctx.db).await?;
+        let frontier = db::verification::archive_frontier(&ctx.db).await?;
+        ensure!(
+            progress.is_none() || frontier.is_some(),
+            "archive progress has no retained frontier provenance"
+        );
         let next = resume_block(&state, progress, start, &self.evidence)?;
         ensure!(
             next >= start && next <= end + 1,
@@ -202,7 +249,11 @@ impl PreparedImport {
             })
             .await??,
         );
-        if let FrontierStatus::Archive(frontier) = state {
+        if let Some(frontier) = frontier {
+            ensure!(
+                frontier.evidence == self.evidence,
+                "archive evidence changed on resume"
+            );
             let retained = Arc::clone(&reader);
             tokio::task::spawn_blocking(move || {
                 verify_archive_recovery(&frontier, retained.as_ref())
@@ -221,9 +272,9 @@ impl PreparedImport {
         );
         run_groups(
             &ctx,
-            staging,
+            Arc::clone(&staging),
             &plan,
-            reader,
+            Arc::clone(&reader),
             proof,
             next,
             self.config.max_transactions_per_block,
@@ -240,7 +291,10 @@ impl PreparedImport {
             end,
             "archive import complete; payload scratch released, header evidence retained"
         );
-        Ok(())
+        Ok(RetainedArchive {
+            reader,
+            _staging: staging,
+        })
     }
 }
 
@@ -259,11 +313,19 @@ fn resume_block(
             start
         }
         FrontierStatus::Committed { checkpoint, .. } => {
-            ensure!(
-                progress.is_none(),
-                "archive progress disagrees with frontier provenance"
-            );
-            checkpoint + 1
+            if let Some((block, hash)) = progress {
+                ensure!(
+                    block == evidence.anchor_block
+                        && hash == evidence.anchor_hash
+                        && *checkpoint > block,
+                    "archive progress disagrees with frontier provenance"
+                );
+                // A P2P tail may advance the scalar checkpoint while the archive
+                // journal remains at its immutable completed boundary.
+                block + 1
+            } else {
+                checkpoint + 1
+            }
         }
         FrontierStatus::Archive(frontier) => {
             ensure!(

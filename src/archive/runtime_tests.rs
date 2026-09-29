@@ -73,6 +73,8 @@ impl Fixture {
         )?;
         fs::write(root.join("manifest.json"), &raw)?;
         let config = ArchiveConfig {
+            handoff: false,
+            handoff_retry_secs: 15,
             manifest: root.join("manifest.json"),
             manifest_sha256: format!("{:x}", Sha256::digest(&raw)),
             end_block: 104,

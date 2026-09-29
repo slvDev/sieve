@@ -66,6 +66,33 @@ pub struct IngestionContext {
 }
 
 impl IngestionContext {
+    /// Attach peers after archive ingestion while preserving handler and factory
+    /// state, the database, shutdown channel, and stream configuration.
+    pub fn into_sync<C: ChainTypes>(
+        self,
+        pool: Arc<crate::p2p::PeerPool<C>>,
+    ) -> super::SyncContext<C> {
+        super::SyncContext {
+            pool,
+            config: self.config,
+            db: self.db,
+            handlers: self.handlers,
+            metrics: self.metrics,
+            stop_rx: self.stop_rx,
+            factories: self.factories,
+            transfer_handlers: self.transfer_handlers,
+            call_handlers: self.call_handlers,
+            stream_dispatcher: self.stream_dispatcher,
+            event_table_map: self.event_table_map,
+            is_backfill: self.is_backfill,
+            receipt_tables: self.receipt_tables,
+            bloom_filter: self.bloom_filter,
+            head_seen_rx: None,
+            verbose: self.verbose,
+            worker_count: self.worker_count,
+        }
+    }
+
     pub fn from_sync<C: ChainTypes>(ctx: &super::SyncContext<C>) -> Self {
         let pool = Arc::clone(&ctx.pool);
         Self {
