@@ -24,6 +24,7 @@ pub mod fetch;
 pub mod follow;
 pub mod reorg;
 pub mod scheduler;
+pub mod validation;
 
 pub use engine::{run_canonical_segments, verify_or_recover_frontier};
 pub use follow::run_follow_loop;

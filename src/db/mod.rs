@@ -11,6 +11,8 @@
 //! Transaction model: one Postgres transaction per block, so all handler
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
+pub mod verification;
+
 use crate::config::IndexConfig;
 use crate::toml_config::{ResolvedCall, ResolvedEvent, ResolvedFactory, ResolvedTransfer};
 use crate::types::BlockNumber;
@@ -229,6 +231,7 @@ pub async fn rollback_to(
     tx: &mut Transaction<'_, Postgres>,
     block_number: BlockNumber,
 ) -> eyre::Result<()> {
+    verification::ensure_rollback_above_archive(tx, block_number).await?;
     sqlx::query("DELETE FROM _sieve_block_hashes WHERE block_number > $1")
         .bind(block_number.as_u64() as i64)
         .execute(&mut **tx)
@@ -265,8 +268,9 @@ pub async fn rollback_to(
     match target_hash {
         Some(hash) => {
             sqlx::query(
-                "UPDATE _sieve_canonical SET verified_through = $1, verified_hash = $2 \
-                 WHERE id = 1",
+                "UPDATE _sieve_canonical SET verified_through = $1, verified_hash = $2, \
+                 source = CASE WHEN EXISTS (SELECT 1 FROM _sieve_archive_frontier WHERE block_number = $1) \
+                 THEN 'archive_checkpoint' ELSE 'peer_quorum' END WHERE id = 1",
             )
             .bind(block_number.as_u64() as i64)
             .bind(hash)
@@ -887,6 +891,7 @@ pub async fn drop_all_tables(
         "_sieve_tables",
         "_sieve_factories",
         "_sieve_canonical",
+        "_sieve_archive_frontier",
         "_sqlx_migrations",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
@@ -978,15 +983,15 @@ CREATE TABLE IF NOT EXISTS _sieve_tables (
 
 /// DDL for the `_sieve_canonical` verified-frontier marker (single row).
 ///
-/// Records the highest block whose committed hash was verified against a
-/// peer quorum. Startup verification writes it after confirming the
-/// checkpoint hash is canonical; it makes "this state was quorum-verified"
-/// an explicit, inspectable fact rather than an implicit assumption.
+/// Records the authenticated committed frontier and its verification source.
+/// Existing markers migrate to peer_quorum; archive_checkpoint markers require
+/// separate retained evidence. Both are advanced atomically by the writer.
 pub const CANONICAL_FRONTIER_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS _sieve_canonical (
     id SMALLINT PRIMARY KEY DEFAULT 1,
     verified_through BIGINT NOT NULL,
-    verified_hash BYTEA NOT NULL
+    verified_hash BYTEA NOT NULL,
+    source TEXT NOT NULL DEFAULT 'peer_quorum'
 )";
 
 /// Create sieve-internal tables at runtime.
@@ -1053,6 +1058,11 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
         .await
         .wrap_err("failed to create _sieve_canonical")?;
 
+    sqlx::raw_sql("ALTER TABLE _sieve_canonical ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'peer_quorum'")
+        .execute(db.pool()).await?;
+    sqlx::raw_sql(verification::ARCHIVE_FRONTIER_DDL)
+        .execute(db.pool())
+        .await?;
     info!("internal tables ready");
     Ok(())
 }
@@ -1158,7 +1168,8 @@ impl Database {
         has_prior_sieve_state(self).await
     }
 
-    /// Read the quorum-verified frontier `(block, hash)`, if recorded.
+    /// Read the authenticated frontier `(block, hash)`, if recorded.
+    /// The source is read separately when classifying startup state.
     ///
     /// Its PRESENCE is the trust boundary: a database Sieve built through
     /// the canonical stage always has it (advanced atomically with every
@@ -1202,10 +1213,10 @@ pub async fn advance_verified_frontier(
     hash: &B256,
 ) -> eyre::Result<()> {
     sqlx::query(
-        "INSERT INTO _sieve_canonical (id, verified_through, verified_hash) \
-         VALUES (1, $1, $2) \
+        "INSERT INTO _sieve_canonical (id, verified_through, verified_hash, source) \
+         VALUES (1, $1, $2, 'peer_quorum') \
          ON CONFLICT (id) DO UPDATE SET verified_through = EXCLUDED.verified_through, \
-         verified_hash = EXCLUDED.verified_hash",
+         verified_hash = EXCLUDED.verified_hash, source = EXCLUDED.source",
     )
     .bind(block.as_u64() as i64)
     .bind(hash.as_slice())
