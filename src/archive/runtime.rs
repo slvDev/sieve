@@ -376,3 +376,7 @@ pub fn config_fingerprint(config: &crate::toml_config::SieveConfig, dir: &Path) 
     let bytes = serde_json::to_vec(&value)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
