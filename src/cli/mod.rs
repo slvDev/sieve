@@ -69,6 +69,8 @@ pub struct Cli {
 /// Utility subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Inspect a pinned Base V2 archive manifest offline; print a JSON import plan.
+    ArchivePlan(crate::archive::PlanArgs),
     /// Scaffold a new Sieve project (creates sieve.toml and abis/erc20.json).
     Init {
         /// Also generate a docker-compose.yml for running Sieve with PostgreSQL.

@@ -10,6 +10,7 @@
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod api;
+mod archive;
 mod chain;
 mod cli;
 mod config;
@@ -67,6 +68,7 @@ async fn main() -> eyre::Result<()> {
     // Route subcommands
     if let Some(ref command) = cli.command {
         return match command {
+            cli::Command::ArchivePlan(args) => archive::print_plan(args),
             cli::Command::Init { docker } => cmd_init(&cli, *docker),
             cli::Command::Schema => cmd_schema(&cli),
             cli::Command::Reset => cmd_reset(&cli).await,
