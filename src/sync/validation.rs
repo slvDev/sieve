@@ -148,11 +148,7 @@ impl<C: ChainTypes> AuthenticatedSegment<C> {
 
 impl AuthenticatedSegment<crate::chain::BaseChain> {
     /// Verify retained headers through the independently trusted anchor, keeping
-    /// only the bounded segment being submitted. A jar adapter is added in phase 3.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase-3 retained-jar adapter input")
-    )]
+    /// only the bounded segment being submitted.
     pub fn archive(
         evidence: ArchiveEvidence,
         headers: impl IntoIterator<Item = EyreResult<Header>>,

@@ -1,7 +1,11 @@
-//! Read-only Base archive planning. No downloads, database writes, or peer probes.
+//! Offline planning and explicitly configured Base V2 archive ingestion.
 
 mod manifest;
 mod plan;
+mod reader;
+mod runtime;
+mod staging;
+pub use runtime::{config_fingerprint, ArchiveConfig, PreparedImport};
 
 #[cfg(test)]
 mod tests;

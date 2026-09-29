@@ -7,7 +7,7 @@ use crate::config::{ContractConfig, IndexConfig};
 use alloy_json_abi::JsonAbi;
 use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -15,8 +15,10 @@ use tracing::info;
 // ── TOML serde types ──────────────────────────────────────────────────
 
 /// Top-level TOML config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SieveConfig {
+    /// Explicit finite Base archive import.
+    pub archive: Option<crate::archive::ArchiveConfig>,
     /// Chain to index: "mainnet" (default) or "base".
     pub chain: Option<String>,
     /// Optional API configuration.
@@ -38,14 +40,14 @@ pub struct SieveConfig {
 }
 
 /// API section.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ApiConfig {
     /// Port for the GraphQL API server (default: 4000).
     pub port: Option<u16>,
 }
 
 /// Sync/processing section.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SyncConfig {
     /// Number of parallel block-processing workers. Defaults to the CPU
     /// count. Lower it to co-locate several Sieve instances on one host
@@ -54,7 +56,7 @@ pub struct SyncConfig {
 }
 
 /// P2P section.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct P2pConfig {
     /// Port for the P2P listener (default: 30303).
     pub port: Option<u16>,
@@ -66,7 +68,7 @@ pub struct P2pConfig {
 }
 
 /// A contract definition from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlContract {
     /// Human-readable name (e.g. "USDC").
     pub name: String,
@@ -91,7 +93,7 @@ pub struct TomlContract {
 }
 
 /// Factory section for a contract definition.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlFactory {
     /// Factory contract address (hex with 0x prefix).
     pub address: String,
@@ -106,7 +108,7 @@ pub struct TomlFactory {
 }
 
 /// An event definition from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlEvent {
     /// Event name as it appears in the ABI (e.g. "Transfer").
     pub name: String,
@@ -123,7 +125,7 @@ pub struct TomlEvent {
 }
 
 /// An explicit column mapping from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlColumn {
     /// ABI parameter name to map.
     pub param: String,
@@ -135,7 +137,7 @@ pub struct TomlColumn {
 }
 
 /// A function call definition from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlCall {
     /// Function name as it appears in the ABI (e.g. "exactInputSingle").
     pub name: String,
@@ -148,7 +150,7 @@ pub struct TomlCall {
 }
 
 /// A native ETH transfer definition from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlTransfer {
     /// Human-readable name (e.g. "eth_transfers").
     pub name: String,
@@ -167,7 +169,7 @@ pub struct TomlTransfer {
 }
 
 /// Address filter for native ETH transfers.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlTransferFilter {
     /// Only include transfers from these addresses.
     pub from: Option<Vec<String>>,
@@ -176,7 +178,7 @@ pub struct TomlTransferFilter {
 }
 
 /// A stream/webhook notification sink from TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TomlStream {
     /// Unique name for this stream.
     pub name: String,
@@ -1162,7 +1164,7 @@ pub fn load_config(config_path: &Path) -> eyre::Result<SieveConfig> {
 /// `api`, `p2p`, `sync`, `streams`) belong to the root config alone —
 /// `deny_unknown_fields` turns any of them appearing in a fragment into a
 /// parse error.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FragmentConfig {
     #[serde(default)]
