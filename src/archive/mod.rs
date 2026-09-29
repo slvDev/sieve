@@ -1,5 +1,7 @@
 //! Offline planning and explicitly configured Base V2 archive ingestion.
 
+#[cfg(test)]
+mod acceptance_tests;
 pub mod handoff;
 mod manifest;
 mod plan;

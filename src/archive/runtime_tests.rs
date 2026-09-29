@@ -803,6 +803,104 @@ fn indexing_fingerprint_is_stable_but_detects_abi_and_filter_changes() -> Result
     Ok(())
 }
 
+#[test]
+fn extraction_rejects_traversal_absolute_paths_and_tar_links() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let import = fixture.import(100)?;
+    let (_stop, rx) = watch::channel(false);
+    let stage = Staging::open(
+        fixture.config.clone(),
+        import.identity.as_bytes(),
+        &import.manifest,
+        rx,
+    )?;
+    let archive = &import.plan.groups[0].archives[0];
+    for (index, kind, path) in [
+        (0, tar::EntryType::Regular, "../escape"),
+        (1, tar::EntryType::Regular, "/escape"),
+        (2, tar::EntryType::Symlink, archive.files[0].path.as_str()),
+        (3, tar::EntryType::Link, archive.files[0].path.as_str()),
+    ] {
+        let source = fixture.root.join(format!("unsafe-{index}.tar.zst"));
+        let encoder = zstd::Encoder::new(File::create(&source)?, 1)?;
+        let mut tar = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_size(0);
+        header.set_mode(0o644);
+        // Build hostile input directly; the safe tar builder rejects these paths.
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        if kind.is_symlink() || kind.is_hard_link() {
+            header.set_link_name("../../escape")?;
+        }
+        header.set_cksum();
+        tar.append(&header, std::io::empty())?;
+        tar.into_inner()?.finish()?;
+        let partial = stage.root.join(format!("unsafe-{index}.partial"));
+        assert!(stage.extract(archive, &source, &partial).is_err());
+        assert_eq!(fs::read_dir(partial.join("static_files"))?.count(), 0);
+        assert!(!fixture.root.join("escape").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn free_space_reserve_and_cancellation_stop_staging_before_transfer() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let import = fixture.import(100)?;
+    let mut config = fixture.config.clone();
+    config.min_free_bytes = u64::MAX;
+    let (stop, rx) = watch::channel(false);
+    let stage = Staging::open(config, import.identity.as_bytes(), &import.manifest, rx)?;
+    assert!(stage.stage(&import.plan.groups[0].archives[0]).is_err());
+    assert!(!stage.root.join("transfer.json").exists());
+    drop(stage);
+    let stage = Staging::open(
+        fixture.config.clone(),
+        import.identity.as_bytes(),
+        &import.manifest,
+        stop.subscribe(),
+    )?;
+    stop.send(true)?;
+    assert!(stage.stage(&import.plan.groups[0].archives[0]).is_err());
+    assert!(!stage.root.join("transfer.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+async fn cancelled_archive_keeps_progress_resumable_and_bad_anchor_commits_nothing() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let import = fixture.import(100)?;
+    drop(fixture.stage(&import)?);
+    let (mut ctx, _, _) = ingestion_tests::context(false).await?;
+    let (stop, rx) = watch::channel(true);
+    ctx.stop_rx = rx;
+    assert!(import.run(ctx.clone()).await.is_err());
+    assert!(!ctx.db.has_indexed_state().await?);
+    assert!(db::archive_job::progress(&ctx.db).await?.is_none());
+    stop.send(false)?;
+    fixture.import(100)?.run(ctx.clone()).await?;
+    assert_eq!(
+        ctx.db.last_checkpoint().await?,
+        Some(crate::types::BlockNumber::new(104))
+    );
+
+    let mut invalid = Fixture::new()?;
+    invalid.config.checkpoint_hash = B256::ZERO;
+    let import = invalid.import(100)?;
+    drop(invalid.stage(&import)?);
+    let (ctx, _, _) = ingestion_tests::context(false).await?;
+    assert!(import.run(ctx.clone()).await.is_err());
+    assert!(!ctx.db.has_indexed_state().await?);
+    assert!(db::archive_job::progress(&ctx.db).await?.is_none());
+    let children: i64 = sqlx::query_scalar("SELECT count(*) FROM _sieve_factory_children")
+        .fetch_one(ctx.db.pool())
+        .await?;
+    assert_eq!(children, 0);
+    Ok(())
+}
+
 /// Serve components on demand and assert that no earlier group's payload files
 /// remain when the next payload request starts. A chosen component can fail to
 /// simulate restart after a completed/cleaned group without test-only runtime hooks.
