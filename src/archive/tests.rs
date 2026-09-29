@@ -276,3 +276,20 @@ fn cli_requires_range_and_pin_and_accepts_no_config() -> Result<()> {
     assert!(super::parse_sha256(&format!("0x{digest}")).is_err());
     Ok(())
 }
+
+#[test]
+fn current_producer_declares_height_but_retains_inclusive_coverage() -> Result<()> {
+    let mut value = fixture();
+    value["reth_version"] = super::manifest::CURRENT_PRODUCER.into();
+    for name in COMPONENTS {
+        value["components"][name]["total_blocks"] = 24.into();
+    }
+    let (raw, args) = inputs(&value, 13, 24)?;
+    let plan = build(&raw, &args)?;
+    assert_eq!(plan.groups[1].available_range, [20, 24]);
+    assert_eq!(plan.requested_range, [13, 24]);
+    value["components"]["receipts"]["total_blocks"] = 23.into();
+    let (raw, args) = inputs(&value, 13, 24)?;
+    assert!(build(&raw, &args).is_err());
+    Ok(())
+}

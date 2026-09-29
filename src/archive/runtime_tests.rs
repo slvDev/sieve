@@ -34,11 +34,11 @@ fn compact_bytes<T: Compact>(value: &T) -> Vec<u8> {
 }
 
 impl Fixture {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "fixture constructs matching jars and manifest"
-    )]
     fn new() -> Result<Self> {
+        Self::with_width(5)
+    }
+
+    fn with_width(width: u64) -> Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "sieve-phase3-{}-{}",
@@ -63,78 +63,10 @@ impl Fixture {
             ("transactions", StaticFileSegment::Transactions),
             ("receipts", StaticFileSegment::Receipts),
         ] {
-            let dir = root.join("source").join(name);
-            fs::create_dir_all(dir.join("static_files"))?;
-            let relative = format!("static_files/static_file_{name}_100_104");
-            let range = SegmentRangeInclusive::new(100, 104);
-            let tx_range = (name != "headers").then(|| SegmentRangeInclusive::new(50, 51));
-            let header = SegmentHeader::new(range, Some(range), tx_range, kind);
-            let mut rows = vec![Vec::<Vec<u8>>::new(); kind.columns()];
-            for p in &payloads {
-                match kind {
-                    StaticFileSegment::Headers => {
-                        rows[0].push(compact_bytes(p.header()));
-                        rows[1].push(vec![0]);
-                        rows[2].push(p.header().hash_slow().to_vec());
-                    }
-                    StaticFileSegment::Transactions => {
-                        rows[0].extend(p.body().transactions.iter().map(compact_bytes));
-                    }
-                    StaticFileSegment::Receipts => {
-                        rows[0].extend(p.receipts().iter().map(compact_bytes));
-                    }
-                    _ => return Err(eyre!("unexpected fixture segment")),
-                }
-            }
-            let mut writer =
-                NippyJarWriter::new(NippyJar::new(kind.columns(), &dir.join(&relative), header))?;
-            let columns = rows
-                .iter()
-                .map(|col| {
-                    col.iter().map(|r| {
-                        Ok::<&[u8], Box<dyn std::error::Error + Send + Sync>>(r.as_slice())
-                    })
-                })
-                .collect::<Vec<_>>();
-            writer.append_rows(columns, rows[0].len() as u64)?;
-            writer.commit()?;
-            drop(writer);
-            let files = ["", ".conf", ".off"].iter().map(|suffix| -> Result<Value> {
-                let path = format!("{relative}{suffix}");
-                let bytes = fs::read(dir.join(&path))?;
-                Ok(json!({"path":path,"size":bytes.len(),"blake3":blake3::hash(&bytes).to_hex().as_str()}))
-            }).collect::<Result<Vec<_>>>()?;
-            let encoder =
-                zstd::Encoder::new(File::create(root.join(format!("{name}.tar.zst")))?, 1)?;
-            let mut tar = tar::Builder::new(encoder);
-            for file in &files {
-                let path = file["path"].as_str().ok_or_else(|| eyre!("path"))?;
-                tar.append_path_with_name(dir.join(path), path)?;
-            }
-            tar.into_inner()?.finish()?;
-            let compressed = fs::metadata(root.join(format!("{name}.tar.zst")))?.len();
-            let extracted: u64 = files.iter().filter_map(|v| v["size"].as_u64()).sum();
-            // Earlier metadata is unselected; no earlier files are opened.
-            let output = (0..=20)
-                .map(|i| {
-                    files
-                        .iter()
-                        .cloned()
-                        .map(|mut f| {
-                            f["path"] = Value::String(
-                                f["path"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .replace("100_104", &format!("{}_{}", i * 5, i * 5 + 4)),
-                            );
-                            f
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            components.insert(name.into(), json!({"blocks_per_file":5,"total_blocks":105,
-                "chunk_files": (0..=20).map(|i| format!("static_files/{name}-{}-{}.tar.zst",i*5,i*5+4)).collect::<Vec<_>>(),
-                "chunk_sizes":vec![compressed;21],"chunk_decompressed_sizes":vec![extracted;21],"chunk_output_files":output}));
+            components.insert(
+                name.into(),
+                fixture_component(&root, &payloads, name, kind, width)?,
+            );
         }
         let raw = serde_json::to_vec(
             &json!({"block":104,"chain_id":8453,"storage_version":2,"reth_version":crate::archive::manifest::PRODUCER,"base_url":"https://fixture.invalid","components":components}),
@@ -178,7 +110,7 @@ impl Fixture {
             &import.manifest,
             rx,
         )?;
-        for archive in &import.plan.groups[0].archives {
+        for archive in import.plan.groups.iter().flat_map(|g| &g.archives) {
             let target = stage.component_dir(archive);
             fs::create_dir_all(target.join("static_files"))?;
             for file in &archive.files {
@@ -193,6 +125,122 @@ impl Fixture {
         }
         Ok(stage)
     }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "constructs each fixture component and its manifest metadata"
+)]
+fn fixture_component(
+    root: &Path,
+    payloads: &[BlockPayload<BaseChain>],
+    name: &str,
+    kind: StaticFileSegment,
+    width: u64,
+) -> Result<Value> {
+    let dir = root.join("source").join(name);
+    fs::create_dir_all(dir.join("static_files"))?;
+    let mut outputs = Vec::new();
+    let mut sizes = Vec::new();
+    let mut extracted = Vec::new();
+    let mut tx = 50;
+    for start in (100..=104).step_by(width as usize) {
+        let end = start + width - 1;
+        let relative = format!("static_files/static_file_{name}_{start}_{end}");
+        let mut rows = vec![Vec::<Vec<u8>>::new(); kind.columns()];
+        for p in payloads
+            .iter()
+            .filter(|p| (start..=end).contains(&p.header().number))
+        {
+            match kind {
+                StaticFileSegment::Headers => {
+                    rows[0].push(compact_bytes(p.header()));
+                    rows[1].push(vec![0]);
+                    rows[2].push(p.header().hash_slow().to_vec());
+                }
+                StaticFileSegment::Transactions => {
+                    rows[0].extend(p.body().transactions.iter().map(compact_bytes));
+                }
+                StaticFileSegment::Receipts => {
+                    rows[0].extend(p.receipts().iter().map(compact_bytes));
+                }
+                _ => return Err(eyre!("unexpected fixture segment")),
+            }
+        }
+        let tx_range = (name != "headers" && !rows[0].is_empty())
+            .then(|| SegmentRangeInclusive::new(tx, tx + rows[0].len() as u64 - 1));
+        if name != "headers" {
+            tx += rows[0].len() as u64;
+        }
+        let header = SegmentHeader::new(
+            SegmentRangeInclusive::new(start, end),
+            Some(SegmentRangeInclusive::new(start, end.min(104))),
+            tx_range,
+            kind,
+        );
+        let mut writer =
+            NippyJarWriter::new(NippyJar::new(kind.columns(), &dir.join(&relative), header))?;
+        let columns = rows
+            .iter()
+            .map(|col| {
+                col.iter()
+                    .map(|r| Ok::<&[u8], Box<dyn std::error::Error + Send + Sync>>(r.as_slice()))
+            })
+            .collect::<Vec<_>>();
+        writer.append_rows(columns, rows[0].len() as u64)?;
+        writer.commit()?;
+        drop(writer);
+        let files = ["", ".conf", ".off"].iter().map(|suffix| -> Result<Value> {
+            let path = format!("{relative}{suffix}");
+            let bytes = fs::read(dir.join(&path))?;
+            Ok(json!({"path":path,"size":bytes.len(),"blake3":blake3::hash(&bytes).to_hex().as_str()}))
+        }).collect::<Result<Vec<_>>>()?;
+        let path = root.join(format!("{name}-{start}-{end}.tar.zst"));
+        let encoder = zstd::Encoder::new(File::create(&path)?, 1)?;
+        let mut tar = tar::Builder::new(encoder);
+        for file in &files {
+            let path = file["path"].as_str().ok_or_else(|| eyre!("path"))?;
+            tar.append_path_with_name(dir.join(path), path)?;
+        }
+        tar.into_inner()?.finish()?;
+        if width == 5 {
+            fs::copy(&path, root.join(format!("{name}.tar.zst")))?;
+        }
+        sizes.push(fs::metadata(path)?.len());
+        extracted.push(files.iter().filter_map(|v| v["size"].as_u64()).sum::<u64>());
+        outputs.push(files);
+    }
+    let mut all_outputs = Vec::new();
+    let mut all_sizes = Vec::new();
+    let mut all_extracted = Vec::new();
+    for i in 0..=104 / width {
+        let (files, size, extract) = if i < 100 / width {
+            (
+                outputs[0]
+                    .iter()
+                    .cloned()
+                    .map(|mut f| {
+                        f["path"] = Value::String(f["path"].as_str().unwrap_or("").replace(
+                            &format!("100_{}", 100 + width - 1),
+                            &format!("{}_{}", i * width, i * width + width - 1),
+                        ));
+                        f
+                    })
+                    .collect(),
+                sizes[0],
+                extracted[0],
+            )
+        } else {
+            let i = (i - 100 / width) as usize;
+            (outputs[i].clone(), sizes[i], extracted[i])
+        };
+        all_outputs.push(files);
+        all_sizes.push(size);
+        all_extracted.push(extract);
+    }
+    Ok(json!({"blocks_per_file":width,"total_blocks":105,
+        "chunk_files": (0..=104/width).map(|i| format!("static_files/{name}-{}-{}.tar.zst",i*width,i*width+width-1)).collect::<Vec<_>>(),
+        "chunk_sizes":all_sizes,"chunk_decompressed_sizes":all_extracted,"chunk_output_files":all_outputs}))
 }
 
 #[test]
@@ -522,5 +570,275 @@ fn indexing_fingerprint_is_stable_but_detects_abi_and_filter_changes() -> Result
         .ok_or_else(|| eyre!("missing filter"))?;
     filter.insert("b".into(), vec!["changed".into()]);
     assert_ne!(config_fingerprint(&config, &fixture.root)?, original);
+    Ok(())
+}
+
+/// Serve components on demand and assert that no earlier group's payload files
+/// remain when the next payload request starts. A chosen component can fail to
+/// simulate restart after a completed/cleaned group without test-only runtime hooks.
+fn serve_groups(
+    fixture: &Fixture,
+    import: &mut PreparedImport,
+    fail: Option<(u64, &'static str)>,
+) -> Result<std::thread::JoinHandle<Result<Vec<String>>>> {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let mut files = std::collections::HashMap::new();
+    for group in &mut import.plan.groups {
+        for archive in &mut group.archives {
+            let key = format!(
+                "{}-{}-{}.tar.zst",
+                archive.component, group.archive_range[0], group.archive_range[1]
+            );
+            archive.url = format!("http://{address}/{key}");
+            files.insert(
+                key,
+                (
+                    fs::read(fixture.root.join(format!(
+                        "{}-{}-{}.tar.zst",
+                        archive.component, group.archive_range[0], group.archive_range[1]
+                    )))?,
+                    group.archive_range[0],
+                    archive.component,
+                ),
+            );
+        }
+    }
+    let stage_root = fixture.config.staging_dir.clone();
+    let width = import.plan.groups[0].archive_range[1] - import.plan.groups[0].archive_range[0] + 1;
+    Ok(std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let mut idle = std::time::Instant::now();
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if idle.elapsed() > std::time::Duration::from_secs(2) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            idle = std::time::Instant::now();
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            let mut buffer = [0u8; 4096];
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut buffer)?;
+                ensure!(
+                    n > 0 && request.len() + n <= 16384,
+                    "invalid fixture HTTP request"
+                );
+                request.extend_from_slice(&buffer[..n]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            let key = request
+                .split_whitespace()
+                .nth(1)
+                .ok_or_else(|| eyre!("missing request path"))?
+                .trim_start_matches('/');
+            let (bytes, start, component) = files
+                .get(key)
+                .ok_or_else(|| eyre!("unplanned download {key}"))?;
+            if *component != "headers" && *start > 100 {
+                for previous in (100..*start).step_by(width as usize) {
+                    for kind in ["transactions", "receipts"] {
+                        ensure!(
+                            !stage_root
+                                .join(format!("{kind}-{previous}-{}", previous + width - 1))
+                                .exists(),
+                            "prior payload group still occupies staging"
+                        );
+                    }
+                }
+            }
+            requests.push(key.to_owned());
+            if fail == Some((*start, *component)) {
+                stream.write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )?;
+                break;
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )?;
+            stream.write_all(bytes)?;
+        }
+        Ok(requests)
+    }))
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and localhost HTTP; run serially"]
+async fn rolling_groups_resume_after_cleanup_and_match_uninterrupted_factory_output() -> Result<()>
+{
+    let mut expected = None;
+    for interrupted in [false, true] {
+        let fixture = Fixture::with_width(1)?;
+        let (ctx, _, _) = ingestion_tests::context(false).await?;
+        if interrupted {
+            let mut first = fixture.import(100)?;
+            let server = serve_groups(&fixture, &mut first, Some((101, "transactions")))?;
+            assert!(first.run(ctx.clone()).await.is_err());
+            server.join().map_err(|_| eyre!("server panicked"))??;
+            assert_eq!(
+                db::archive_job::progress(&ctx.db).await?.map(|p| p.0),
+                Some(100)
+            );
+            let group = db::archive_job::group_progress(&ctx.db, 100)
+                .await?
+                .ok_or_else(|| eyre!("missing group"))?;
+            assert!(group.completed && group.cleaned);
+            assert_eq!(group.next_transaction, Some(51));
+            ctx.config
+                .replace_factory_children(std::collections::HashMap::new());
+            db::load_factory_children(&ctx.db, &ctx.config, &ctx.factories).await?;
+        }
+        let mut import = fixture.import(100)?;
+        let server = serve_groups(&fixture, &mut import, None)?;
+        let result = import.run(ctx.clone()).await;
+        let requests = server.join().map_err(|_| eyre!("server panicked"))??;
+        result?;
+        if interrupted {
+            assert!(!requests
+                .iter()
+                .any(|r| r.starts_with("headers") || r.contains("-100-100")));
+        }
+        let rows: Vec<(i64, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT block_number, block_hash, value FROM phase2_events ORDER BY block_number",
+        )
+        .fetch_all(ctx.db.pool())
+        .await?;
+        assert_eq!(rows.len(), 2);
+        if let Some(expected) = &expected {
+            assert_eq!(&rows, expected);
+        } else {
+            expected = Some(rows);
+        }
+        let statuses: Vec<(i64, bool, bool, Option<i64>)> = sqlx::query_as("SELECT start_block, completed, cleaned, next_transaction FROM _sieve_archive_groups ORDER BY start_block").fetch_all(ctx.db.pool()).await?;
+        assert_eq!(
+            statuses,
+            vec![
+                (100, true, true, Some(51)),
+                (101, true, true, Some(52)),
+                (102, true, true, Some(52)),
+                (103, true, true, Some(52)),
+                (104, true, true, Some(52))
+            ]
+        );
+        fixture.import(100)?.run(ctx).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and localhost HTTP; run serially"]
+async fn rolling_partial_end_and_durable_transaction_continuity() -> Result<()> {
+    let mut fixture = Fixture::with_width(2)?;
+    fixture.config.end_block = 102;
+    fixture.config.checkpoint_hash = fixture.payloads[2].header().hash_slow();
+    let (ctx, _, _) = ingestion_tests::context(false).await?;
+    let mut import = fixture.import(100)?;
+    let server = serve_groups(&fixture, &mut import, None)?;
+    import.run(ctx.clone()).await?;
+    server.join().map_err(|_| eyre!("server panicked"))??;
+    assert_eq!(
+        db::archive_job::progress(&ctx.db).await?.map(|p| p.0),
+        Some(102)
+    );
+    assert!(ctx
+        .db
+        .get_block_hash(crate::types::BlockNumber::new(103))
+        .await?
+        .is_none());
+    let group = db::archive_job::group_progress(&ctx.db, 102)
+        .await?
+        .ok_or_else(|| eyre!("missing group"))?;
+    assert_eq!(group.next_transaction, None); // partial group never claims a decoded next-group position
+    let wrong = db::archive_job::GroupDescriptor {
+        archive_range: [104, 105],
+        index_range: [104, 104],
+        available_end: 104,
+        transaction_range: Some([99, 100]),
+    };
+    assert!(db::archive_job::prepare_group(&ctx.db, &wrong, Some(52))
+        .await
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn actual_staging_budget_refuses_transfer_before_any_request() -> Result<()> {
+    let fixture = Fixture::with_width(2)?;
+    let import = fixture.import(100)?;
+    let (_tx, rx) = watch::channel(false);
+    let mut config = fixture.config.clone();
+    config.max_staging_bytes = 10_000;
+    let stage = Staging::open(config, import.identity.as_bytes(), &import.manifest, rx)?;
+    // A retained/leftover file also consumes the configured hard limit.
+    File::create(stage.root.join("leftover"))?.set_len(10_000)?;
+    let err = stage
+        .stage(&import.plan.groups[0].archives[0])
+        .err()
+        .ok_or_else(|| eyre!("budget was not enforced"))?;
+    assert!(err.to_string().contains("max_staging_bytes"));
+    assert!(!stage.root.join("transfer.json").exists());
+    Ok(())
+}
+
+#[test]
+fn bounded_header_proofs_authenticate_resume_without_replaying_history() -> Result<()> {
+    use alloy_consensus::Header;
+    let mut parent = B256::repeat_byte(3);
+    let headers = (100..8300)
+        .map(|number| {
+            let h = Header {
+                number,
+                parent_hash: parent,
+                ..Default::default()
+            };
+            parent = h.hash_slow();
+            h
+        })
+        .collect::<Vec<_>>();
+    let evidence = ArchiveEvidence {
+        first_block: 100,
+        anchor_block: 8299,
+        anchor_hash: parent,
+        genesis_hash: ChainKind::Base.genesis_hash(),
+        manifest_sha256: B256::repeat_byte(9),
+    };
+    let proof = AuthenticatedArchive::new(
+        evidence.clone(),
+        headers.iter().cloned().map(Ok),
+        &std::collections::BTreeSet::new(),
+    )?;
+    assert_eq!(proof.segment_end(110, 8299)?, 8291);
+    assert_eq!(proof.segment_end(8292, 8299)?, 8299);
+    proof.segment(headers[10..8192].iter().cloned().map(Ok), 110, 8291)?;
+    assert!(proof
+        .segment(headers[8192..8199].iter().cloned().map(Ok), 8292, 8299)
+        .is_err());
+    let mut bad = headers[8192..].to_vec();
+    bad[0].timestamp = 123;
+    assert!(proof.segment(bad.into_iter().map(Ok), 8292, 8299).is_err());
+    let mut wrong_anchor = evidence;
+    wrong_anchor.anchor_hash = B256::ZERO;
+    assert!(AuthenticatedArchive::new(
+        wrong_anchor,
+        headers.into_iter().map(Ok),
+        &std::collections::BTreeSet::new()
+    )
+    .is_err());
     Ok(())
 }
