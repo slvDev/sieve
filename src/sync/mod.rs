@@ -217,3 +217,6 @@ const _: [(); 816] = [(); core::mem::size_of::<BlockPayload<crate::chain::Ethere
 #[cfg(target_pointer_width = "64")]
 const _: [(); 32] = [(); core::mem::size_of::<FetchBatch>()];
 // SyncContext size varies with stream fields — skip assertion.
+
+#[cfg(test)]
+mod ingestion_tests;
