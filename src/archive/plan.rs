@@ -29,7 +29,7 @@ pub(super) struct Plan {
 }
 
 /// Metadata needed to open aligned jars and reconstruct from a group boundary.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct Group {
     /// Full nominal range encoded in file names (tail may end earlier).
     pub archive_range: [u64; 2],

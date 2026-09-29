@@ -146,6 +146,7 @@ impl<C: ChainTypes> AuthenticatedSegment<C> {
     }
 }
 
+#[cfg(test)]
 impl AuthenticatedSegment<crate::chain::BaseChain> {
     /// Verify retained headers through the independently trusted anchor, keeping
     /// only the bounded segment being submitted.
@@ -184,9 +185,23 @@ pub fn verify_archive_headers(
         end - start < CANONICAL_SEGMENT_BLOCKS,
         "archive segment exceeds bounded ingestion window"
     );
+    let mut selected = Vec::new();
+    walk_archive_headers(evidence, headers, |number, sealed| {
+        if (start..=end).contains(&number) {
+            selected.push(sealed);
+        }
+    })?;
+    Ok(selected)
+}
+
+fn walk_archive_headers(
+    evidence: &ArchiveEvidence,
+    headers: impl IntoIterator<Item = EyreResult<Header>>,
+    mut visit: impl FnMut(u64, SealedHeader),
+) -> EyreResult<()> {
+    evidence.validate()?;
     let mut next = evidence.first_block;
     let mut previous = None;
-    let mut selected = Vec::new();
     for header in headers {
         let header = header?;
         ensure!(
@@ -207,9 +222,7 @@ pub fn verify_archive_headers(
             );
         }
         previous = Some(sealed.hash());
-        if (start..=end).contains(&next) {
-            selected.push(sealed);
-        }
+        visit(next, sealed);
         next += 1;
     }
     ensure!(
@@ -220,7 +233,95 @@ pub fn verify_archive_headers(
         previous == Some(evidence.anchor_hash),
         "archive header chain does not reach trusted anchor"
     );
-    Ok(selected)
+    Ok(())
+}
+
+/// Created only after replaying the entire header chain to the trusted anchor.
+/// Retains one hash per bounded window/group boundary, never all historical
+/// headers. It is rebuilt on every restart; no on-disk hash cache is trusted.
+pub struct AuthenticatedArchive {
+    evidence: ArchiveEvidence,
+    tips: std::collections::BTreeMap<u64, B256>,
+}
+impl AuthenticatedArchive {
+    pub fn new(
+        evidence: ArchiveEvidence,
+        headers: impl IntoIterator<Item = EyreResult<Header>>,
+        group_ends: &std::collections::BTreeSet<u64>,
+    ) -> EyreResult<Self> {
+        let mut tips = std::collections::BTreeMap::new();
+        walk_archive_headers(&evidence, headers, |number, sealed| {
+            if (number - evidence.first_block + 1).is_multiple_of(CANONICAL_SEGMENT_BLOCKS)
+                || number == evidence.anchor_block
+                || group_ends.contains(&number)
+            {
+                tips.insert(number, sealed.hash());
+            }
+        })?;
+        Ok(Self { evidence, tips })
+    }
+    pub const fn evidence(&self) -> &ArchiveEvidence {
+        &self.evidence
+    }
+    pub fn segment_end(&self, start: u64, limit: u64) -> EyreResult<u64> {
+        ensure!(
+            start >= self.evidence.first_block
+                && start <= limit
+                && limit <= self.evidence.anchor_block,
+            "segment outside archive evidence"
+        );
+        self.tips
+            .range(start..=limit)
+            .next()
+            .map(|(number, _)| *number)
+            .ok_or_else(|| eyre::eyre!("missing authenticated segment boundary"))
+    }
+    pub fn segment(
+        &self,
+        headers: impl IntoIterator<Item = EyreResult<Header>>,
+        start: u64,
+        end: u64,
+    ) -> EyreResult<AuthenticatedSegment<crate::chain::BaseChain>> {
+        ensure!(
+            start >= self.evidence.first_block
+                && start <= end
+                && end - start < CANONICAL_SEGMENT_BLOCKS,
+            "invalid bounded archive segment"
+        );
+        let tip = self
+            .tips
+            .get(&end)
+            .ok_or_else(|| eyre::eyre!("unauthenticated segment tip"))?;
+        let mut selected = Vec::new();
+        let mut previous = None;
+        let mut next = start;
+        for header in headers {
+            let header = header?;
+            ensure!(
+                next <= end && header.number == next,
+                "missing or unordered segment header"
+            );
+            if let Some(parent) = previous {
+                ensure!(header.parent_hash == parent, "broken archive segment chain");
+            }
+            let sealed = SealedHeader::seal_slow(header);
+            previous = Some(sealed.hash());
+            selected.push(sealed);
+            next += 1;
+        }
+        ensure!(
+            next == end + 1 && previous == Some(*tip),
+            "segment does not reach its authenticated tip"
+        );
+        Ok(AuthenticatedSegment {
+            headers: SegmentHeaders::Archive {
+                start,
+                headers: selected,
+                evidence: self.evidence.clone(),
+            },
+            chain: PhantomData,
+        })
+    }
 }
 
 /// Reader contract for startup. Implementations reopen retained jars for exactly

@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub(super) const PRODUCER: &str = "2.5.2-dev (76a8261)";
+pub(super) const CURRENT_PRODUCER: &str = "2.5.2-dev (5877708)";
 pub(super) const COMPONENTS: [&str; 3] = ["headers", "transactions", "receipts"];
 
 #[derive(Debug, Deserialize)]
@@ -36,7 +37,7 @@ pub(super) struct OutputFile {
     pub blake3: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct Archive {
     pub component: &'static str,
     pub url: String,
@@ -61,8 +62,8 @@ impl Manifest {
             "expected Base mainnet V2 snapshot"
         );
         ensure!(
-            manifest.reth_version == PRODUCER,
-            "unsupported snapshot producer {}; expected {PRODUCER}",
+            matches!(manifest.reth_version.as_str(), PRODUCER | CURRENT_PRODUCER),
+            "unsupported snapshot producer {}; expected {PRODUCER} or {CURRENT_PRODUCER}",
             manifest.reth_version
         );
         // Every persisted Sieve block number must fit PostgreSQL BIGINT.
@@ -91,8 +92,15 @@ impl Manifest {
                 .clone(),
         )?;
         let total = self.block + 1;
+        // This producer writes the snapshot height into total_blocks, while
+        // the original supported manifest uses an inclusive block count.
+        let declared_total = if self.reth_version == CURRENT_PRODUCER {
+            self.block
+        } else {
+            total
+        };
         ensure!(
-            component.blocks_per_file > 0 && component.total_blocks == total,
+            component.blocks_per_file > 0 && component.total_blocks == declared_total,
             "{name}: pruned history or invalid chunk width"
         );
         let count = usize::try_from(total.div_ceil(component.blocks_per_file))?;

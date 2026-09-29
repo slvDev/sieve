@@ -1,5 +1,5 @@
 //! Base static-file reconstruction adapted from Shinode snapshot/reader.rs (MIT).
-use super::{manifest::Archive, plan::Group};
+use super::{manifest::Archive, plan::Group, staging::Staging};
 use crate::{
     chain::{BaseChain, ChainKind},
     sync::{
@@ -17,7 +17,7 @@ use reth_static_file_types::{SegmentHeader, StaticFileSegment};
 use std::path::Path;
 
 fn load(
-    root: &Path,
+    stage: &Staging,
     chunk: &Archive,
     group: &Group,
     kind: StaticFileSegment,
@@ -27,7 +27,7 @@ fn load(
         .iter()
         .find(|file| Path::new(&file.path).extension().is_none())
         .ok_or_else(|| eyre!("missing static file"))?;
-    let jar = NippyJar::<SegmentHeader>::load(&root.join(chunk.component).join(&file.path))?;
+    let jar = NippyJar::<SegmentHeader>::load(&stage.component_dir(chunk).join(&file.path))?;
     ensure!(
         jar.user_header().segment() == kind && jar.columns() == kind.columns(),
         "static-file segment/column mismatch"
@@ -102,19 +102,25 @@ pub(super) fn reconstruct(
 }
 
 pub(super) struct HeaderReader {
-    jar: NippyJar<SegmentHeader>,
+    jars: Vec<NippyJar<SegmentHeader>>,
     evidence: ArchiveEvidence,
 }
 
 impl HeaderReader {
-    pub fn open(root: &Path, group: &Group, evidence: ArchiveEvidence) -> Result<Self> {
-        let jar = load(root, &group.archives[0], group, StaticFileSegment::Headers)?;
-        ensure!(
-            jar.rows() as u64 == group.available_range[1] - group.available_range[0] + 1
-                && jar.user_header().block_end() == Some(group.available_range[1]),
-            "truncated header jar"
-        );
-        Ok(Self { jar, evidence })
+    pub fn open(stage: &Staging, groups: &[Group], evidence: ArchiveEvidence) -> Result<Self> {
+        let jars = groups
+            .iter()
+            .map(|group| {
+                let jar = load(stage, &group.archives[0], group, StaticFileSegment::Headers)?;
+                ensure!(
+                    jar.rows() as u64 == group.available_range[1] - group.available_range[0] + 1
+                        && jar.user_header().block_end() == Some(group.available_range[1]),
+                    "truncated header jar"
+                );
+                Ok(jar)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { jars, evidence })
     }
 }
 impl ArchiveRecoveryReader for HeaderReader {
@@ -126,9 +132,25 @@ impl ArchiveRecoveryReader for HeaderReader {
             *evidence == self.evidence,
             "retained header evidence identity mismatch"
         );
-        let mut cursor = NippyJarCursor::new(&self.jar)?;
-        let mut next = evidence.first_block;
-        let end = evidence.anchor_block;
+        self.range(evidence.first_block, evidence.anchor_block)
+    }
+}
+impl HeaderReader {
+    pub fn range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Box<dyn Iterator<Item = Result<Header>> + '_>> {
+        ensure!(
+            start >= self.evidence.first_block && start <= end && end <= self.evidence.anchor_block,
+            "header range outside retained evidence"
+        );
+        let mut jars = self
+            .jars
+            .iter()
+            .filter(move |jar| jar.user_header().block_end().is_some_and(|n| n >= start));
+        let mut cursor: Option<NippyJarCursor<'_, SegmentHeader>> = None;
+        let mut next = start;
         Ok(Box::new(std::iter::from_fn(move || {
             if next > end {
                 return None;
@@ -136,8 +158,29 @@ impl ArchiveRecoveryReader for HeaderReader {
             let number = next;
             next += 1;
             Some((|| {
+                if cursor
+                    .as_ref()
+                    .is_none_or(|c| c.row_index() as usize == c.jar().rows())
+                {
+                    let jar = jars
+                        .next()
+                        .ok_or_else(|| eyre!("missing retained header jar"))?;
+                    cursor = Some(NippyJarCursor::new(jar)?);
+                }
+                let cursor = cursor
+                    .as_mut()
+                    .ok_or_else(|| eyre!("missing header cursor"))?;
+                let offset = number
+                    .checked_sub(
+                        cursor
+                            .jar()
+                            .user_header()
+                            .block_start()
+                            .ok_or_else(|| eyre!("missing header start"))?,
+                    )
+                    .ok_or_else(|| eyre!("header range gap"))?;
                 let row = cursor
-                    .next_row()?
+                    .row_by_number(usize::try_from(offset)?)?
                     .ok_or_else(|| eyre!("missing retained header"))?;
                 ensure!(row.len() == 3, "wrong header columns");
                 let header: Header = compact(row[0])?;
@@ -151,43 +194,42 @@ impl ArchiveRecoveryReader for HeaderReader {
     }
 }
 
-#[derive(Default)]
-struct Position {
-    previous: Option<B256>,
-    block: u64,
-    transaction: u64,
-    transaction_known: bool,
-}
-
-pub(super) fn scan(
-    root: &Path,
-    group: &Group,
-    max_transactions: u32,
-    mut consume: impl FnMut(ValidatedPayload<BaseChain>) -> Result<()>,
-) -> Result<()> {
-    let mut position = Position {
-        block: group.decode_from,
-        transaction_known: group.decode_from == 0,
-        ..Position::default()
-    };
-    let headers = load(root, &group.archives[0], group, StaticFileSegment::Headers)?;
+/// Matching metadata is checked before ingestion; complete consumption in scan
+/// checks that these exact rows were assigned before the last block is emitted.
+pub(super) fn transaction_range(stage: &Staging, group: &Group) -> Result<Option<[u64; 2]>> {
     let transactions = load(
-        root,
+        stage,
         &group.archives[1],
         group,
         StaticFileSegment::Transactions,
     )?;
-    let receipts = load(root, &group.archives[2], group, StaticFileSegment::Receipts)?;
-    let end = group.available_range[1];
-    ensure!(
-        headers.rows() as u64 == end - group.archive_range[0] + 1
-            && headers.user_header().block_end() == Some(end),
-        "header chunk is truncated"
-    );
-    ensure!(
-        position.block == group.archive_range[0],
-        "gap between header chunks"
-    );
+    let receipts = load(
+        stage,
+        &group.archives[2],
+        group,
+        StaticFileSegment::Receipts,
+    )?;
+    validate_payload_metadata(&transactions, &receipts, group.available_range[1])?;
+    transactions
+        .user_header()
+        .tx_range()
+        .map(|range| {
+            Ok([
+                range.start(),
+                range
+                    .end()
+                    .checked_add(1)
+                    .ok_or_else(|| eyre!("transaction range overflow"))?,
+            ])
+        })
+        .transpose()
+}
+
+fn validate_payload_metadata(
+    transactions: &NippyJar<SegmentHeader>,
+    receipts: &NippyJar<SegmentHeader>,
+    end: u64,
+) -> Result<()> {
     ensure!(
         transactions.rows() == receipts.rows()
             && transactions.user_header().tx_range() == receipts.user_header().tx_range(),
@@ -202,6 +244,52 @@ pub(super) fn scan(
             && receipts.user_header().block_end() == Some(end),
         "incomplete transaction/receipt block range"
     );
+    Ok(())
+}
+
+#[derive(Default)]
+struct Position {
+    previous: Option<B256>,
+    block: u64,
+    transaction: u64,
+    transaction_known: bool,
+}
+
+pub(super) fn scan(
+    stage: &Staging,
+    group: &Group,
+    max_transactions: u32,
+    mut consume: impl FnMut(ValidatedPayload<BaseChain>) -> Result<()>,
+) -> Result<()> {
+    let mut position = Position {
+        block: group.decode_from,
+        transaction_known: group.decode_from == 0,
+        ..Position::default()
+    };
+    let headers = load(stage, &group.archives[0], group, StaticFileSegment::Headers)?;
+    let transactions = load(
+        stage,
+        &group.archives[1],
+        group,
+        StaticFileSegment::Transactions,
+    )?;
+    let receipts = load(
+        stage,
+        &group.archives[2],
+        group,
+        StaticFileSegment::Receipts,
+    )?;
+    let end = group.available_range[1];
+    ensure!(
+        headers.rows() as u64 == end - group.archive_range[0] + 1
+            && headers.user_header().block_end() == Some(end),
+        "header chunk is truncated"
+    );
+    ensure!(
+        position.block == group.archive_range[0],
+        "gap between header chunks"
+    );
+    validate_payload_metadata(&transactions, &receipts, end)?;
     if !position.transaction_known {
         if let Some(first) = transactions.user_header().tx_start() {
             position.transaction = first;

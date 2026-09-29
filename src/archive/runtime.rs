@@ -1,5 +1,5 @@
 use super::{
-    plan::{self, Plan},
+    plan::{self, Group, Plan},
     reader::{self, HeaderReader},
     staging::Staging,
     PlanArgs, MAX_MANIFEST_BYTES,
@@ -8,10 +8,10 @@ use crate::{
     chain::{BaseChain, ChainKind},
     db,
     sync::{
-        canonical::{self, FrontierStatus, CANONICAL_SEGMENT_BLOCKS},
+        canonical::{self, FrontierStatus},
         ingestion::{IngestionContext, IngestionPipeline},
         validation::{
-            verify_archive_recovery, ArchiveEvidence, ArchiveRecoveryReader, AuthenticatedSegment,
+            verify_archive_recovery, ArchiveEvidence, ArchiveRecoveryReader, AuthenticatedArchive,
         },
         FetchItem,
     },
@@ -28,7 +28,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-/// Explicit finite, one-group bootstrap. Paths are relative to the root config.
+/// Explicit finite, rolling archive bootstrap. Paths are relative to the root config.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveConfig {
@@ -127,10 +127,6 @@ impl PreparedImport {
             },
         )?;
         ensure!(
-            plan.groups.len() == 1,
-            "phase 3 imports one aligned archive group; choose an end in the starting group"
-        );
-        ensure!(
             plan.resources.fits_staging_budget == Some(true),
             "archive group exceeds max_staging_bytes"
         );
@@ -146,11 +142,23 @@ impl PreparedImport {
             anchor_hash: config.checkpoint_hash,
         };
         evidence.validate()?;
-        let identity = serde_json::to_string(&serde_json::json!({
+        // Keep phase-3 single-group identities/layouts resumable. Multi-group
+        // jobs use distinct component directories and record their full selection.
+        let mut identity = serde_json::json!({
             "reader": "base-v2-aligned-compact-v1", "evidence": evidence,
-            "range": plan.requested_range, "group": plan.groups[0].archive_range,
-            "indexing_config_sha256": fingerprint,
-        }))?;
+            "range": plan.requested_range,
+        });
+        if plan.groups.len() == 1 {
+            identity["group"] = serde_json::json!(plan.groups[0].archive_range);
+        } else {
+            identity["groups"] = serde_json::json!(plan
+                .groups
+                .iter()
+                .map(|g| g.archive_range)
+                .collect::<Vec<_>>());
+        }
+        identity["indexing_config_sha256"] = fingerprint.into();
+        let identity = serde_json::to_string(&identity)?;
         Ok(Self {
             config,
             plan,
@@ -187,8 +195,10 @@ impl PreparedImport {
         let evidence = self.evidence.clone();
         let reader = Arc::new(
             tokio::task::spawn_blocking(move || {
-                stage.stage(&source_plan.groups[0].archives[0])?;
-                HeaderReader::open(&stage.root, &source_plan.groups[0], evidence)
+                for group in &source_plan.groups {
+                    stage.stage(&group.archives[0])?;
+                }
+                HeaderReader::open(&stage, &source_plan.groups, evidence)
             })
             .await??,
         );
@@ -199,48 +209,32 @@ impl PreparedImport {
             })
             .await??;
         }
-        // Authenticate the anchor before transferring payload components.
+        // Authenticate once, retaining only bounded-window/group tip hashes.
         let retained = Arc::clone(&reader);
         let evidence = self.evidence.clone();
-        tokio::task::spawn_blocking(move || {
-            AuthenticatedSegment::archive(evidence.clone(), retained.headers(&evidence)?, end, end)
-        })
-        .await??;
-        if next <= end {
-            let stage = Arc::clone(&staging);
-            let source_plan = Arc::clone(&plan);
+        let ends = plan.groups.iter().map(|g| g.index_range[1]).collect();
+        let proof = Arc::new(
             tokio::task::spawn_blocking(move || {
-                for archive in &source_plan.groups[0].archives[1..] {
-                    stage.stage(archive)?;
-                }
-                Ok::<_, eyre::Report>(())
+                AuthenticatedArchive::new(evidence.clone(), retained.headers(&evidence)?, &ends)
             })
-            .await??;
-            self::ingest(
-                &ctx,
-                &staging,
-                plan.clone(),
-                reader,
-                self.evidence,
-                next,
-                self.config.max_transactions_per_block,
-            )
-            .await?;
-        }
+            .await??,
+        );
+        run_groups(
+            &ctx,
+            staging,
+            &plan,
+            reader,
+            proof,
+            next,
+            self.config.max_transactions_per_block,
+        )
+        .await?;
         ensure!(
             db::archive_job::progress(&ctx.db)
                 .await?
                 .is_some_and(|(block, _)| block == end),
             "archive stopped before requested end; rerun to resume"
         );
-        let stage = Arc::clone(&staging);
-        tokio::task::spawn_blocking(move || {
-            for archive in &plan.groups[0].archives[1..] {
-                stage.cleanup(archive)?;
-            }
-            Ok::<_, eyre::Report>(())
-        })
-        .await??;
         db::archive_job::mark_cleaned(&ctx.db).await?;
         tracing::info!(
             end,
@@ -285,20 +279,130 @@ fn resume_block(
     })
 }
 
+async fn run_groups(
+    ctx: &IngestionContext,
+    staging: Arc<Staging>,
+    plan: &Plan,
+    reader: Arc<HeaderReader>,
+    proof: Arc<AuthenticatedArchive>,
+    mut next: u64,
+    max_transactions: u32,
+) -> Result<()> {
+    let mut previous_transaction = (proof.evidence().first_block == 0).then_some(0);
+    let initial_start = db::archive_job::initial_start(&ctx.db).await?;
+    for group in &plan.groups {
+        let start = group.index_range[0];
+        let end = group.index_range[1];
+        if end < initial_start {
+            previous_transaction = None;
+            continue;
+        }
+        let saved = db::archive_job::group_progress(&ctx.db, start).await?;
+        if end < next {
+            if let Some(saved) = saved {
+                ensure!(
+                    saved.completed
+                        && saved.descriptor.archive_range == group.archive_range
+                        && saved.descriptor.index_range == group.index_range,
+                    "archive group journal disagrees with checkpoint"
+                );
+                previous_transaction = saved.next_transaction;
+                if saved.cleaned {
+                    continue;
+                }
+            } else {
+                ensure!(
+                    plan.groups.len() == 1,
+                    "committed archive group is missing its decoding journal"
+                );
+                // An already-completed phase-3 job predates per-group records.
+                cleanup_group(&staging, group).await?;
+                continue;
+            }
+        } else {
+            ensure!(
+                saved.as_ref().is_none_or(|s| !s.completed && !s.cleaned),
+                "uncommitted group marked complete"
+            );
+            let stage = Arc::clone(&staging);
+            let current = group.clone();
+            let range = tokio::task::spawn_blocking(move || {
+                for archive in &current.archives[1..] {
+                    stage.stage(archive)?;
+                }
+                reader::transaction_range(&stage, &current)
+            })
+            .await??;
+            db::archive_job::prepare_group(
+                &ctx.db,
+                &db::archive_job::GroupDescriptor {
+                    archive_range: group.archive_range,
+                    index_range: group.index_range,
+                    available_end: group.available_range[1],
+                    transaction_range: range,
+                },
+                previous_transaction,
+            )
+            .await?;
+            ingest(
+                ctx,
+                &staging,
+                group.clone(),
+                Arc::clone(&reader),
+                Arc::clone(&proof),
+                next.max(start),
+                max_transactions,
+            )
+            .await?;
+            let committed = db::archive_job::group_progress(&ctx.db, start)
+                .await?
+                .ok_or_else(|| eyre!("missing archive group journal"))?;
+            ensure!(
+                committed.completed,
+                "archive group stopped before its final commit; rerun to resume"
+            );
+            previous_transaction = committed.next_transaction;
+            next = end + 1;
+        }
+        cleanup_group(&staging, group).await?;
+        db::archive_job::mark_group_cleaned(&ctx.db, start).await?;
+    }
+    Ok(())
+}
+
+async fn cleanup_group(staging: &Arc<Staging>, group: &Group) -> Result<()> {
+    let stage = Arc::clone(staging);
+    let group = group.clone();
+    tokio::task::spawn_blocking(move || {
+        for archive in &group.archives[1..] {
+            stage.cleanup(archive)?;
+        }
+        tracing::info!(
+            start = group.index_range[0],
+            end = group.index_range[1],
+            staging_bytes = stage.usage()?,
+            "archive group committed and released"
+        );
+        Ok::<_, eyre::Report>(())
+    })
+    .await??;
+    Ok(())
+}
+
 async fn ingest(
     ctx: &IngestionContext,
     staging: &Arc<Staging>,
-    plan: Arc<Plan>,
+    group: Group,
     reader: Arc<HeaderReader>,
-    evidence: ArchiveEvidence,
+    proof: Arc<AuthenticatedArchive>,
     next: u64,
     max_transactions: u32,
 ) -> Result<()> {
     let (send, mut receive) = mpsc::channel(16);
     let stage = Arc::clone(staging);
-    let end = plan.requested_range[1];
+    let end = group.index_range[1];
     let producer = tokio::task::spawn_blocking(move || {
-        reader::scan(&stage.root, &plan.groups[0], max_transactions, |payload| {
+        reader::scan(&stage, &group, max_transactions, |payload| {
             stage.check(0)?;
             if payload.header().number >= next {
                 send.blocking_send(payload)
@@ -311,11 +415,11 @@ async fn ingest(
         let mut start = next;
         while start <= end {
             staging.check(0)?;
-            let tip = end.min(start + CANONICAL_SEGMENT_BLOCKS - 1);
+            let tip = proof.segment_end(start, end)?;
             let retained = Arc::clone(&reader);
-            let proof = evidence.clone();
+            let proof = Arc::clone(&proof);
             let segment = tokio::task::spawn_blocking(move || {
-                AuthenticatedSegment::archive(proof.clone(), retained.headers(&proof)?, start, tip)
+                proof.segment(retained.range(start, tip)?, start, tip)
             })
             .await??;
             let pipeline = IngestionPipeline::<BaseChain>::start(ctx.clone(), segment).await?;

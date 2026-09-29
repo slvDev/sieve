@@ -60,6 +60,7 @@ pub(super) struct Staging {
     _lock: File,
     config: ArchiveConfig,
     stop: watch::Receiver<bool>,
+    legacy_layout: bool,
 }
 
 impl Staging {
@@ -107,7 +108,10 @@ impl Staging {
         } else {
             atomic_write(&pinned, manifest)?;
         }
+        let identity_value: serde_json::Value = serde_json::from_slice(identity)?;
+        let legacy_layout = identity_value.get("group").is_some();
         Ok(Self {
+            legacy_layout,
             root,
             _lock: lock,
             config,
@@ -132,8 +136,57 @@ impl Staging {
         Ok(())
     }
 
+    fn key<'a>(&self, archive: &'a Archive) -> &'a str {
+        if self.legacy_layout {
+            archive.component
+        } else {
+            archive
+                .url
+                .rsplit('/')
+                .next()
+                .unwrap_or(archive.component)
+                .trim_end_matches(".tar.zst")
+        }
+    }
+
     pub fn component_dir(&self, archive: &Archive) -> PathBuf {
-        self.root.join(archive.component)
+        self.root.join(self.key(archive))
+    }
+
+    /// Count actual files, including leftovers and metadata, without following links.
+    pub fn usage(&self) -> Result<u64> {
+        fn size(path: &Path) -> Result<u64> {
+            let mut total = 0u64;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                ensure!(!kind.is_symlink(), "symlink in archive staging");
+                let bytes = if kind.is_dir() {
+                    size(&entry.path())?
+                } else {
+                    entry.metadata()?.len()
+                };
+                total = total
+                    .checked_add(bytes)
+                    .ok_or_else(|| eyre!("staging usage overflow"))?;
+            }
+            Ok(total)
+        }
+        size(&self.root)
+    }
+
+    fn check_capacity(&self, additional: u64) -> Result<()> {
+        self.check(additional)?;
+        let required = self
+            .usage()?
+            .checked_add(additional)
+            .and_then(|n| n.checked_add(self.config.min_free_bytes))
+            .ok_or_else(|| eyre!("staging budget overflow"))?;
+        ensure!(
+            required <= self.config.max_staging_bytes,
+            "actual archive staging would exceed max_staging_bytes"
+        );
+        Ok(())
     }
 
     pub fn verify(&self, archive: &Archive) -> Result<()> {
@@ -145,22 +198,22 @@ impl Staging {
         let output = self.component_dir(archive);
         if output.exists() {
             self.verify(archive)?;
-            let compressed = self.root.join(format!("{}.tar.zst", archive.component));
+            let compressed = self.root.join(format!("{}.tar.zst", self.key(archive)));
             if regular_or_missing(&compressed)? {
                 fs::remove_file(compressed)?;
             }
             return Ok(());
         }
-        let partial = self.root.join(format!("{}.partial", archive.component));
+        let partial = self.root.join(format!("{}.partial", self.key(archive)));
         Self::discard_partial(&partial, archive)?;
-        let compressed = self.root.join(format!("{}.tar.zst", archive.component));
+        let compressed = self.root.join(format!("{}.tar.zst", self.key(archive)));
         // No HTTP validator is persisted: every interrupted transfer restarts.
         if regular_or_missing(&compressed)? {
             fs::remove_file(&compressed)?;
         }
         let mut last = None;
         for attempt in 0..=self.config.retries {
-            self.check(archive.compressed_bytes + archive.extracted_bytes)?;
+            self.check_capacity(archive.compressed_bytes + archive.extracted_bytes)?;
             match self.download(archive, &compressed) {
                 Ok(()) => {
                     last = None;
@@ -186,12 +239,22 @@ impl Staging {
             return Err(error);
         }
         self.extract(archive, &compressed, &partial)?;
+        self.report_extraction(archive)?;
         fs::rename(&partial, &output)?;
         File::open(&self.root)?.sync_all()?;
         fs::remove_file(compressed)?;
         tracing::info!(
             component = archive.component,
             "archive component verified and staged"
+        );
+        Ok(())
+    }
+
+    fn report_extraction(&self, archive: &Archive) -> Result<()> {
+        tracing::info!(
+            component = archive.component,
+            staging_bytes = self.usage()?,
+            "archive extracted and verified"
         );
         Ok(())
     }
@@ -362,10 +425,10 @@ impl Staging {
             fs::remove_dir(root)?;
         }
         Self::discard_partial(
-            &self.root.join(format!("{}.partial", archive.component)),
+            &self.root.join(format!("{}.partial", self.key(archive))),
             archive,
         )?;
-        let compressed = self.root.join(format!("{}.tar.zst", archive.component));
+        let compressed = self.root.join(format!("{}.tar.zst", self.key(archive)));
         if regular_or_missing(&compressed)? {
             fs::remove_file(compressed)?;
         }

@@ -1,7 +1,11 @@
 //! Real jars, tar streams, and PostgreSQL exercise the source adapter end to end.
 #![expect(clippy::panic_in_result_fn, reason = "test assertions")]
 use super::*;
-use crate::sync::{ingestion_tests, validation::ValidatedPayload, BlockPayload};
+use crate::sync::{
+    ingestion_tests,
+    validation::{AuthenticatedSegment, ValidatedPayload},
+    BlockPayload,
+};
 use reth_codecs::Compact;
 use reth_nippy_jar::{NippyJar, NippyJarWriter};
 use reth_static_file_types::{SegmentHeader, SegmentRangeInclusive, StaticFileSegment};
@@ -196,7 +200,7 @@ fn real_jars_decode_boundaries_and_authenticate_anchor() -> Result<()> {
     let fixture = Fixture::new()?;
     let import = fixture.import(101)?;
     let stage = fixture.stage(&import)?;
-    let reader = HeaderReader::open(&stage.root, &import.plan.groups[0], import.evidence.clone())?;
+    let reader = HeaderReader::open(&stage, &import.plan.groups, import.evidence.clone())?;
     let segment = AuthenticatedSegment::archive(
         import.evidence.clone(),
         reader.headers(&import.evidence)?,
@@ -205,7 +209,7 @@ fn real_jars_decode_boundaries_and_authenticate_anchor() -> Result<()> {
     )?;
     assert_eq!(segment.start(), 101);
     let mut seen = Vec::new();
-    reader::scan(&stage.root, &import.plan.groups[0], 100, |payload| {
+    reader::scan(&stage, &import.plan.groups[0], 100, |payload| {
         seen.push(payload.header().hash_slow());
         Ok(())
     })?;
@@ -222,7 +226,7 @@ fn real_jars_decode_boundaries_and_authenticate_anchor() -> Result<()> {
     assert!(
         AuthenticatedSegment::archive(wrong, reader.headers(&import.evidence)?, 101, 104).is_err()
     );
-    assert!(reader::scan(&stage.root, &import.plan.groups[0], 0, |_| Ok(())).is_err());
+    assert!(reader::scan(&stage, &import.plan.groups[0], 0, |_| Ok(())).is_err());
     Ok(())
 }
 
