@@ -21,6 +21,234 @@ struct Fixture {
     config: ArchiveConfig,
     payloads: Vec<BlockPayload<BaseChain>>,
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and localhost HTTP; run serially"]
+async fn archives_finish_without_peers_then_handoff_retries_only_new_payloads() -> Result<()> {
+    use crate::archive::handoff::tests::{policy, Peers};
+    use std::time::Duration;
+    let mut fixture = Fixture::new()?;
+    fixture.config.handoff = true;
+    fixture.config.end_block = 100;
+    fixture.config.checkpoint_hash = fixture.payloads[0].header().hash_slow();
+    fixture.config.handoff_retry_secs = 1;
+    let (mut ctx, _, _) = ingestion_tests::context(false).await?;
+    let (stop, rx) = watch::channel(false);
+    ctx.stop_rx = rx;
+    let mut import = fixture.import(100)?;
+    let bridge = import.bridge();
+    let server = serve_groups(&fixture, &mut import, None)?;
+    // There is no peer pool or network connection until archive indexing finishes.
+    let retained = import.run_retained(ctx.clone()).await?;
+    server.join().map_err(|_| eyre!("server panicked"))??;
+    assert_eq!(
+        ctx.db
+            .last_checkpoint()
+            .await?
+            .map(crate::types::BlockNumber::as_u64),
+        Some(100)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM phase2_events")
+            .fetch_one(ctx.db.pool())
+            .await?,
+        1
+    );
+    assert!(!fixture.config.staging_dir.join("transactions").exists());
+    let peers = Peers::new(fixture.payloads.clone(), 3);
+    peers.earliest.store(101, Ordering::Relaxed);
+    peers.bodies.store(false, Ordering::Relaxed);
+    let pool = Arc::clone(&peers.pool);
+    let rx = ctx.stop_rx.clone();
+    let waiting = tokio::spawn(async move { bridge.wait(&pool, &policy(), &rx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(
+        ctx.db
+            .last_checkpoint()
+            .await?
+            .map(crate::types::BlockNumber::as_u64),
+        Some(100)
+    );
+    peers.bodies.store(true, Ordering::Relaxed);
+    assert!(tokio::time::timeout(Duration::from_secs(3), waiting).await???);
+    let wrong = crate::archive::handoff::Bridge {
+        hash: B256::ZERO,
+        ..bridge
+    };
+    assert!(tokio::time::timeout(
+        Duration::from_secs(3),
+        wrong.wait(&peers.pool, &policy(), &ctx.stop_rx)
+    )
+    .await?
+    .is_err());
+    stop.send(true)?;
+    assert!(!bridge.wait(&peers.pool, &policy(), &ctx.stop_rx).await?);
+    drop(retained);
+    Ok(())
+}
+
+#[test]
+fn handoff_end_and_retry_configuration_is_explicit() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let prepare = |config: ArchiveConfig, end| {
+        PreparedImport::new(config, Path::new("."), ChainKind::Base, 100, end, "fixture")
+    };
+    assert!(prepare(fixture.config.clone(), Some(105)).is_err());
+    fixture.config.handoff = true;
+    assert!(prepare(fixture.config.clone(), Some(105)).is_ok());
+    assert!(prepare(fixture.config.clone(), Some(103)).is_err());
+    fixture.config.handoff_retry_secs = 0;
+    assert!(prepare(fixture.config.clone(), None).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+#[expect(clippy::too_many_lines, reason = "end-to-end lifecycle assertions")]
+async fn archive_history_follow_restart_and_tail_reorg() -> Result<()> {
+    use crate::archive::handoff::{
+        self,
+        tests::{policy, Peers},
+    };
+    use crate::types::BlockNumber;
+    use std::time::Duration;
+    let mut fixture = Fixture::new()?;
+    fixture.config.handoff = true;
+    fixture.config.end_block = 100;
+    fixture.config.checkpoint_hash = fixture.payloads[0].header().hash_slow();
+    let import = fixture.import(100)?;
+    let bridge = import.bridge();
+    drop(fixture.stage(&import)?);
+    let peers = Peers::new(fixture.payloads.clone(), 3);
+    let (mut ctx, _notifications, mut live) = ingestion_tests::context(false).await?;
+    let (stop, rx) = watch::channel(false);
+    ctx.stop_rx = rx;
+    ctx.is_backfill = true;
+    let mut sync = ctx.clone().into_sync(Arc::clone(&peers.pool));
+    let retained = import.run_retained(ctx.clone()).await?;
+    peers.earliest.store(101, Ordering::Relaxed);
+    assert_eq!(ctx.db.last_checkpoint().await?, Some(BlockNumber::new(100)));
+    bridge.probe(&peers.pool, &policy(), &ctx.stop_rx).await?;
+    assert!(
+        bridge
+            .verify_tail(&sync, retained.reader(), &policy())
+            .await?
+    );
+    // One exaggerated peer head must not trap genuine live blocks in backfill.
+    let liar = peers.pool.snapshot()[0].peer_id;
+    peers.pool.update_peer_head(liar, 1_000_104);
+    tokio::time::timeout(Duration::from_secs(3), handoff::catch_up(sync.clone())).await??;
+    assert_eq!(ctx.db.last_checkpoint().await?, Some(BlockNumber::new(104)));
+    assert!(
+        live.try_recv().is_err(),
+        "archive/history must retain backfill stream policy"
+    );
+    let prior = &fixture.payloads[1];
+    let mut header = prior.header().clone();
+    header.number = 105;
+    header.parent_hash = fixture.payloads[4].header().hash_slow();
+    peers.blocks.write().push(BlockPayload::new(
+        header,
+        prior.body().clone(),
+        prior.receipts().to_vec(),
+    ));
+    for peer in peers.pool.snapshot() {
+        peers.pool.update_peer_head(peer.peer_id, 105);
+    }
+    let following = tokio::spawn(crate::sync::run_follow_loop(
+        BlockNumber::new(100),
+        sync.clone(),
+    ));
+    let reached = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if ctx.db.last_checkpoint().await? == Some(BlockNumber::new(105)) {
+                return Ok::<_, eyre::Report>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    stop.send(true)?;
+    tokio::time::timeout(Duration::from_secs(10), following).await???;
+    reached??;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), live.recv()).await?,
+        Some((105, 105))
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM phase2_events")
+            .fetch_one(ctx.db.pool())
+            .await?,
+        3
+    );
+    assert_eq!(
+        db::verification::archive_frontier(&ctx.db)
+            .await?
+            .map(|f| f.block),
+        Some(100)
+    );
+    drop(retained);
+
+    // Restart after peers have pruned the archive payloads. Reopening only the
+    // retained jars must succeed, and startup verifies the current P2P frontier.
+    let (_stop, rx) = watch::channel(false);
+    ctx.stop_rx = rx.clone();
+    sync.stop_rx = rx;
+    peers.earliest.store(104, Ordering::Relaxed);
+    let retained = fixture.import(100)?.run_retained(ctx.clone()).await?;
+    crate::sync::engine::verify_or_recover_frontier_with_archive(
+        &sync,
+        &policy(),
+        Some(retained.reader()),
+    )
+    .await?;
+    assert_eq!(ctx.db.last_checkpoint().await?, Some(BlockNumber::new(105)));
+    assert!(bridge
+        .probe(&peers.pool, &policy(), &ctx.stop_rx)
+        .await
+        .is_err());
+
+    // A legitimate P2P-tail reorg can roll back to 104 while preserving the
+    // pinned archive boundary and removing the orphaned child's event.
+    peers.earliest.store(100, Ordering::Relaxed);
+    {
+        let mut blocks = peers.blocks.write();
+        let old = blocks.pop().ok_or_else(|| eyre!("missing tail"))?;
+        let mut changed = old.header().clone();
+        changed.extra_data = alloy_primitives::Bytes::from_static(b"alternate");
+        blocks.push(BlockPayload::new(
+            changed,
+            old.body().clone(),
+            old.receipts().to_vec(),
+        ));
+    }
+    crate::sync::engine::verify_or_recover_frontier_with_archive(
+        &sync,
+        &policy(),
+        Some(retained.reader()),
+    )
+    .await?;
+    assert_eq!(ctx.db.last_checkpoint().await?, Some(BlockNumber::new(104)));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM phase2_events")
+            .fetch_one(ctx.db.pool())
+            .await?,
+        2
+    );
+    assert!(crate::sync::follow::rollback_to_ancestor(
+        &ctx.db,
+        &ctx.handlers,
+        &ctx.transfer_handlers,
+        &ctx.call_handlers,
+        &ctx.config,
+        99
+    )
+    .await
+    .is_err());
+    assert_eq!(ctx.db.last_checkpoint().await?, Some(BlockNumber::new(104)));
+    Ok(())
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);

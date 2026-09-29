@@ -9,6 +9,10 @@ use eyre::{Result, WrapErr};
 use std::time::Duration;
 use tokio::sync::watch;
 
+#[cfg(test)]
+#[path = "handoff_tests.rs"]
+pub(super) mod tests;
+
 /// The pinned archive endpoint selects the bridge; its identity is persisted in
 /// the archive job. Peer hints cannot move it or substitute a different anchor.
 #[derive(Clone, Copy, Debug)]
