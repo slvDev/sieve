@@ -189,6 +189,52 @@ OP-stack notes (Base, OP mainnet, Unichain, and World Chain):
 trusted_peers = ["enode://<pubkey>@<ip>:<port>"]
 ```
 
+### Base Archive Bootstrap
+
+Inspect a pinned Base V2 snapshot before planning a historical archive import:
+
+```bash
+sieve archive-plan --manifest base-manifest.json \
+  --manifest-sha256 <64-hex-digit-digest> \
+  --start-block 500123 --end-block 1000010
+```
+
+This offline command prints the selected archives, decode dependencies, disk
+estimates, and trust requirements without connecting to a database or peers.
+
+To import the selected Base V2 archives, add an `[archive]` section to your Base
+configuration. Paths are relative to the root configuration file:
+
+```toml
+[archive]
+manifest = "base-manifest.json"
+manifest_sha256 = "<64-hex-digit-digest>"
+end_block = 500999
+checkpoint_hash = "0x<trusted-end-block-hash>"
+staging_dir = "archive-stage"
+max_staging_bytes = 8000000000
+max_download_bytes = 300000000
+handoff = false
+```
+
+Obtain the manifest digest and endpoint hash independently. Run `archive-plan`
+on your exact range before choosing budgets; the example values cover only small
+early groups. The reader accepts Base V2 aligned static files from producers
+`2.5.2-dev (76a8261)` and `2.5.2-dev (5877708)`. Checksums and header links do not
+prove OP derivation or L1 finality.
+
+```bash
+sieve --config sieve.toml --start-block 499000 --end-block 500999
+```
+
+Imports resume from committed progress and release each group's transaction and
+receipt files after indexing, while retaining authenticated headers. With
+`handoff = true`, omit `--end-block` to continue from a recent archive endpoint
+through ordinary Base peer history into live follow. An explicit end above the
+archive endpoint bounds the peer tail; an equal end performs only the import.
+Missing peer history is retried without skipping blocks. A full recent snapshot
+to public-peer live-follow run remains unverified.
+
 ### Running Several Instances on One Host
 
 Sieve indexes exactly one chain per process (the pipeline is compiled for the
