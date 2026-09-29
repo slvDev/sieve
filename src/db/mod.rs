@@ -11,6 +11,7 @@
 //! Transaction model: one Postgres transaction per block, so all handler
 //! INSERTs + checkpoint UPDATE are committed atomically.
 
+pub mod archive_job;
 pub mod verification;
 
 use crate::config::IndexConfig;
@@ -892,6 +893,7 @@ pub async fn drop_all_tables(
         "_sieve_factories",
         "_sieve_canonical",
         "_sieve_archive_frontier",
+        "_sieve_archive_job",
         "_sqlx_migrations",
     ] {
         let sql = format!("DROP TABLE IF EXISTS {table} CASCADE");
@@ -1060,6 +1062,7 @@ pub async fn create_internal_tables(db: &Database) -> eyre::Result<()> {
 
     sqlx::raw_sql("ALTER TABLE _sieve_canonical ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'peer_quorum'")
         .execute(db.pool()).await?;
+    sqlx::raw_sql(archive_job::DDL).execute(db.pool()).await?;
     sqlx::raw_sql(verification::ARCHIVE_FRONTIER_DDL)
         .execute(db.pool())
         .await?;

@@ -74,6 +74,7 @@ pub async fn advance_archive_frontier(
     sqlx::query("INSERT INTO _sieve_archive_frontier (id, block_number, block_hash, evidence) VALUES (1, $1, $2, $3) ON CONFLICT (id) DO UPDATE SET block_number = EXCLUDED.block_number, block_hash = EXCLUDED.block_hash, evidence = EXCLUDED.evidence")
         .bind(block as i64).bind(hash.as_slice()).bind(serde_json::to_string(evidence)?)
         .execute(&mut **tx).await?;
+    super::archive_job::advance(tx, block, hash, evidence).await?;
     super::advance_verified_frontier(tx, BlockNumber::new(block), &hash).await?;
     sqlx::query("UPDATE _sieve_canonical SET source = 'archive_checkpoint' WHERE id = 1")
         .execute(&mut **tx)
