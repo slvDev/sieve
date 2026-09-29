@@ -195,7 +195,7 @@ pub async fn context(
     );
     let db = Arc::new(crate::db::Database::connect(&url).await?);
     crate::db::create_internal_tables(&db).await?;
-    sqlx::raw_sql("TRUNCATE _sieve_archive_job, _sieve_archive_frontier, _sieve_canonical, _sieve_block_hashes, _sieve_factory_children, _sieve_factories; UPDATE _sieve_checkpoints SET block_number = 0; CREATE TABLE IF NOT EXISTS phase2_events (block_number BIGINT, block_hash BYTEA, value TEXT); TRUNCATE phase2_events;").execute(db.pool()).await?;
+    sqlx::raw_sql("TRUNCATE _sieve_archive_groups, _sieve_archive_job, _sieve_archive_frontier, _sieve_canonical, _sieve_block_hashes, _sieve_factory_children, _sieve_factories; UPDATE _sieve_checkpoints SET block_number = 0; CREATE TABLE IF NOT EXISTS phase2_events (block_number BIGINT, block_hash BYTEA, value TEXT); TRUNCATE phase2_events;").execute(db.pool()).await?;
     crate::db::ensure_chain_identity(&db, "base", BaseChain::chain_spec().genesis_hash()).await?;
     let config = Arc::new(crate::config::IndexConfig::new(vec![
         crate::config::ContractConfig::new("Child", Address::ZERO, ABI, &["Ping"])?,
