@@ -562,6 +562,10 @@ pub async fn discover_head_p2p<C: ChainTypes>(
             Ok(headers) => {
                 pool.mark_peer_success(peer.peer_id);
                 if let Some(highest) = highest_valid_ascending(start, headers) {
+                    // A connection's Status head ages while the chain advances.
+                    // Refresh the scheduling hint from headers actually served;
+                    // canonical quorum still authenticates every indexed segment.
+                    pool.update_peer_head(peer.peer_id, highest);
                     best = best.max(highest);
                 }
             }

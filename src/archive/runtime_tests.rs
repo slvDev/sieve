@@ -105,6 +105,42 @@ fn handoff_end_and_retry_configuration_is_explicit() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+async fn archive_history_catches_up_after_connected_peers_advance() -> Result<()> {
+    use crate::archive::handoff::{self, tests::Peers};
+    use crate::types::BlockNumber;
+    use std::time::Duration;
+
+    let mut fixture = Fixture::new()?;
+    fixture.config.handoff = true;
+    fixture.config.end_block = 100;
+    fixture.config.checkpoint_hash = fixture.payloads[0].header().hash_slow();
+    let import = fixture.import(100)?;
+    drop(fixture.stage(&import)?);
+    let peers = Peers::new(fixture.payloads[..1].to_vec(), 3);
+    let (ctx, _, mut live) = ingestion_tests::context(false).await?;
+    let (_stop, rx) = watch::channel(false);
+    let mut ctx = ctx;
+    ctx.stop_rx = rx;
+    let retained = import.run_retained(ctx.clone()).await?;
+
+    // Existing connections can serve newer blocks without a new Status message.
+    peers
+        .blocks
+        .write()
+        .extend_from_slice(&fixture.payloads[1..]);
+    let sync = ctx.clone().into_sync(Arc::clone(&peers.pool));
+    tokio::time::timeout(Duration::from_secs(3), handoff::catch_up(sync)).await??;
+    assert_eq!(ctx.db.last_checkpoint().await?, Some(BlockNumber::new(104)));
+    assert!(
+        live.try_recv().is_err(),
+        "history must use backfill stream policy"
+    );
+    drop(retained);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
 #[expect(clippy::too_many_lines, reason = "end-to-end lifecycle assertions")]
 async fn archive_history_follow_restart_and_tail_reorg() -> Result<()> {
     use crate::archive::handoff::{
