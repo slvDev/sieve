@@ -3,7 +3,7 @@
 //! Entry point: loads TOML config, connects to PostgreSQL, optionally spawns
 //! the GraphQL API server, then runs the P2P sync engine. Supports historical
 //! backfill (`--end-block`) and live head-following modes. Graceful shutdown
-//! on first Ctrl+C, hard exit on second.
+//! on first SIGINT/Ctrl+C or SIGTERM, hard exit on second.
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -150,7 +150,13 @@ async fn run_default(cli: &cli::Cli) -> eyre::Result<()> {
 
     // Graceful shutdown signal
     let (stop_tx, stop_rx) = watch::channel(false);
-    tokio::spawn(shutdown_handler(stop_tx, cli.verbose));
+    let signals = ShutdownSignals::new()?;
+    let verbose = cli.verbose;
+    tokio::spawn(async move {
+        if let Err(error) = shutdown_handler(signals, stop_tx, verbose).await {
+            warn!(%error, "failed to receive shutdown signal");
+        }
+    });
 
     let _writer_lease = db::archive_job::writer_lease(&startup.database_url).await?;
     let db = Arc::new(setup_database(cli, &startup).await?);
@@ -1311,6 +1317,7 @@ fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
 /// Returns an error if the P2P network fails to start.
 #[expect(clippy::print_stdout, reason = "CLI output for peers command")]
 async fn cmd_peers<C: chain::ChainTypes>() -> eyre::Result<()> {
+    let mut signals = ShutdownSignals::new()?;
     println!("Connecting to {} P2P network...", C::NAME);
     let session = p2p::connect_peers::<C>(None, &[]).await?;
     println!("Startup complete: {} peers connected", session.pool.len());
@@ -1323,7 +1330,8 @@ async fn cmd_peers<C: chain::ChainTypes>() -> eyre::Result<()> {
                 let best = session.pool.best_peer_head().unwrap_or(0);
                 println!("peers={count} best_head={best}");
             }
-            _ = tokio::signal::ctrl_c() => {
+            signal = signals.recv() => {
+                signal?;
                 println!("Shutting down.");
                 break;
             }
@@ -1557,22 +1565,61 @@ async fn resolve_effective_start(
     Ok(start_block)
 }
 
-/// Handle Ctrl+C for graceful shutdown.
+/// Register once and retain both streams while the indexer drains.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let received = tokio::select! {
+                signal = self.interrupt.recv() => signal,
+                signal = self.terminate.recv() => signal,
+            };
+            received.ok_or_else(|| std::io::Error::other("shutdown signal stream closed"))
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await
+        }
+    }
+}
+
+/// Handle SIGINT/Ctrl+C and SIGTERM for graceful shutdown.
 ///
 /// First signal: set the stop flag so all loops drain gracefully.
 /// Second signal: hard exit (for impatient users).
-#[expect(clippy::exit, reason = "second Ctrl+C requires immediate hard exit")]
-async fn shutdown_handler(stop_tx: watch::Sender<bool>, verbose: bool) {
-    // First Ctrl+C → graceful shutdown
-    tokio::signal::ctrl_c().await.ok();
+#[expect(
+    clippy::exit,
+    reason = "second shutdown signal requires immediate hard exit"
+)]
+async fn shutdown_handler(
+    mut signals: ShutdownSignals,
+    stop_tx: watch::Sender<bool>,
+    verbose: bool,
+) -> std::io::Result<()> {
+    signals.recv().await?;
     if !verbose {
         ui::clear_line();
     }
     warn!("shutdown signal received; stopping after draining");
     let _ = stop_tx.send(true);
 
-    // Second Ctrl+C → hard exit
-    tokio::signal::ctrl_c().await.ok();
+    signals.recv().await?;
     warn!("second shutdown signal received; forcing exit");
     std::process::exit(130);
 }
@@ -1739,6 +1786,130 @@ fn build_stream_sinks(
 )]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod shutdown_signals {
+        use super::*;
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        // Real signals run in subprocesses so they cannot terminate or install
+        // process-wide signal handlers in the main test runner.
+        struct Probe(Child);
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "subprocess entry point for shutdown signal tests"]
+        #[expect(clippy::print_stdout, reason = "subprocess synchronization")]
+        async fn probe() -> eyre::Result<()> {
+            let signals = ShutdownSignals::new()?;
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            let handler = tokio::spawn(shutdown_handler(signals, stop_tx, true));
+            println!("READY");
+            stop_rx.changed().await?;
+            assert!(*stop_rx.borrow());
+            println!("STOPPING");
+            if std::env::var_os("SIEVE_TEST_SHUTDOWN_FORCE").is_some() {
+                handler.await??;
+            }
+            Ok(())
+        }
+
+        fn run_probe(first: &str, second: Option<&str>) -> eyre::Result<i32> {
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "tests::shutdown_signals::probe",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .env_remove("SIEVE_TEST_SHUTDOWN_FORCE");
+            if second.is_some() {
+                command.env("SIEVE_TEST_SHUTDOWN_FORCE", "1");
+            }
+            let mut child = Probe(command.spawn()?);
+            let stdout = child
+                .0
+                .stdout
+                .take()
+                .ok_or_else(|| eyre::eyre!("no probe stdout"))?;
+            let (line_tx, line_rx) = mpsc::channel();
+            let _reader = std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if line_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let wait_for = |marker: &str| -> eyre::Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let line =
+                        line_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+                    if line == marker {
+                        return Ok(());
+                    }
+                }
+            };
+            let send = |signal: &str| -> eyre::Result<()> {
+                let status = Command::new("/bin/kill")
+                    .args(["-s", signal, &child.0.id().to_string()])
+                    .status()?;
+                eyre::ensure!(status.success(), "failed to send {signal}");
+                Ok(())
+            };
+            wait_for("READY")?;
+            send(first)?;
+            wait_for("STOPPING")?;
+            if let Some(signal) = second {
+                send(signal)?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.0.try_wait()? {
+                    return status
+                        .code()
+                        .ok_or_else(|| eyre::eyre!("probe killed by a signal"));
+                }
+                eyre::ensure!(Instant::now() < deadline, "shutdown probe did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn first_signal_stops_gracefully() -> eyre::Result<()> {
+            for signal in ["SIGINT", "SIGTERM"] {
+                assert_eq!(run_probe(signal, None)?, 0, "first {signal}");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn second_signal_forces_exit() -> eyre::Result<()> {
+            for first in ["SIGINT", "SIGTERM"] {
+                for second in ["SIGINT", "SIGTERM"] {
+                    assert_eq!(
+                        run_probe(first, Some(second))?,
+                        130,
+                        "{first} then {second}"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn generate_contract_toml_basic() {

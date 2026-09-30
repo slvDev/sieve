@@ -630,7 +630,7 @@ Sieve syncs block headers and receipts over the chain's devp2p protocol, filters
 - **One command:** backfill, catch-up, and live head-following, no separate modes
 - **Checkpoint/resume:** restarts exactly where it left off (see [Integrity](#integrity))
 - **Follow mode:** after historical sync, follows the chain head in real-time
-- **Graceful shutdown:** Ctrl+C stops cleanly, progress is saved
+- **Graceful shutdown:** Ctrl+C or SIGTERM (including `docker stop`) drains pending work and saves progress. A second signal forces exit. Allow enough Docker stop time for the drain to finish.
 
 ## FAQ
 
