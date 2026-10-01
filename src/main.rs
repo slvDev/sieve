@@ -1,4 +1,4 @@
-//! Sieve — Ethereum event indexer over P2P.
+//! Sieve: Ethereum and OP-stack event indexer over P2P.
 //!
 //! Entry point: loads TOML config, connects to PostgreSQL, optionally spawns
 //! the GraphQL API server, then runs the P2P sync engine. Supports historical
@@ -606,7 +606,7 @@ fn load_resolved_config(cli: &cli::Cli) -> eyre::Result<ResolvedStartup> {
 
 #[expect(clippy::print_stdout, reason = "CLI output for --explain")]
 fn print_explain() -> eyre::Result<()> {
-    println!("Ethereum event indexer. Connects directly to P2P.");
+    println!("Ethereum and OP-stack event indexer. Connects directly to P2P.");
     println!("No RPC provider. No API keys. No rate limits. No bills.");
     Ok(())
 }

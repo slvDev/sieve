@@ -2,9 +2,13 @@
 
 use clap::{Parser, Subcommand};
 
-/// Ethereum event indexer over P2P.
+/// Ethereum and OP-stack event indexer over P2P.
 #[derive(Debug, Parser)]
-#[command(name = "sieve", version, about = "Ethereum event indexer over P2P")]
+#[command(
+    name = "sieve",
+    version,
+    about = "Ethereum and OP-stack event indexer over P2P"
+)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "CLI flags are naturally independent booleans"
@@ -99,8 +103,9 @@ pub enum Command {
     Inspect,
     /// Connect to P2P network and report peer count (no DB needed).
     Peers {
-        /// Chain to connect to: "mainnet" or "base". Defaults to the
-        /// config file's `chain` key if present, else mainnet.
+        /// Chain to connect to: "mainnet", "base", "optimism", "unichain",
+        /// or "world". Defaults to the config file's `chain` key if
+        /// present, else mainnet.
         #[arg(long)]
         chain: Option<String>,
     },
