@@ -18,7 +18,7 @@ use reth_eth_wire_types::{
 };
 use reth_network::config::{rng_secret_key, NetworkConfigBuilder};
 use reth_network::import::ProofOfStakeBlockImport;
-use reth_network::{NetworkHandle, PeersConfig, PeersInfo};
+use reth_network::{NetworkHandle, Peers, PeersConfig, PeersInfo};
 use reth_network_api::events::PeerEvent;
 use reth_network_api::{
     DiscoveredEvent, DiscoveryEvent, NetworkEvent, NetworkEventListenerProvider, PeerId,
@@ -103,12 +103,14 @@ impl P2pStats {
 #[derive(Debug)]
 pub struct PeerPool<C: ChainTypes> {
     peers: RwLock<Vec<NetworkPeer<C>>>,
+    disconnect_tx: Option<tokio::sync::mpsc::UnboundedSender<PeerId>>,
 }
 
 impl<C: ChainTypes> PeerPool<C> {
-    const fn new() -> Self {
+    const fn new(disconnect_tx: Option<tokio::sync::mpsc::UnboundedSender<PeerId>>) -> Self {
         Self {
             peers: RwLock::new(Vec::new()),
+            disconnect_tx,
         }
     }
 
@@ -117,13 +119,14 @@ impl<C: ChainTypes> PeerPool<C> {
     #[cfg(test)]
     #[must_use]
     pub const fn new_empty() -> Self {
-        Self::new()
+        Self::new(None)
     }
 
     #[cfg(test)]
     pub const fn fixture(peers: Vec<NetworkPeer<C>>) -> Self {
         Self {
             peers: RwLock::new(peers),
+            disconnect_tx: None,
         }
     }
 
@@ -190,11 +193,19 @@ impl<C: ChainTypes> PeerPool<C> {
             .max()
     }
 
-    /// Remove peers with no successful request within `threshold`.
+    /// Remove stale peers and request transport disconnection to free network slots.
     pub fn evict_stale(&self, threshold: Duration) -> usize {
         let mut peers = self.peers.write();
         let before = peers.len();
-        peers.retain(|p| p.last_success.elapsed() < threshold);
+        peers.retain(|peer| {
+            if peer.last_success.elapsed() < threshold {
+                return true;
+            }
+            if let Some(tx) = &self.disconnect_tx {
+                let _ = tx.send(peer.peer_id);
+            }
+            false
+        });
         before - peers.len()
     }
 
@@ -304,7 +315,14 @@ pub async fn connect_peers<C: ChainTypes>(
         .await
         .wrap_err("failed to start p2p network")?;
 
-    let pool = Arc::new(PeerPool::<C>::new());
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pool = Arc::new(PeerPool::<C>::new(Some(disconnect_tx)));
+    let disconnect_handle = handle.clone();
+    tokio::spawn(async move {
+        while let Some(peer_id) = disconnect_rx.recv().await {
+            disconnect_handle.disconnect_peer(peer_id);
+        }
+    });
     let p2p_stats = Arc::new(P2pStats::new());
 
     let genesis_hash = C::chain_spec().genesis_hash();
@@ -1016,6 +1034,7 @@ pub async fn fetch_payloads_for_headers<C: ChainTypes>(
 
 #[cfg(test)]
 mod tests {
+    use super::{NetworkPeer, PeerPool};
     use crate::chain::EthereumChain;
     use crate::sync::validation::validate_payload;
     use crate::test_utils::{build_test_transaction, make_log, make_receipt};
@@ -1023,6 +1042,36 @@ mod tests {
     use alloy_primitives::{Address, Bytes, B256};
     use reth_ethereum_primitives::{BlockBody, Receipt};
     use reth_primitives_traits::Header;
+
+    #[tokio::test]
+    #[expect(clippy::panic_in_result_fn, reason = "test assertions")]
+    async fn stale_eviction_requests_disconnect_and_preserves_recent_peers() -> eyre::Result<()> {
+        let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = PeerPool::<EthereumChain>::new(Some(disconnect_tx));
+        let stale_id = reth_network_api::PeerId::repeat_byte(1);
+        let recent_id = reth_network_api::PeerId::repeat_byte(2);
+        let mut connections = Vec::new();
+        for (peer_id, age) in [(stale_id, 121), (recent_id, 119)] {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            connections.push(rx);
+            pool.add_peer(NetworkPeer {
+                peer_id,
+                eth_version: reth_eth_wire::EthVersion::Eth68,
+                messages: reth_network_api::PeerRequestSender::new(peer_id, tx),
+                head_number: 100,
+                earliest_block: None,
+                last_success: tokio::time::Instant::now() - std::time::Duration::from_secs(age),
+            });
+        }
+        assert_eq!(pool.evict_stale(std::time::Duration::from_secs(120)), 1);
+        assert_eq!(disconnect_rx.try_recv()?, stale_id);
+        assert!(disconnect_rx.try_recv().is_err());
+        assert_eq!(pool.snapshot()[0].peer_id, recent_id);
+        assert_eq!(pool.evict_stale(std::time::Duration::from_secs(120)), 0);
+        assert!(disconnect_rx.try_recv().is_err());
+        drop(connections);
+        Ok(())
+    }
 
     fn validate(
         header: &Header,
