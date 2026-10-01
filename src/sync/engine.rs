@@ -137,7 +137,14 @@ pub async fn verify_or_recover_frontier_with_archive<C: ChainTypes>(
         }
     };
 
-    let winner = crate::sync::canonical::quorum_at(&ctx.pool, checkpoint, policy).await?;
+    let Some(winner) = crate::p2p::until_stopped(
+        &ctx.stop_rx,
+        crate::sync::canonical::quorum_at(&ctx.pool, checkpoint, policy),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     if winner.hash == stored {
         debug!(checkpoint, "committed frontier verified by quorum");
         return Ok(());
@@ -228,15 +235,21 @@ pub async fn run_canonical_segments<C: ChainTypes>(
             Some(parent) => ctx.db.get_block_hash(BlockNumber::new(parent)).await?,
             None => None,
         };
-        let canonical = establish_canonical_chain(
-            &ctx.pool,
-            seg_start,
-            seg_end,
-            frontier,
-            require_seam,
-            &policy,
+        let Some(canonical) = crate::p2p::until_stopped(
+            &ctx.stop_rx,
+            establish_canonical_chain(
+                &ctx.pool,
+                seg_start,
+                seg_end,
+                frontier,
+                require_seam,
+                &policy,
+            ),
         )
-        .await?;
+        .await?
+        else {
+            break;
+        };
 
         let outcome = run_sync(
             BlockNumber::new(seg_start),
@@ -454,6 +467,7 @@ async fn run_fetch_loop<C: ChainTypes>(
                 &mut state.ready_peers,
                 &mut state.ready_set,
                 abort_rx,
+                stop_rx,
             )
             .await
             {
@@ -520,11 +534,18 @@ async fn await_first_peer<C: ChainTypes>(
     ready_peers: &mut Vec<NetworkPeer<C>>,
     ready_set: &mut HashSet<PeerId>,
     abort_rx: &watch::Receiver<bool>,
+    stop_rx: &watch::Receiver<bool>,
 ) -> bool {
     let mut abort_rx = abort_rx.clone();
+    let mut stop_rx = stop_rx.clone();
+    if *stop_rx.borrow() || *abort_rx.borrow() {
+        return false;
+    }
     let received = tokio::select! {
+        biased;
+        _ = stop_rx.wait_for(|stopped| *stopped) => return false,
+        _ = abort_rx.wait_for(|aborted| *aborted) => return false,
         peer = ready_rx.recv() => peer,
-        _ = abort_rx.changed() => return false,
     };
     let Some(peer) = received else {
         return false;
@@ -845,6 +866,65 @@ mod peer_tests {
             },
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_waiting_for_fetchable_peers() -> eyre::Result<()> {
+        let pool = PeerPool::<EthereumChain>::new_empty();
+        let (_ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (_abort_tx, abort_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut ready = Vec::new();
+        let mut ready_set = HashSet::new();
+        let waiting = await_first_peer(
+            &mut ready_rx,
+            &pool,
+            &mut ready,
+            &mut ready_set,
+            &abort_rx,
+            &stop_rx,
+        );
+        let stop = async {
+            tokio::task::yield_now().await;
+            stop_tx.send(true)
+        };
+        let (continued, stopped) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(waiting, stop)
+        })
+        .await?;
+        stopped?;
+        assert!(!continued);
+        assert!(ready.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_stopped_or_aborted_fetch_wait_does_not_dispatch_ready_peer() -> eyre::Result<()>
+    {
+        for (stopped, aborted) in [(true, false), (false, true)] {
+            let (peer, connection) = peer();
+            let pool = PeerPool::fixture(vec![peer.clone()]);
+            let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+            ready_tx.send(peer)?;
+            let (_stop_tx, stop_rx) = watch::channel(stopped);
+            let (_abort_tx, abort_rx) = watch::channel(aborted);
+            let mut ready = Vec::new();
+            let mut ready_set = HashSet::new();
+            assert!(
+                !await_first_peer(
+                    &mut ready_rx,
+                    &pool,
+                    &mut ready,
+                    &mut ready_set,
+                    &abort_rx,
+                    &stop_rx
+                )
+                .await
+            );
+            assert!(ready.is_empty());
+            drop(connection);
+        }
+        Ok(())
     }
 
     #[tokio::test]

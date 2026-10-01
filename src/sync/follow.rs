@@ -417,7 +417,13 @@ async fn should_rollback_reorg<C: ChainTypes>(
     }
 
     let policy = crate::sync::canonical::QuorumPolicy::default();
-    match reorg::preflight_reorg(db, pool, baseline, &policy).await? {
+    let Some(check) =
+        crate::p2p::until_stopped(stop_rx, reorg::preflight_reorg(db, pool, baseline, &policy))
+            .await?
+    else {
+        return Ok(true);
+    };
+    match check {
         ReorgCheck::NoReorg => Ok(false),
         ReorgCheck::Inconclusive => {
             debug!("reorg check inconclusive, retrying");

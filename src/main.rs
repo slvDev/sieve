@@ -217,13 +217,13 @@ async fn connect_archive_context(
     port: Option<u16>,
     trusted: &[reth_network_peers::TrustedPeer],
 ) -> eyre::Result<Option<sync::SyncContext<chain::BaseChain>>> {
-    let mut stop = ctx.stop_rx.clone();
-    if *stop.borrow() {
+    let Some(session) = p2p::until_stopped(
+        &ctx.stop_rx,
+        p2p::connect_peers::<chain::BaseChain>(port, trusted),
+    )
+    .await?
+    else {
         return Ok(None);
-    }
-    let session = tokio::select! {
-        _ = stop.wait_for(|stopped| *stopped) => return Ok(None),
-        result = p2p::connect_peers::<chain::BaseChain>(port, trusted) => result?,
     };
     Ok(Some(ctx.into_sync(session.pool)))
 }
@@ -311,12 +311,17 @@ async fn prepare_and_run<C: chain::ChainTypes>(
     let api = build_api_schema(&startup, db)?;
     let start_block = startup.start_block;
 
-    let ctx = build_sync_context::<C>(cli, startup, db, metrics, stop_rx).await?;
+    let Some(ctx) = build_sync_context::<C>(cli, startup, db, metrics, stop_rx).await? else {
+        return Ok(());
+    };
 
     // Verify committed state (and recover from a reorg while stopped)
     // BEFORE anything can read it.
     let policy = sync::canonical::QuorumPolicy::default();
     sync::verify_or_recover_frontier(&ctx, &policy).await?;
+    if *ctx.stop_rx.borrow() {
+        return Ok(());
+    }
 
     // An existing database must resume at or below checkpoint + 1; a
     // configured start ABOVE it would leave an unindexed gap the scalar
@@ -424,7 +429,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
     db: &Arc<db::Database>,
     metrics: &Arc<metrics::SieveMetrics>,
     stop_rx: watch::Receiver<bool>,
-) -> eyre::Result<sync::SyncContext<C>> {
+) -> eyre::Result<Option<sync::SyncContext<C>>> {
     let event_table_map = build_event_table_map(&startup.resolved_events);
     let receipt_tables = Arc::new(build_receipt_tables(
         &startup.resolved_events,
@@ -452,7 +457,11 @@ async fn build_sync_context<C: chain::ChainTypes>(
     let stream_dispatcher = build_stream_dispatcher(&startup.resolved_streams);
 
     let session = if cli.verbose {
-        p2p::connect_peers::<C>(startup.p2p_port, &startup.trusted_peers).await?
+        p2p::until_stopped(
+            &stop_rx,
+            p2p::connect_peers::<C>(startup.p2p_port, &startup.trusted_peers),
+        )
+        .await?
     } else {
         let (done_tx, mut done_rx) = watch::channel(false);
         let spinner_task = tokio::spawn(async move {
@@ -465,11 +474,18 @@ async fn build_sync_context<C: chain::ChainTypes>(
                 }
             }
         });
-        let session = p2p::connect_peers::<C>(startup.p2p_port, &startup.trusted_peers).await?;
+        let session = p2p::until_stopped(
+            &stop_rx,
+            p2p::connect_peers::<C>(startup.p2p_port, &startup.trusted_peers),
+        )
+        .await;
         let _ = done_tx.send(true);
         spinner_task.await.ok();
         ui::clear_line();
-        session
+        session?
+    };
+    let Some(session) = session else {
+        return Ok(None);
     };
     info!(
         chain = C::NAME,
@@ -477,7 +493,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
         "connected to p2p network"
     );
 
-    Ok(sync::SyncContext {
+    Ok(Some(sync::SyncContext {
         pool: Arc::clone(&session.pool),
         config: index_config,
         db: Arc::clone(db),
@@ -495,7 +511,7 @@ async fn build_sync_context<C: chain::ChainTypes>(
         head_seen_rx: None,
         verbose: cli.verbose,
         worker_count,
-    })
+    }))
 }
 
 async fn build_archive_context(
@@ -1319,7 +1335,14 @@ fn print_transfer_detail(transfer: &toml_config::ResolvedTransfer) {
 async fn cmd_peers<C: chain::ChainTypes>() -> eyre::Result<()> {
     let mut signals = ShutdownSignals::new()?;
     println!("Connecting to {} P2P network...", C::NAME);
-    let session = p2p::connect_peers::<C>(None, &[]).await?;
+    let session = tokio::select! {
+        signal = signals.recv() => {
+            signal?;
+            println!("Shutting down.");
+            return Ok(());
+        }
+        result = p2p::connect_peers::<C>(None, &[]) => result?,
+    };
     println!("Startup complete: {} peers connected", session.pool.len());
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));

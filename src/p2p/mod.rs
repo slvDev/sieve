@@ -29,7 +29,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, watch, Semaphore};
 use tokio::time::{sleep, timeout, Duration, Instant};
 use tracing::{debug, info};
 
@@ -266,6 +266,35 @@ pub struct NetworkSession<C: ChainTypes> {
 }
 
 // ── connect_peers ────────────────────────────────────────────────────
+
+/// Await peer discovery or verification until shutdown. Cancellation returns `None`.
+///
+/// # Errors
+///
+/// Returns the operation's error, or an error if the shutdown channel closes
+/// without a stop request.
+pub fn until_stopped<T>(
+    stop_rx: &watch::Receiver<bool>,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> impl std::future::Future<Output = Result<Option<T>>> {
+    let mut stop = stop_rx.clone();
+    // Box before constructing the future: network startup carries a large
+    // state machine that must not inflate every caller's async stack frame.
+    let operation = Box::pin(operation);
+    async move {
+        if *stop.borrow() {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            stopped = stop.wait_for(|stopped| *stopped) => {
+                stopped.wrap_err("shutdown channel closed without a stop request")?;
+                Ok(None)
+            },
+            result = operation => result.map(Some),
+        }
+    }
+}
 
 /// Start the devp2p network for chain `C`, discover peers, and wait for
 /// initial connections.
@@ -1043,6 +1072,84 @@ mod tests {
     use alloy_primitives::{Address, Bytes, B256};
     use reth_ethereum_primitives::{BlockBody, Receipt};
     use reth_primitives_traits::Header;
+
+    #[tokio::test]
+    #[expect(clippy::panic_in_result_fn, reason = "test assertions")]
+    async fn shutdown_cancels_waiting_for_initial_peers() -> eyre::Result<()> {
+        let pool = std::sync::Arc::new(PeerPool::<EthereumChain>::new_empty());
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let waiting = super::until_stopped(&stop_rx, super::wait_for_peer_pool(pool, 1, None));
+        let stop = async {
+            tokio::task::yield_now().await;
+            stop_tx.send(true)
+        };
+        let (result, stopped) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(waiting, stop)
+        })
+        .await?;
+        stopped?;
+        assert!(result?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic_in_result_fn, reason = "test assertions")]
+    async fn shutdown_cancels_waiting_for_canonical_quorum() -> eyre::Result<()> {
+        let pool = PeerPool::<EthereumChain>::new_empty();
+        let policy = crate::sync::canonical::QuorumPolicy::default();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let waiting = super::until_stopped(
+            &stop_rx,
+            crate::sync::canonical::quorum_at(&pool, 100, &policy),
+        );
+        let stop = async {
+            tokio::task::yield_now().await;
+            stop_tx.send(true)
+        };
+        let (result, stopped) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(waiting, stop)
+        })
+        .await?;
+        stopped?;
+        assert!(result?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic_in_result_fn, reason = "test assertions")]
+    async fn stopped_peer_operation_is_not_polled() -> eyre::Result<()> {
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(true);
+        let result = super::until_stopped::<()>(&stop_rx, async {
+            eyre::bail!("operation must not run after shutdown")
+        })
+        .await?;
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic_in_result_fn, reason = "test assertions")]
+    async fn peer_operation_preserves_results_errors_and_closed_stop_channel() -> eyre::Result<()> {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            super::until_stopped(&stop_rx, async { Ok(7) }).await?,
+            Some(7)
+        );
+        let error =
+            super::until_stopped::<()>(&stop_rx, async { eyre::bail!("peer failed") }).await;
+        assert_eq!(
+            error.err().map(|err| err.to_string()).as_deref(),
+            Some("peer failed")
+        );
+        drop(stop_tx);
+        let result =
+            super::until_stopped(&stop_rx, std::future::pending::<eyre::Result<()>>()).await;
+        assert!(
+            result.is_err(),
+            "a closed channel must not bypass verification as successful shutdown"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[expect(clippy::panic_in_result_fn, reason = "test assertions")]
