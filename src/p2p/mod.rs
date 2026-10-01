@@ -142,32 +142,33 @@ impl<C: ChainTypes> PeerPool<C> {
         self.peers.read().clone()
     }
 
-    /// Add a peer if not already present.
-    fn add_peer(&self, peer: NetworkPeer<C>) {
+    /// Store the current session, replacing any older session for this peer ID.
+    pub(crate) fn add_peer(&self, peer: NetworkPeer<C>) {
         let mut peers = self.peers.write();
-        if peers
-            .iter()
-            .any(|existing| existing.peer_id == peer.peer_id)
+        if let Some(existing) = peers
+            .iter_mut()
+            .find(|existing| existing.peer_id == peer.peer_id)
         {
+            *existing = peer;
             return;
         }
         peers.push(peer);
     }
 
     /// Remove a peer by id.
-    fn remove_peer(&self, peer_id: PeerId) {
+    pub(crate) fn remove_peer(&self, peer_id: PeerId) {
         let mut peers = self.peers.write();
         peers.retain(|peer| peer.peer_id != peer_id);
     }
 
-    /// Get a peer's reported head block number.
+    /// Clone the current usable session, never an old or closed request sender.
     #[must_use]
-    pub fn get_peer_head(&self, peer_id: PeerId) -> Option<u64> {
+    pub fn get_peer(&self, peer_id: PeerId) -> Option<NetworkPeer<C>> {
         self.peers
             .read()
             .iter()
-            .find(|p| p.peer_id == peer_id)
-            .map(|p| p.head_number)
+            .find(|peer| peer.peer_id == peer_id && !peer.messages.to_session_tx.is_closed())
+            .cloned()
     }
 
     /// Update a peer's head block number (monotonic: only advances forward).

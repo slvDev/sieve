@@ -20,7 +20,7 @@ use crate::types::BlockNumber;
 use alloy_primitives::B256;
 use prometheus_client::metrics::gauge::Gauge;
 use reth_network_api::PeerId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -356,24 +356,26 @@ fn spawn_peer_feeder<C: ChainTypes>(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut known: HashSet<PeerId> = HashSet::new();
+        let mut known = HashMap::new();
 
-        // Seed any already-connected peers immediately.
-        for peer in pool.snapshot() {
-            if known.insert(peer.peer_id) {
-                let _ = ready_tx.send(peer);
-            }
-        }
-
+        // The first tick is immediate, seeding already-connected sessions.
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    let mut current = HashSet::new();
                     for peer in pool.snapshot() {
-                        if known.insert(peer.peer_id) {
+                        if peer.messages.to_session_tx.is_closed() {
+                            continue;
+                        }
+                        current.insert(peer.peer_id);
+                        let sender = &peer.messages.to_session_tx;
+                        if !known.get(&peer.peer_id).is_some_and(|old: &tokio::sync::mpsc::Sender<_>| old.same_channel(sender)) {
+                            known.insert(peer.peer_id, sender.clone());
                             let _ = ready_tx.send(peer);
                         }
                     }
+                    known.retain(|peer_id, _| current.contains(peer_id));
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
@@ -524,12 +526,12 @@ async fn await_first_peer<C: ChainTypes>(
         peer = ready_rx.recv() => peer,
         _ = abort_rx.changed() => return false,
     };
-    let Some(mut peer) = received else {
+    let Some(peer) = received else {
         return false;
     };
-    if let Some(h) = pool.get_peer_head(peer.peer_id) {
-        peer.head_number = h;
-    }
+    let Some(peer) = pool.get_peer(peer.peer_id) else {
+        return true;
+    };
     if ready_set.insert(peer.peer_id) {
         ready_peers.push(peer);
     }
@@ -546,13 +548,13 @@ async fn dispatch_best_peer<C: ChainTypes>(
 ) {
     // Pick best peer by quality score
     let best_idx = pick_best_ready_peer_index(ready_peers, ctx.peer_health).await;
-    let mut peer = ready_peers.swap_remove(best_idx);
-    ready_set.remove(&peer.peer_id);
+    let queued = ready_peers.swap_remove(best_idx);
+    ready_set.remove(&queued.peer_id);
 
-    // Refresh head from pool (picks up re-probe updates)
-    if let Some(h) = ctx.pool.get_peer_head(peer.peer_id) {
-        peer.head_number = h;
-    }
+    // Refresh the entire session: a reconnect replaces its sender and Status.
+    let Some(peer) = ctx.pool.get_peer(queued.peer_id) else {
+        return;
+    };
 
     // Pre-flight: cooldown and stale-head checks
     if let Some(action) = check_peer_eligibility(ctx, &peer).await {
@@ -720,17 +722,17 @@ async fn check_history_range<C: ChainTypes>(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Non-blocking drain of ready channel, refreshing peer heads from pool.
+/// Non-blocking drain of ready channel, resolving current sessions from the pool.
 fn drain_ready_peers<C: ChainTypes>(
     ready_rx: &mut mpsc::UnboundedReceiver<NetworkPeer<C>>,
     pool: &PeerPool<C>,
     ready_peers: &mut Vec<NetworkPeer<C>>,
     ready_set: &mut HashSet<PeerId>,
 ) {
-    while let Ok(mut peer) = ready_rx.try_recv() {
-        if let Some(h) = pool.get_peer_head(peer.peer_id) {
-            peer.head_number = h;
-        }
+    while let Ok(queued) = ready_rx.try_recv() {
+        let Some(peer) = pool.get_peer(queued.peer_id) else {
+            continue;
+        };
         if ready_set.insert(peer.peer_id) {
             ready_peers.push(peer);
         }
@@ -818,4 +820,100 @@ async fn check_progress<C: ChainTypes>(
     }
     *last_completed = current_completed;
     *last_check = Instant::now();
+}
+
+#[cfg(test)]
+#[expect(clippy::panic_in_result_fn, reason = "test assertions")]
+mod peer_tests {
+    use super::*;
+    use crate::chain::EthereumChain;
+    use reth_network_api::{PeerRequest, PeerRequestSender};
+
+    type PeerReceiver = mpsc::Receiver<PeerRequest<<EthereumChain as ChainTypes>::Net>>;
+
+    fn peer() -> (NetworkPeer<EthereumChain>, PeerReceiver) {
+        let peer_id = PeerId::repeat_byte(1);
+        let (tx, rx) = mpsc::channel(8);
+        (
+            NetworkPeer {
+                peer_id,
+                eth_version: reth_eth_wire::EthVersion::Eth68,
+                messages: PeerRequestSender::new(peer_id, tx),
+                head_number: 100,
+                earliest_block: Some(0),
+                last_success: Instant::now(),
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn feeder_forwards_reconnected_session_even_without_observing_disconnect(
+    ) -> eyre::Result<()> {
+        let (old, old_connection) = peer();
+        let pool = Arc::new(PeerPool::fixture(vec![old]));
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let feeder = spawn_peer_feeder(Arc::clone(&pool), ready_tx, stop_rx);
+        let first = tokio::time::timeout(Duration::from_secs(2), ready_rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("feeder closed"))?;
+        let (mut fresh, fresh_connection) = peer();
+        fresh.head_number = 200;
+        fresh.earliest_block = Some(50);
+        let fresh_sender = fresh.messages.to_session_tx.clone();
+        // Replace between feeder ticks, so there is never an empty snapshot.
+        pool.add_peer(fresh);
+        drop(old_connection);
+        let replacement = tokio::time::timeout(Duration::from_secs(2), ready_rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("feeder closed"))?;
+        assert!(first.messages.to_session_tx.is_closed());
+        assert!(replacement
+            .messages
+            .to_session_tx
+            .same_channel(&fresh_sender));
+        assert_eq!(replacement.head_number, 200);
+        assert_eq!(replacement.earliest_block, Some(50));
+        assert_eq!(pool.len(), 1);
+        // An unchanged session must not be dispatched repeatedly by the feeder.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), ready_rx.recv())
+                .await
+                .is_err()
+        );
+        stop_tx.send(true)?;
+        feeder.await?;
+        drop(fresh_connection);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ready_queue_uses_current_session_and_ignores_removed_or_closed_peers(
+    ) -> eyre::Result<()> {
+        let (old, old_connection) = peer();
+        let pool = PeerPool::fixture(vec![old.clone()]);
+        let (fresh, fresh_connection) = peer();
+        let sender = fresh.messages.to_session_tx.clone();
+        pool.add_peer(fresh);
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let mut ready = Vec::new();
+        let mut ready_set = HashSet::new();
+        ready_tx.send(old.clone())?;
+        drain_ready_peers(&mut ready_rx, &pool, &mut ready, &mut ready_set);
+        assert_eq!(ready.len(), 1);
+        assert!(ready[0].messages.to_session_tx.same_channel(&sender));
+        ready.clear();
+        ready_set.clear();
+        drop(fresh_connection);
+        ready_tx.send(old.clone())?;
+        drain_ready_peers(&mut ready_rx, &pool, &mut ready, &mut ready_set);
+        assert!(ready.is_empty());
+        pool.remove_peer(old.peer_id);
+        ready_tx.send(old)?;
+        drain_ready_peers(&mut ready_rx, &pool, &mut ready, &mut ready_set);
+        assert!(ready.is_empty());
+        drop(old_connection);
+        Ok(())
+    }
 }
