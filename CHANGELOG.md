@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.3.0] - 2026-10-01
+
+Base archive bootstrap. A Base index can now start from Base's published V2
+snapshot archives instead of syncing all history from peers, then continue
+through peer history into live follow in one run.
+
+### Added
+
+- **`sieve archive-plan`**: offline planner for a pinned Base V2 snapshot
+  manifest. For a block range it prints the selected archives, decode
+  dependencies, disk estimates, and trust requirements. No database or peers
+  needed.
+- **`[archive]` config section** (Base only): `manifest`, `manifest_sha256`,
+  `end_block`, `checkpoint_hash`, `staging_dir`, `max_staging_bytes`,
+  `max_download_bytes`, `handoff`. Paths resolve relative to the root config.
+- **Archive imports**: Sieve downloads, verifies, extracts, and decodes Base V2
+  static files (headers, transactions, receipts), then indexes them through the
+  same filter, decode, and commit pipeline as P2P sync. Accepts aligned static
+  files from producers `2.5.2-dev (76a8261)` and `2.5.2-dev (5877708)`.
+- **Resumable rolling imports**: progress is committed per archive group and
+  restarts resume from it. Each group's transaction and receipt files are
+  released after indexing while authenticated headers are kept. Staging and
+  download budgets are enforced.
+- **Archive to live handoff**: with `handoff = true` and no `--end-block`, Sieve
+  continues from the archive endpoint through Base peer history into live follow.
+  The first peer block must link to the trusted endpoint hash. Missing peer
+  history is retried without skipping blocks. An `--end-block` above the archive
+  endpoint bounds the peer tail; an equal one runs only the import.
+- **Block source provenance**: each committed canonical block records whether it
+  came from a peer quorum or an archive.
+
+### Changed
+
+- P2P sync and archive imports share one ordered ingestion path (verify, filter,
+  decode, commit).
+- Graceful shutdown also handles SIGTERM, including `docker stop`. Pending work
+  drains and progress is saved; a second signal forces exit.
+- CLI help and `--explain` describe Sieve as an Ethereum and OP-stack indexer,
+  and `sieve peers --chain` lists every supported chain.
+- Only one Sieve process can write to a database at a time. A second process
+  pointed at the same database exits at startup with "another Sieve writer owns
+  this database".
+
+### Fixed
+
+- Peer heads are refreshed during archive catch-up, so the peer tail no longer
+  waits on stale head reports.
+- Evicted stale peers are now disconnected instead of only leaving the pool.
+- Fetch sessions are refreshed when a peer reconnects.
+- Shutdown now cancels waits for initial peers and for canonical quorum, so
+  stopping no longer hangs while Sieve is still looking for peers.
+
+### Upgrade notes
+
+- Existing 0.2.0 databases upgrade in place. The new archive progress tables and
+  the canonical block `source` column are created automatically.
+- Get the manifest digest and the endpoint `checkpoint_hash` from an independent
+  source. Checksums and header links do not prove OP derivation or L1 finality.
+
 ## [0.2.0] - 2026-08-19
 
 Multichain release. Sieve now indexes four OP-Stack chains alongside Ethereum
