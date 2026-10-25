@@ -645,10 +645,7 @@ async fn dispatch_best_peer<C: ChainTypes>(
     });
 }
 
-/// Highest block a peer may be assigned in a segment ending at `segment_end`.
-/// `observed_head` is the follow-mode tracker value (`None` outside follow
-/// mode, 0 before its first probe). A positive observation lifts a stale
-/// per-peer head but never lowers a capable peer's cap. Peer head 0 is unknown.
+/// Dispatch cap: a positive follow-mode observed head lifts a stale peer head, never lowers it, bounded by `segment_end`.
 fn dispatch_head_cap(peer_head: u64, observed_head: Option<u64>, segment_end: u64) -> u64 {
     let peer_cap = if peer_head == 0 {
         segment_end
@@ -688,9 +685,7 @@ async fn check_peer_eligibility<C: ChainTypes>(
     }
 
     // Stale-head detection: peer's probed head is below our work range.
-    // Skip in follow mode: per-peer heads are stale (probed once at connect),
-    // the observed head lifts their dispatch cap, and the canonical segment
-    // already proves the blocks exist. Let fetches fail instead.
+    // Skipped in follow mode: the observed head lifts stale caps and the canonical segment proves the blocks exist.
     if ctx.head_seen_rx.is_none()
         && peer.head_number > 0
         && peer.head_number < ctx.start_block.as_u64()
@@ -1058,8 +1053,7 @@ mod peer_tests {
                 payload_tx,
                 _payload_rx: payload_rx,
                 ready_tx,
-                // Fixture headers have empty blooms, so every block completes
-                // through the canonical bloom-skip path without a peer request.
+                // Empty fixture blooms make every block a bloom skip, so no peer request is sent.
                 bloom_filter: Some(Arc::new(BloomFilter::new(vec![Address::repeat_byte(0xAA)]))),
                 head_seen_rx: observed_head.map(|head| watch::channel(head).1),
                 canonical: Arc::new(fixture_chain(headers)?),

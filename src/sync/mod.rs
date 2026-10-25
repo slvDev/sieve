@@ -97,8 +97,7 @@ pub struct SyncContext<C: ChainTypes> {
     /// Bloom filter for skipping blocks with no matching contract addresses.
     /// `None` when transfers, calls, or factories are configured.
     pub bloom_filter: Option<Arc<BloomFilter>>,
-    /// Global observed head from the follow-mode head tracker. Lifts stale
-    /// per-peer dispatch caps; never lowers a capable peer's cap.
+    /// Follow-mode observed head; lifts stale per-peer dispatch caps, never lowers them.
     pub head_seen_rx: Option<watch::Receiver<u64>>,
     /// Whether to use verbose tracing output (vs pretty UI).
     pub verbose: bool,
