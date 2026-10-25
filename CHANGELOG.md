@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.1] - 2026-10-25
+
+### Fixed
+
+- Catch-up without `--end-block` is no longer capped by the follow-mode head
+  tracker, which advanced about 64 blocks per probe cycle (regression since
+  v0.1.1). The observed head now only lifts stale per-peer head caps and never
+  lowers a capable peer's cap; near-tip follow behavior is unchanged.
+
 ## [0.3.0] - 2026-10-01
 
 Base archive bootstrap. A Base index can now start from Base's published V2
