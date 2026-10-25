@@ -590,19 +590,11 @@ async fn dispatch_best_peer<C: ChainTypes>(
         return;
     }
 
-    // Head cap: in follow mode use global observed head; otherwise per-peer head
-    let head_cap = if let Some(rx) = ctx.head_seen_rx {
-        let observed = *rx.borrow();
-        if observed > 0 {
-            observed
-        } else {
-            ctx.end_block.as_u64()
-        }
-    } else if peer.head_number == 0 {
-        ctx.end_block.as_u64()
-    } else {
-        peer.head_number
-    };
+    let head_cap = dispatch_head_cap(
+        peer.head_number,
+        ctx.head_seen_rx.as_ref().map(|rx| *rx.borrow()),
+        ctx.end_block.as_u64(),
+    );
 
     let batch = ctx
         .scheduler
@@ -653,6 +645,23 @@ async fn dispatch_best_peer<C: ChainTypes>(
     });
 }
 
+/// Highest block a peer may be assigned in a segment ending at `segment_end`.
+/// `observed_head` is the follow-mode tracker value (`None` outside follow
+/// mode, 0 before its first probe). A positive observation lifts a stale
+/// per-peer head but never lowers a capable peer's cap. Peer head 0 is unknown.
+fn dispatch_head_cap(peer_head: u64, observed_head: Option<u64>, segment_end: u64) -> u64 {
+    let peer_cap = if peer_head == 0 {
+        segment_end
+    } else {
+        peer_head
+    };
+    match observed_head {
+        None => peer_cap,
+        Some(0) => segment_end,
+        Some(observed) => peer_cap.max(observed).min(segment_end),
+    }
+}
+
 /// What to do with an ineligible peer.
 enum PeerAction {
     /// Recycle with a delayed re-send.
@@ -679,8 +688,9 @@ async fn check_peer_eligibility<C: ChainTypes>(
     }
 
     // Stale-head detection: peer's probed head is below our work range.
-    // Skip in follow mode — the head tracker verifies blocks exist on the network,
-    // and per-peer heads are stale (probed once at connect). Let fetches fail instead.
+    // Skip in follow mode: per-peer heads are stale (probed once at connect),
+    // the observed head lifts their dispatch cap, and the canonical segment
+    // already proves the blocks exist. Let fetches fail instead.
     if ctx.head_seen_rx.is_none()
         && peer.head_number > 0
         && peer.head_number < ctx.start_block.as_u64()
@@ -848,6 +858,9 @@ async fn check_progress<C: ChainTypes>(
 mod peer_tests {
     use super::*;
     use crate::chain::EthereumChain;
+    use crate::filter::BloomFilter;
+    use crate::sync::canonical::{chain, fixture_chain};
+    use alloy_primitives::Address;
     use reth_network_api::{PeerRequest, PeerRequestSender};
 
     type PeerReceiver = mpsc::Receiver<PeerRequest<<EthereumChain as ChainTypes>::Net>>;
@@ -994,6 +1007,175 @@ mod peer_tests {
         drain_ready_peers(&mut ready_rx, &pool, &mut ready, &mut ready_set);
         assert!(ready.is_empty());
         drop(old_connection);
+        Ok(())
+    }
+
+    const SEGMENT_START: u64 = 100;
+    const SEGMENT_END: u64 = 227;
+
+    /// Network-free fetch-loop state over the canonical segment `SEGMENT_START..=SEGMENT_END`.
+    struct DispatchFixture {
+        scheduler: Arc<PeerWorkScheduler>,
+        peer_health: Arc<PeerHealthTracker>,
+        pool: Arc<PeerPool<EthereumChain>>,
+        active_tasks: Arc<AtomicUsize>,
+        metrics: Arc<SieveMetrics>,
+        payload_tx: mpsc::Sender<FetchItem<EthereumChain>>,
+        _payload_rx: mpsc::Receiver<FetchItem<EthereumChain>>,
+        ready_tx: mpsc::UnboundedSender<NetworkPeer<EthereumChain>>,
+        bloom_filter: Option<Arc<BloomFilter>>,
+        head_seen_rx: Option<watch::Receiver<u64>>,
+        canonical: Arc<CanonicalChain>,
+    }
+
+    impl DispatchFixture {
+        fn new(
+            peer: &NetworkPeer<EthereumChain>,
+            observed_head: Option<u64>,
+        ) -> eyre::Result<Self> {
+            let config = SchedulerConfig {
+                blocks_per_assignment: 32,
+                initial_blocks_per_assignment: 32,
+                ..SchedulerConfig::default()
+            };
+            let peer_health = Arc::new(PeerHealthTracker::new(
+                PeerHealthConfig::from_scheduler_config(&config),
+            ));
+            let scheduler = Arc::new(PeerWorkScheduler::new_with_health(
+                config,
+                (SEGMENT_START..=SEGMENT_END).collect(),
+                Arc::clone(&peer_health),
+            ));
+            let (payload_tx, payload_rx) = mpsc::channel(128);
+            let (ready_tx, _) = mpsc::unbounded_channel();
+            let headers = chain(SEGMENT_START, SEGMENT_END - SEGMENT_START + 1, 1);
+            Ok(Self {
+                scheduler,
+                peer_health,
+                pool: Arc::new(PeerPool::fixture(vec![peer.clone()])),
+                active_tasks: Arc::new(AtomicUsize::new(0)),
+                metrics: Arc::new(SieveMetrics::new()),
+                payload_tx,
+                _payload_rx: payload_rx,
+                ready_tx,
+                // Fixture headers have empty blooms, so every block completes
+                // through the canonical bloom-skip path without a peer request.
+                bloom_filter: Some(Arc::new(BloomFilter::new(vec![Address::repeat_byte(0xAA)]))),
+                head_seen_rx: observed_head.map(|head| watch::channel(head).1),
+                canonical: Arc::new(fixture_chain(headers)?),
+            })
+        }
+
+        fn ctx(&self) -> FetchLoopContext<'_, EthereumChain> {
+            FetchLoopContext {
+                scheduler: &self.scheduler,
+                peer_health: &self.peer_health,
+                pool: &self.pool,
+                active_tasks: &self.active_tasks,
+                metrics: &self.metrics,
+                start_block: BlockNumber::new(SEGMENT_START),
+                end_block: BlockNumber::new(SEGMENT_END),
+                payload_tx: &self.payload_tx,
+                ready_tx: &self.ready_tx,
+                bloom_filter: &self.bloom_filter,
+                head_seen_rx: &self.head_seen_rx,
+                canonical: &self.canonical,
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_head_cap_combines_peer_and_observed_heads() {
+        let cases = [
+            (
+                1000,
+                Some(163),
+                SEGMENT_END,
+                "slow tracker behind capable peer",
+            ),
+            (
+                200,
+                Some(163),
+                200,
+                "capable peer inside segment keeps its head",
+            ),
+            (50, Some(180), 180, "observation lifts stale peer"),
+            (50, Some(0), SEGMENT_END, "tracker before first probe"),
+            (
+                0,
+                Some(163),
+                SEGMENT_END,
+                "unprobed peer with lagging tracker",
+            ),
+            (
+                50,
+                Some(5000),
+                SEGMENT_END,
+                "observation above rolled-back segment",
+            ),
+            (90, Some(95), 95, "both hints below pending work"),
+            (200, None, 200, "historical known peer"),
+            (50, None, 50, "historical stale peer"),
+            (0, None, SEGMENT_END, "historical unprobed peer"),
+        ];
+        for (peer_head, observed_head, expected, case) in cases {
+            assert_eq!(
+                dispatch_head_cap(peer_head, observed_head, SEGMENT_END),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_peer_head_is_rejected_only_outside_follow_mode() -> eyre::Result<()> {
+        for (observed_head, rejected) in
+            [(Some(SEGMENT_END), false), (Some(0), false), (None, true)]
+        {
+            let (mut stale, connection) = peer();
+            stale.head_number = SEGMENT_START - 50;
+            let fixture = DispatchFixture::new(&stale, observed_head)?;
+            let action = check_peer_eligibility(&fixture.ctx(), &stale).await;
+            assert_eq!(
+                matches!(action, Some(PeerAction::RecycleImmediate)),
+                rejected,
+                "{observed_head:?}"
+            );
+            assert_eq!(action.is_some(), rejected, "{observed_head:?}");
+            assert_eq!(
+                fixture
+                    .peer_health
+                    .is_peer_cooling_down(stale.peer_id)
+                    .await,
+                rejected,
+                "{observed_head:?}"
+            );
+            drop(connection);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn follow_dispatch_is_not_limited_by_slow_head_tracker() -> eyre::Result<()> {
+        let (mut capable, connection) = peer();
+        capable.head_number = 1000;
+        // The tracker has only observed 64 blocks of the 128-block segment.
+        let fixture = DispatchFixture::new(&capable, Some(SEGMENT_START + 63))?;
+        let ctx = fixture.ctx();
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+        let mut fetch_tasks = JoinSet::new();
+        for assigned in 1..=3 {
+            let mut ready = vec![capable.clone()];
+            let mut ready_set = HashSet::from([capable.peer_id]);
+            let permit = Arc::clone(&semaphore).try_acquire_owned()?;
+            dispatch_best_peer(&ctx, &mut ready, &mut ready_set, &mut fetch_tasks, permit).await;
+            assert_eq!(fetch_tasks.len(), assigned, "batch {assigned} not assigned");
+        }
+        while let Some(joined) = fetch_tasks.join_next().await {
+            joined?;
+        }
+        assert_eq!(fixture.scheduler.completed_count().await, 96);
+        drop(connection);
         Ok(())
     }
 }

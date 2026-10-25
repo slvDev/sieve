@@ -145,6 +145,24 @@ pub(super) fn fixture_chain(headers: Vec<Header>) -> eyre::Result<CanonicalChain
     })
 }
 
+/// Build a parent-linked header chain with the given seed byte.
+#[cfg(test)]
+pub(super) fn chain(start: u64, len: u64, seed: u8) -> Vec<Header> {
+    let mut headers = Vec::new();
+    let mut parent = B256::repeat_byte(seed);
+    for number in start..start + len {
+        let header = Header {
+            number,
+            parent_hash: parent,
+            gas_limit: u64::from(seed),
+            ..Default::default()
+        };
+        parent = SealedHeader::seal_slow(header.clone()).hash();
+        headers.push(header);
+    }
+    headers
+}
+
 // ── Pure quorum + validation core (fully unit-tested) ────────────────
 
 /// Outcome of tallying one round of votes against the fixed threshold.
@@ -691,23 +709,6 @@ mod tests {
         let mut reversed = votes;
         reversed.reverse();
         assert_eq!(tally(&reversed, 3), QuorumOutcome::Agreed(hash(0xAA)));
-    }
-
-    /// Build a parent-linked header chain with the given seed byte.
-    fn chain(start: u64, len: u64, seed: u8) -> Vec<Header> {
-        let mut headers = Vec::new();
-        let mut parent = B256::repeat_byte(seed);
-        for number in start..start + len {
-            let header = Header {
-                number,
-                parent_hash: parent,
-                gas_limit: u64::from(seed),
-                ..Default::default()
-            };
-            parent = SealedHeader::seal_slow(header.clone()).hash();
-            headers.push(header);
-        }
-        headers
     }
 
     fn tip_of(headers: &[Header]) -> B256 {

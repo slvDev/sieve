@@ -516,8 +516,8 @@ pub async fn rollback_to_ancestor(
 
 /// Background task that continuously probes P2P peers for the chain head.
 ///
-/// Broadcasts the highest confirmed head via `head_seen_tx` so the fetch
-/// loop can use it as head_cap instead of stale per-peer heads.
+/// Broadcasts the highest confirmed head via `head_seen_tx`. The fetch loop
+/// uses it as an advisory lift for stale per-peer heads, not as a ceiling.
 async fn run_head_tracker<C: ChainTypes>(
     pool: Arc<PeerPool<C>>,
     head_seen_tx: watch::Sender<u64>,
