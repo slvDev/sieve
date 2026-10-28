@@ -164,8 +164,8 @@ never mix. Use a separate database per chain, or wipe with `sieve reset` /
 OP-stack notes (Base, OP mainnet, Unichain, and World Chain):
 
 - Blocks arrive over the chain's devp2p network directly (no RPC, same as
-  mainnet). Sieve follows the sequencer's unsafe head, typically within a
-  block or two (~1-2s blocks). Base runs its own partitioned `basev0` peer
+  mainnet). Sieve polls peers for the sequencer's unsafe head and indexes
+  new blocks in small batches. Base runs its own partitioned `basev0` peer
   discovery, which Sieve speaks; OP mainnet, Unichain, and World Chain use
   standard superchain discovery.
 - OP-stack deposit transactions (type `0x7E`) are indexed like any other
@@ -181,11 +181,14 @@ OP-stack notes (Base, OP mainnet, Unichain, and World Chain):
 - Test connectivity without a config: `sieve peers --chain base` /
   `sieve peers --chain optimism` / `sieve peers --chain unichain` /
   `sieve peers --chain world`.
-- Known limitation: Base's unscheduled "Cobalt" hardfork will introduce a
-  new transaction type (`0x79`) and can be activated via L1 signalling.
-  When it is scheduled, Sieve will need an update to keep following Base.
-  Similarly, future OP-stack hardforks that change the fork-id require a
-  Sieve update to keep the handshake current.
+- Base fork schedule: Cobalt (2026-09-30 18:00 UTC) and Denim
+  (2026-11-05 18:00 UTC) are built in. After Denim, Base produces 200ms
+  blocks; header timestamps stay in whole seconds, so up to five
+  consecutive blocks share the same `block_timestamp`.
+- Known limitation: Base's unscheduled Everest hardfork adds the EIP-8130
+  transaction type `0x79`, which Sieve does not decode. Everest, like any
+  future OP-stack hardfork that changes the fork-id, requires a Sieve
+  update to keep following the chain.
 
 ```toml
 [p2p]
