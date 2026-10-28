@@ -21,7 +21,10 @@ def rpc(url, method, params):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     for attempt in range(4):
         try:
-            request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            request = urllib.request.Request(url, data=body, headers={
+                "Content-Type": "application/json",
+                "User-Agent": "sieve-reference-capture",
+            })
             with urllib.request.urlopen(request, timeout=60) as response:
                 data = json.load(response)
             if data.get("error") or data.get("result") is None:
@@ -37,7 +40,8 @@ def rpc(url, method, params):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/fixtures/base-reference"))
-    parser.add_argument("--blocks", type=int, nargs="+", default=[5_000_000, 9_101_527, 30_008_527, 47_810_527, 51_925_326])
+    parser.add_argument("--blocks", type=int, nargs="+", default=[
+        5_000_000, 9_101_527, 30_008_527, 47_810_527, 51_925_326, 52_000_926, 52_000_927])
     parser.add_argument("--env-file", type=pathlib.Path, help="local file containing BASE_ACCEPTANCE_RPC_URL or ALCHEMY_RPC_URL")
     args = parser.parse_args()
     if any(block < 0 for block in args.blocks):

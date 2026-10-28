@@ -36,12 +36,14 @@ use std::{
 };
 use tokio::sync::watch;
 
-const REFERENCES: [&str; 5] = [
+const REFERENCES: [&str; 7] = [
     include_str!("../../tests/fixtures/base-reference/5000000.json"),
     include_str!("../../tests/fixtures/base-reference/9101527.json"),
     include_str!("../../tests/fixtures/base-reference/30008527.json"),
     include_str!("../../tests/fixtures/base-reference/47810527.json"),
     include_str!("../../tests/fixtures/base-reference/51925326.json"),
+    include_str!("../../tests/fixtures/base-reference/52000926.json"),
+    include_str!("../../tests/fixtures/base-reference/52000927.json"),
 ];
 
 fn reference(raw: &str) -> Result<(Value, BlockPayload<BaseChain>)> {

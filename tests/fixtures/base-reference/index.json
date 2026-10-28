@@ -38,5 +38,21 @@
     "transactions": 132,
     "bytes": 707091,
     "sha256": "7a63f785483bb3e50b3820908a25d25af146fdc11743a322681faa30b7f55242"
+  },
+  {
+    "file": "52000926.json",
+    "block": 52000926,
+    "hash": "0xe4fca355892104a2ed43e472da40c05d7242479cae275a08da26d7b0b34a3ab9",
+    "transactions": 168,
+    "bytes": 790425,
+    "sha256": "07c309f09a174cf682440db8275a761d8413c42531e0744430889bf95f74c3a1"
+  },
+  {
+    "file": "52000927.json",
+    "block": 52000927,
+    "hash": "0x3b41aeacedde7127889727e7265a67ba5022ca2cf68975837f6e4f662159e4b7",
+    "transactions": 275,
+    "bytes": 1566140,
+    "sha256": "1cafa5e746b119ed207554f10ff78b539cbb8afe65d9a6cc2a35e4b999f79ae5"
   }
 ]
