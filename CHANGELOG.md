@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.3] - 2026-10-28
+
+### Fixed
+
+- Archive imports rejected the current Base snapshot (producer
+  `2.5.2-dev (7134be3)`). Older manifests are no longer published, so archive
+  bootstrap was unusable. This producer is now accepted. Its files for blocks
+  0-51,499,999 are byte-identical to the already supported `2.5.2-dev (5877708)`
+  snapshot.
+
 ## [0.3.2] - 2026-10-28
 
 ### Fixed
