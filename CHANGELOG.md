@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.2] - 2026-10-28
+
+### Fixed
+
+- Base following stalled at block 52,000,926 because the Base fork schedule
+  lacked Cobalt (2026-09-30 18:00 UTC), so post-Cobalt peers failed the
+  fork-id check. Cobalt and Denim (scheduled 2026-11-05 18:00 UTC) are now in
+  the schedule. Base's Everest transaction type `0x79` (EIP-8130) is not
+  supported yet.
+
 ## [0.3.1] - 2026-10-25
 
 ### Fixed
