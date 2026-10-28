@@ -333,7 +333,7 @@ impl Fixture {
             );
         }
         let raw = serde_json::to_vec(
-            &json!({"block":104,"chain_id":8453,"storage_version":2,"reth_version":crate::archive::manifest::PRODUCER,"base_url":"https://fixture.invalid","components":components}),
+            &json!({"block":104,"chain_id":8453,"storage_version":2,"reth_version":"2.5.2-dev (76a8261)","base_url":"https://fixture.invalid","components":components}),
         )?;
         fs::write(root.join("manifest.json"), &raw)?;
         let config = ArchiveConfig {

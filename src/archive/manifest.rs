@@ -6,8 +6,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-pub(super) const PRODUCER: &str = "2.5.2-dev (76a8261)";
-pub(super) const CURRENT_PRODUCER: &str = "2.5.2-dev (5877708)";
+/// How a producer writes each component's `total_blocks`.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TotalBlocks {
+    /// `block + 1`.
+    InclusiveCount,
+    /// The snapshot height, `block`.
+    Height,
+}
+
+/// Exact producers whose snapshot layout has been verified.
+pub(super) const PRODUCERS: [(&str, TotalBlocks); 3] = [
+    ("2.5.2-dev (76a8261)", TotalBlocks::InclusiveCount),
+    ("2.5.2-dev (5877708)", TotalBlocks::Height),
+    ("2.5.2-dev (7134be3)", TotalBlocks::Height),
+];
 pub(super) const COMPONENTS: [&str; 3] = ["headers", "transactions", "receipts"];
 
 #[derive(Debug, Deserialize)]
@@ -61,11 +74,7 @@ impl Manifest {
             manifest.chain_id == 8453 && manifest.storage_version == 2,
             "expected Base mainnet V2 snapshot"
         );
-        ensure!(
-            matches!(manifest.reth_version.as_str(), PRODUCER | CURRENT_PRODUCER),
-            "unsupported snapshot producer {}; expected {PRODUCER} or {CURRENT_PRODUCER}",
-            manifest.reth_version
-        );
+        manifest.total_blocks_convention()?;
         // Every persisted Sieve block number must fit PostgreSQL BIGINT.
         ensure!(
             manifest.block < i64::MAX as u64,
@@ -92,12 +101,9 @@ impl Manifest {
                 .clone(),
         )?;
         let total = self.block + 1;
-        // This producer writes the snapshot height into total_blocks, while
-        // the original supported manifest uses an inclusive block count.
-        let declared_total = if self.reth_version == CURRENT_PRODUCER {
-            self.block
-        } else {
-            total
+        let declared_total = match self.total_blocks_convention()? {
+            TotalBlocks::InclusiveCount => total,
+            TotalBlocks::Height => self.block,
         };
         ensure!(
             component.blocks_per_file > 0 && component.total_blocks == declared_total,
@@ -116,6 +122,21 @@ impl Manifest {
             "{name}: incomplete chunk metadata"
         );
         Ok(component)
+    }
+
+    fn total_blocks_convention(&self) -> Result<TotalBlocks> {
+        PRODUCERS
+            .iter()
+            .find(|(producer, _)| *producer == self.reth_version)
+            .map(|(_, convention)| *convention)
+            .ok_or_else(|| {
+                let expected: Vec<&str> = PRODUCERS.iter().map(|(producer, _)| *producer).collect();
+                eyre!(
+                    "unsupported snapshot producer {}; expected one of: {}",
+                    self.reth_version,
+                    expected.join(", ")
+                )
+            })
     }
 
     pub fn archive(

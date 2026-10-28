@@ -2,7 +2,11 @@
 
 #![expect(clippy::panic_in_result_fn, reason = "test assertions")]
 
-use super::{manifest::COMPONENTS, plan::build, PlanArgs};
+use super::{
+    manifest::{COMPONENTS, PRODUCERS},
+    plan::build,
+    PlanArgs,
+};
 use alloy_primitives::B256;
 use clap::Parser;
 use eyre::Result;
@@ -35,7 +39,7 @@ fn fixture() -> Value {
     components.insert("state".into(), json!({"unrelated_format": true}));
     json!({
         "block": 24, "chain_id": 8453, "storage_version": 2,
-        "reth_version": super::manifest::PRODUCER,
+        "reth_version": "2.5.2-dev (76a8261)",
         "base_url": "https://snapshots.example.test",
         "components": components,
     })
@@ -154,13 +158,11 @@ fn rejects_wrong_digest_before_parsing_and_invalid_ranges() -> Result<()> {
 }
 
 #[test]
-fn rejects_incompatible_identity_producer_and_layout() -> Result<()> {
+fn rejects_incompatible_identity_and_layout() -> Result<()> {
     let cases = [
         ("/chain_id", json!(1)),
         ("/storage_version", json!(1)),
-        ("/reth_version", json!("2.5.3")),
         ("/block", json!(u64::MAX)),
-        ("/components/receipts/total_blocks", json!(24)),
         ("/components/transactions/blocks_per_file", json!(9)),
         ("/components/headers/blocks_per_file", json!(0)),
         ("/components/receipts/chunk_sizes", json!([50])),
@@ -278,18 +280,76 @@ fn cli_requires_range_and_pin_and_accepts_no_config() -> Result<()> {
 }
 
 #[test]
-fn current_producer_declares_height_but_retains_inclusive_coverage() -> Result<()> {
-    let mut value = fixture();
-    value["reth_version"] = super::manifest::CURRENT_PRODUCER.into();
-    for name in COMPONENTS {
-        value["components"][name]["total_blocks"] = 24.into();
+fn producers_accept_only_their_total_blocks_convention() -> Result<()> {
+    // Declared total_blocks relative to the snapshot height.
+    let cases = [
+        ("2.5.2-dev (76a8261)", 1),
+        ("2.5.2-dev (5877708)", 0),
+        ("2.5.2-dev (7134be3)", 0),
+    ];
+    assert_eq!(PRODUCERS.map(|(producer, _)| producer), cases.map(|c| c.0));
+    // Genesis-only, a one-block chunk after a boundary, and a partial tail.
+    for height in [0, 10, 24] {
+        let chunks = usize::try_from(height / 10 + 1)?;
+        let mut base = fixture();
+        base["block"] = height.into();
+        for name in COMPONENTS {
+            for field in [
+                "chunk_files",
+                "chunk_sizes",
+                "chunk_decompressed_sizes",
+                "chunk_output_files",
+            ] {
+                base["components"][name][field]
+                    .as_array_mut()
+                    .ok_or_else(|| eyre::eyre!("fixture {name}.{field}"))?
+                    .truncate(chunks);
+            }
+        }
+        for (producer, offset) in cases {
+            let declared = height + offset;
+            let mut value = base.clone();
+            value["reth_version"] = producer.into();
+            for name in COMPONENTS {
+                value["components"][name]["total_blocks"] = declared.into();
+            }
+            let (raw, args) = inputs(&value, 0, height)?;
+            let plan = build(&raw, &args)?;
+            assert_eq!(plan.groups.len(), chunks, "{producer} at {height}");
+            assert_eq!(
+                plan.groups[chunks - 1].available_range,
+                [height / 10 * 10, height]
+            );
+            assert_eq!(plan.handoff.candidate_p2p_start, height + 1);
+            // The other convention is one of these off-by-one totals.
+            for wrong in [declared.checked_sub(1), Some(declared + 1)]
+                .into_iter()
+                .flatten()
+            {
+                for name in COMPONENTS {
+                    let mut value = value.clone();
+                    value["components"][name]["total_blocks"] = wrong.into();
+                    let (raw, args) = inputs(&value, 0, height)?;
+                    assert!(
+                        build(&raw, &args).is_err(),
+                        "{producer} accepted {name} total {wrong} at {height}"
+                    );
+                }
+            }
+        }
     }
-    let (raw, args) = inputs(&value, 13, 24)?;
-    let plan = build(&raw, &args)?;
-    assert_eq!(plan.groups[1].available_range, [20, 24]);
-    assert_eq!(plan.requested_range, [13, 24]);
-    value["components"]["receipts"]["total_blocks"] = 23.into();
-    let (raw, args) = inputs(&value, 13, 24)?;
-    assert!(build(&raw, &args).is_err());
+    for producer in ["2.5.2-dev (deadbee)", "2.5.3"] {
+        let mut value = fixture();
+        value["reth_version"] = producer.into();
+        let (raw, args) = inputs(&value, 13, 24)?;
+        let Err(error) = build(&raw, &args) else {
+            eyre::bail!("accepted {producer}");
+        };
+        let message = error.to_string();
+        assert!(message.contains(&format!("unsupported snapshot producer {producer};")));
+        for (allowed, _) in PRODUCERS {
+            assert!(message.contains(allowed), "{message}");
+        }
+    }
     Ok(())
 }
