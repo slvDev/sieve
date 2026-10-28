@@ -227,8 +227,8 @@ handoff = false
 Obtain the manifest digest and endpoint hash independently. Run `archive-plan`
 on your exact range before choosing budgets; the example values cover only small
 early groups. The reader accepts Base V2 aligned static files from producers
-`2.5.2-dev (76a8261)` and `2.5.2-dev (5877708)`. Checksums and header links do not
-prove OP derivation or L1 finality.
+`2.5.2-dev (76a8261)`, `2.5.2-dev (5877708)` and `2.5.2-dev (7134be3)`.
+Checksums and header links do not prove OP derivation or L1 finality.
 
 ```bash
 sieve --config sieve.toml --start-block 499000 --end-block 500999
