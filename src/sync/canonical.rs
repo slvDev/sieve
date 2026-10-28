@@ -728,6 +728,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_same_second_headers() -> eyre::Result<()> {
+        // Base Denim seals five 200ms blocks per whole-second header timestamp.
+        let mut headers = Vec::new();
+        let mut parent = hash(0x01);
+        for number in 100..105 {
+            let header = Header {
+                number,
+                parent_hash: parent,
+                timestamp: 1_793_901_601,
+                ..Default::default()
+            };
+            parent = SealedHeader::seal_slow(header.clone()).hash();
+            headers.push(header);
+        }
+        let frontier = headers[0].parent_hash;
+
+        let sealed = validate_canonical_chain(100, 104, headers, parent, Some(frontier), true)?;
+        assert_eq!(sealed.len(), 5);
+        Ok(())
+    }
+
+    #[test]
     fn validate_rejects_forged_empty_bloom_chain() {
         // A forger serves a fully self-consistent chain (empty blooms —
         // every block would bloom-skip) — but its tip cannot match the
