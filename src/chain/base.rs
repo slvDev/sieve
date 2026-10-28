@@ -200,8 +200,7 @@ mod tests {
         );
     }
 
-    /// Expected vectors from the EIP-2124 CRC chain over Base genesis and
-    /// every scheduled fork timestamp, computed independently of reth.
+    /// Expected hashes are the EIP-2124 CRC chain, computed independently of reth.
     #[test]
     fn fork_id_at_head_timestamps() {
         let beryl = ForkId {
@@ -227,9 +226,7 @@ mod tests {
         assert_eq!(spec.latest_fork_id(), DENIM_FORK_ID);
     }
 
-    /// Reth builds the handshake fork filter from the genesis head when no
-    /// head is configured, as in `connect_peers`; it must accept peers that
-    /// already passed Cobalt or Denim.
+    /// Unconfigured head means reth builds the filter at genesis, as in `connect_peers`.
     #[test]
     fn genesis_head_fork_filter_accepts_cobalt_and_denim_peers() {
         let config = NetworkConfigBuilder::<<BaseChain as ChainTypes>::Net>::new(rng_secret_key())
