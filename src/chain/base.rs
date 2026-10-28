@@ -4,11 +4,13 @@
 //! client (base-reth-node). Three things differ from the pinned reth's
 //! built-in `BASE_MAINNET`:
 //!
-//! 1. **Hardforks**: two post-Jovian forks are live — Azul (2026-05-28,
-//!    which also activates Ethereum Osaka) and Beryl (2026-06-25). Without
-//!    them the EIP-2124 fork-id would be stale and current peers would
-//!    reject the handshake. The expected head fork-id is `0xea0159eb/0`
-//!    (verified by a unit test below).
+//! 1. **Hardforks**: four post-Jovian forks are scheduled: Azul
+//!    (2026-05-28, which also activates Ethereum Osaka), Beryl (2026-06-25),
+//!    Cobalt (2026-09-30) and Denim (2026-11-05, 200ms blocks with
+//!    same-second header timestamps). Without them the EIP-2124 fork-id
+//!    would be stale and current peers would reject the handshake. The
+//!    expected head fork-id after Denim is `0x169d85a3/0` (verified by a
+//!    unit test below).
 //! 2. **Discovery**: Base EL nodes run discv5 with a custom packet
 //!    protocol id `basev0` (default is `discv5`), hard-partitioning their
 //!    DHT — a stock discv5 node cannot even decode Base discovery packets.
@@ -16,9 +18,7 @@
 //! 3. **Types**: every Base block carries a type-0x7E deposit transaction,
 //!    so bodies/receipts use the OP envelope types.
 //!
-//! Known future risk (documented, not handled): the unscheduled "Cobalt"
-//! fork will add tx type 0x79 and can be activated via L1 signalling
-//! without a client release, which would shift the fork-id.
+//! Not handled: the unscheduled Everest fork's EIP-8130 tx type 0x79.
 
 use super::{op_stack, ChainTypes};
 use alloy_primitives::B256;
@@ -39,6 +39,12 @@ const AZUL_TIMESTAMP: u64 = 1_779_991_200;
 
 /// Beryl activation timestamp on Base mainnet (2026-06-25 18:00:00 UTC).
 const BERYL_TIMESTAMP: u64 = 1_782_410_400;
+
+/// Cobalt activation timestamp on Base mainnet (2026-09-30 18:00:00 UTC).
+const COBALT_TIMESTAMP: u64 = 1_790_791_200;
+
+/// Denim activation timestamp on Base mainnet (2026-11-05 18:00:00 UTC).
+const DENIM_TIMESTAMP: u64 = 1_793_901_600;
 
 /// discv5 packet protocol id used by Base EL nodes since Azul.
 const BASE_V0_PROTOCOL_ID: [u8; 6] = *b"basev0";
@@ -65,6 +71,10 @@ enum BaseHardfork {
     Azul,
     /// 2026-06-25: B20 native token precompiles.
     Beryl,
+    /// 2026-09-30: L1-signalled dynamic upgrades.
+    Cobalt,
+    /// 2026-11-05: 200ms blocks.
+    Denim,
 }
 
 impl Hardfork for BaseHardfork {
@@ -72,6 +82,8 @@ impl Hardfork for BaseHardfork {
         match self {
             Self::Azul => "Azul",
             Self::Beryl => "Beryl",
+            Self::Cobalt => "Cobalt",
+            Self::Denim => "Denim",
         }
     }
 }
@@ -90,6 +102,14 @@ static BASE_MAINNET_CURRENT: LazyLock<Arc<OpChainSpec>> = LazyLock::new(|| {
     spec.inner.hardforks.insert(
         BaseHardfork::Beryl,
         ForkCondition::Timestamp(BERYL_TIMESTAMP),
+    );
+    spec.inner.hardforks.insert(
+        BaseHardfork::Cobalt,
+        ForkCondition::Timestamp(COBALT_TIMESTAMP),
+    );
+    spec.inner.hardforks.insert(
+        BaseHardfork::Denim,
+        ForkCondition::Timestamp(DENIM_TIMESTAMP),
     );
     Arc::new(spec)
 });
@@ -159,7 +179,18 @@ impl ChainTypes for BaseChain {
 mod tests {
     use super::*;
     use alloy_primitives::b256;
-    use reth_chainspec::EthChainSpec;
+    use reth_chainspec::{EthChainSpec, ForkHash, ForkId, Hardforks, Head};
+    use reth_network::config::rng_secret_key;
+    use reth_storage_api::noop::NoopProvider;
+
+    const COBALT_FORK_ID: ForkId = ForkId {
+        hash: ForkHash([0x68, 0x64, 0x7e, 0x86]),
+        next: 1_793_901_600,
+    };
+    const DENIM_FORK_ID: ForkId = ForkId {
+        hash: ForkHash([0x16, 0x9d, 0x85, 0xa3]),
+        next: 0,
+    };
 
     #[test]
     fn genesis_hash_matches_base_mainnet() {
@@ -169,13 +200,46 @@ mod tests {
         );
     }
 
+    /// Expected vectors from the EIP-2124 CRC chain over Base genesis and
+    /// every scheduled fork timestamp, computed independently of reth.
     #[test]
-    fn latest_fork_id_matches_beryl() {
-        // Expected head fork-id after Beryl, verified against
-        // base-reth-node's own fork-id test vectors + EIP-2124 CRC chain.
-        let fork_id = BaseChain::chain_spec().latest_fork_id();
-        assert_eq!(fork_id.hash.0, [0xea, 0x01, 0x59, 0xeb]);
-        assert_eq!(fork_id.next, 0);
+    fn fork_id_at_head_timestamps() {
+        let beryl = ForkId {
+            hash: ForkHash([0xea, 0x01, 0x59, 0xeb]),
+            next: 1_790_791_200,
+        };
+        let cases = [
+            (BERYL_TIMESTAMP, beryl),
+            (COBALT_TIMESTAMP - 1, beryl),
+            (COBALT_TIMESTAMP, COBALT_FORK_ID),
+            (DENIM_TIMESTAMP - 1, COBALT_FORK_ID),
+            (DENIM_TIMESTAMP, DENIM_FORK_ID),
+        ];
+        let spec = BaseChain::chain_spec();
+        for (timestamp, expected) in cases {
+            let head = Head {
+                number: 52_000_927,
+                timestamp,
+                ..Default::default()
+            };
+            assert_eq!(spec.fork_id(&head), expected, "timestamp {timestamp}");
+        }
+        assert_eq!(spec.latest_fork_id(), DENIM_FORK_ID);
+    }
+
+    /// Reth builds the handshake fork filter from the genesis head when no
+    /// head is configured, as in `connect_peers`; it must accept peers that
+    /// already passed Cobalt or Denim.
+    #[test]
+    fn genesis_head_fork_filter_accepts_cobalt_and_denim_peers() {
+        let config = NetworkConfigBuilder::<<BaseChain as ChainTypes>::Net>::new(rng_secret_key())
+            .build(NoopProvider::<OpChainSpec, OpPrimitives>::new(
+                BaseChain::chain_spec(),
+            ));
+        for peer in [COBALT_FORK_ID, DENIM_FORK_ID] {
+            let result = config.fork_filter.validate(peer);
+            assert!(result.is_ok(), "{peer:?}: {result:?}");
+        }
     }
 
     #[test]
@@ -297,22 +361,17 @@ mod tests {
     }
 
     #[test]
-    fn azul_and_beryl_are_scheduled() {
-        let spec = BaseChain::chain_spec();
-        assert!(spec
-            .inner
-            .hardforks
-            .fork(BaseHardfork::Azul)
-            .active_at_timestamp(AZUL_TIMESTAMP));
-        assert!(spec
-            .inner
-            .hardforks
-            .fork(BaseHardfork::Beryl)
-            .active_at_timestamp(BERYL_TIMESTAMP));
-        assert!(!spec
-            .inner
-            .hardforks
-            .fork(BaseHardfork::Beryl)
-            .active_at_timestamp(BERYL_TIMESTAMP - 1));
+    fn post_jovian_forks_are_scheduled() {
+        let hardforks = &BaseChain::chain_spec().inner.hardforks;
+        for (fork, activation) in [
+            (BaseHardfork::Azul, 1_779_991_200),
+            (BaseHardfork::Beryl, 1_782_410_400),
+            (BaseHardfork::Cobalt, 1_790_791_200),
+            (BaseHardfork::Denim, 1_793_901_600),
+        ] {
+            let condition = hardforks.fork(fork);
+            assert!(!condition.active_at_timestamp(activation - 1), "{fork:?}");
+            assert!(condition.active_at_timestamp(activation), "{fork:?}");
+        }
     }
 }
