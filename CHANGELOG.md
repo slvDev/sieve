@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.6] - 2026-10-29
+
+### Fixed
+
+- GraphQL equality, inequality and IN filters on numeric columns (`bigint`,
+  `numeric`, `integer`) failed with `operator does not exist: bigint = text`.
+- Ordering and cursor paging on numeric columns sorted values as text and
+  could skip rows.
+
 ## [0.3.5] - 2026-10-28
 
 ### Changed
