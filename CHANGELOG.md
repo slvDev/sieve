@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.4] - 2026-10-28
+
+### Added
+
+- Optional `signature` on `[[contracts.events]]` selects an overloaded ABI
+  event by its canonical signature, e.g.
+  `signature = "Deposit(address,uint256,uint128)"`.
+- `sieve inspect` shows each event's signature and topic0.
+- `sieve add-contract` emits one entry per event overload, each with its
+  `signature` and a numbered table.
+
+### Changed
+
+- An overloaded event name without `signature` now fails at config load and
+  lists the candidate signatures. It used to silently take the first overload.
+- Events route by topic0, so overloads in one contract write to separate
+  tables, including within the same block.
+- When one event feeds several tables, each table gets its own stream
+  notification and count.
+
+Configs without `signature` keep the same schema, rows, and archive
+fingerprint; no reset is needed.
+
 ## [0.3.3] - 2026-10-28
 
 ### Fixed
