@@ -4,7 +4,9 @@
 //! extracting `PgRow` values into JSON maps, and mapping PG types to
 //! GraphQL `TypeRef` values.
 
-use crate::toml_config::{ContextField, ResolvedCall, ResolvedEvent, ResolvedTransfer};
+use crate::toml_config::{
+    is_json_pg_type, ContextField, ResolvedCall, ResolvedEvent, ResolvedTransfer,
+};
 use async_graphql::dynamic::TypeRef;
 use serde_json::Value as JsonValue;
 use sqlx::postgres::PgRow;
@@ -217,6 +219,7 @@ const fn context_field_base_type(cf: ContextField) -> &'static str {
 /// - `bytea` columns: `'0x' || encode(col, 'hex') AS col`
 /// - `numeric` columns: `col::text AS col`
 /// - `bigint`/`bigserial` columns: `col::text AS col`
+/// - `json`/`jsonb` columns: `col::text AS col`
 /// - others: `col` as-is
 #[must_use]
 pub fn build_select_clause(columns: &[ColumnMeta]) -> String {
@@ -227,6 +230,7 @@ pub fn build_select_clause(columns: &[ColumnMeta]) -> String {
             match col.pg_type.as_str() {
                 "bytea" => format!("'0x' || encode(\"{name}\", 'hex') AS \"{name}\""),
                 "numeric" | "bigint" | "bigserial" => format!("\"{name}\"::text AS \"{name}\""),
+                t if is_json_pg_type(t) => format!("\"{name}\"::text AS \"{name}\""),
                 _ => format!("\"{name}\""),
             }
         })
@@ -240,7 +244,7 @@ pub fn build_select_clause(columns: &[ColumnMeta]) -> String {
 ///
 /// After `build_select_clause` casts, the actual Rust types are:
 /// - `bytea` → `String` (already hex-encoded in SELECT)
-/// - `numeric`/`bigint`/`bigserial` → `String` (cast to text in SELECT)
+/// - `numeric`/`bigint`/`bigserial`/`json`/`jsonb` → `String` (cast to text in SELECT)
 /// - `text` → `String`
 /// - `boolean` → `bool`
 /// - `integer` → `i32`
@@ -289,7 +293,7 @@ fn extract_column(
                 Ok(JsonValue::Number(v.into()))
             }
         }
-        // Everything else was cast to text in SELECT (bigint, numeric, bytea, text, bigserial)
+        // Everything else was cast to text in SELECT (bigint, numeric, bytea, json, jsonb, bigserial)
         _ => {
             if nullable {
                 let v: Option<String> = row.try_get(name)?;
@@ -494,6 +498,26 @@ mod tests {
             "\"id\"::text AS \"id\", \"block_number\"::text AS \"block_number\", \
              '0x' || encode(\"tx_hash\", 'hex') AS \"tx_hash\", \
              \"name\", \"amount\"::text AS \"amount\", \"active\", \"idx\""
+        );
+    }
+
+    #[test]
+    fn select_clause_reads_json_columns_as_text() {
+        let meta: Vec<ColumnMeta> = ["jsonb", "json"]
+            .into_iter()
+            .map(|pg_type| ColumnMeta {
+                name: format!("{pg_type}_col"),
+                pg_type: pg_type.to_string(),
+                nullable: false,
+            })
+            .collect();
+        assert_eq!(
+            build_select_clause(&meta),
+            "\"jsonb_col\"::text AS \"jsonb_col\", \"json_col\"::text AS \"json_col\""
+        );
+        assert_eq!(
+            pg_to_graphql_type("jsonb", false).to_string(),
+            pg_to_graphql_type("text", false).to_string()
         );
     }
 

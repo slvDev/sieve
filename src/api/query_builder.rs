@@ -6,6 +6,7 @@
 //! `ResolvedEvent` metadata and are safe to interpolate.
 
 use crate::api::types::ColumnMeta;
+use crate::toml_config::is_json_pg_type;
 
 use base64::Engine;
 use std::fmt::Write as _;
@@ -151,11 +152,21 @@ pub fn build_select(
     (sql, params)
 }
 
+/// SQL for a column as GraphQL sees it: JSON columns compare and sort by their text.
+fn column_sql(column: &str, pg_type: &str) -> String {
+    if is_json_pg_type(pg_type) {
+        format!("\"{column}\"::text")
+    } else {
+        format!("\"{column}\"")
+    }
+}
+
 /// Build a single WHERE condition string for a filter.
 fn build_condition(column: &str, pg_type: &str, op: FilterOp, param_idx: &mut usize) -> String {
     let idx = *param_idx;
     *param_idx += 1;
 
+    let col = column_sql(column, pg_type);
     // For bytea columns, decode hex input
     let is_bytea = pg_type == "bytea";
     // For numeric comparisons, cast both sides
@@ -164,49 +175,49 @@ fn build_condition(column: &str, pg_type: &str, op: FilterOp, param_idx: &mut us
     match op {
         FilterOp::Eq => {
             if is_bytea {
-                format!("\"{column}\" = decode(${idx}, 'hex')")
+                format!("{col} = decode(${idx}, 'hex')")
             } else {
-                format!("\"{column}\" = ${idx}")
+                format!("{col} = ${idx}")
             }
         }
         FilterOp::Ne => {
             if is_bytea {
-                format!("\"{column}\" != decode(${idx}, 'hex')")
+                format!("{col} != decode(${idx}, 'hex')")
             } else {
-                format!("\"{column}\" != ${idx}")
+                format!("{col} != ${idx}")
             }
         }
         FilterOp::Gt => {
             if is_numeric {
-                format!("\"{column}\" > ${idx}::{pg_type}")
+                format!("{col} > ${idx}::{pg_type}")
             } else {
-                format!("\"{column}\" > ${idx}")
+                format!("{col} > ${idx}")
             }
         }
         FilterOp::Gte => {
             if is_numeric {
-                format!("\"{column}\" >= ${idx}::{pg_type}")
+                format!("{col} >= ${idx}::{pg_type}")
             } else {
-                format!("\"{column}\" >= ${idx}")
+                format!("{col} >= ${idx}")
             }
         }
         FilterOp::Lt => {
             if is_numeric {
-                format!("\"{column}\" < ${idx}::{pg_type}")
+                format!("{col} < ${idx}::{pg_type}")
             } else {
-                format!("\"{column}\" < ${idx}")
+                format!("{col} < ${idx}")
             }
         }
         FilterOp::Lte => {
             if is_numeric {
-                format!("\"{column}\" <= ${idx}::{pg_type}")
+                format!("{col} <= ${idx}::{pg_type}")
             } else {
-                format!("\"{column}\" <= ${idx}")
+                format!("{col} <= ${idx}")
             }
         }
-        FilterOp::Contains | FilterOp::StartsWith => format!("\"{column}\" LIKE ${idx}"),
+        FilterOp::Contains | FilterOp::StartsWith => format!("{col} LIKE ${idx}"),
         // In/NotIn are handled by build_single_filter_sql, not build_condition
-        FilterOp::In | FilterOp::NotIn => format!("\"{column}\" = ${idx}"),
+        FilterOp::In | FilterOp::NotIn => format!("{col} = ${idx}"),
     }
 }
 
@@ -386,7 +397,11 @@ pub fn build_condition_in(
         })
         .collect();
 
-    format!("\"{column}\" {op} ({})", placeholders.join(", "))
+    format!(
+        "{} {op} ({})",
+        column_sql(column, pg_type),
+        placeholders.join(", ")
+    )
 }
 
 /// Parse a GraphQL filter value list into a `SqlParam::List`.
@@ -578,7 +593,10 @@ pub fn build_cursor_condition(
         String::new()
     };
 
-    let sql = format!("(\"{order_col}\", id) {cmp} (${val_idx}{cast}, ${id_idx})");
+    let sql = format!(
+        "({}, id) {cmp} (${val_idx}{cast}, ${id_idx})",
+        column_sql(order_col, order_pg_type)
+    );
 
     let params = vec![
         SqlParam::Text(cursor.sort_value.clone()),
@@ -636,8 +654,10 @@ pub fn build_select_with_cursor(p: &SelectParams<'_>) -> (String, Vec<SqlParam>)
 
     let _ = write!(
         sql,
-        " ORDER BY \"{}\" {}, id {}",
-        p.order_by, p.order_dir, p.order_dir
+        " ORDER BY {} {}, id {}",
+        column_sql(p.order_by, p.order_pg_type),
+        p.order_dir,
+        p.order_dir
     );
 
     let clamped_limit = p.limit.clamp(1, MAX_LIMIT);
@@ -877,6 +897,38 @@ mod tests {
         let (sql, _) = build_cursor_condition("id", "bigserial", "ASC", &cursor, &mut idx);
         // bigserial maps to bigint at runtime (bigserial is a DDL pseudo-type)
         assert_eq!(sql, "(\"id\", id) > ($1::bigint, $2)");
+    }
+
+    #[test]
+    fn json_columns_filter_and_sort_as_text() {
+        let mut idx = 1;
+        let eq = build_condition("allocations", "jsonb", FilterOp::Eq, &mut idx);
+        assert_eq!(eq, "\"allocations\"::text = $1");
+        assert_eq!(
+            build_condition_in("allocations", "jsonb", true, 2, idx),
+            "\"allocations\"::text NOT IN ($2, $3)"
+        );
+        let cursor = Cursor {
+            sort_value: "[]".into(),
+            id: 3,
+        };
+        let (sql, _) = build_cursor_condition("allocations", "jsonb", "ASC", &cursor, &mut idx);
+        assert_eq!(sql, "(\"allocations\"::text, id) > ($2, $3)");
+        let (sql, _) = build_select_with_cursor(&SelectParams {
+            table: "t",
+            select_clause: "*",
+            where_clause: None,
+            order_by: "allocations",
+            order_pg_type: "jsonb",
+            order_dir: "ASC",
+            limit: 1,
+            offset: 0,
+            cursor: None,
+        });
+        assert_eq!(
+            sql,
+            "SELECT * FROM t ORDER BY \"allocations\"::text ASC, id ASC LIMIT $1 OFFSET $2"
+        );
     }
 
     #[test]

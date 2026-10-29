@@ -518,6 +518,12 @@ fn default_pg_type(solidity_type: &str) -> &'static str {
     }
 }
 
+/// Whether a column's Postgres type stores JSON.
+#[must_use]
+pub fn is_json_pg_type(pg_type: &str) -> bool {
+    matches!(pg_type, "json" | "jsonb")
+}
+
 // ── Identifier validation ─────────────────────────────────────────────
 
 /// PostgreSQL reserved words that cannot be used as unquoted identifiers.
