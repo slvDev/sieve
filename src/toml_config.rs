@@ -112,8 +112,7 @@ pub struct TomlFactory {
 pub struct TomlEvent {
     /// Event name as it appears in the ABI (e.g. "Transfer").
     pub name: String,
-    /// Canonical signature (e.g. "Deposit(address,uint256)") selecting one
-    /// overload of `name`. Required only when the ABI overloads the name.
+    /// Canonical signature (e.g. "Deposit(address,uint256)"); required when `name` is overloaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     /// Postgres table name for this event's data.
@@ -1492,13 +1491,11 @@ fn resolve_contract(
     Ok(contract_config)
 }
 
-/// Resolve a single TOML event definition into its selected ABI event and
-/// `ResolvedEvent`.
+/// Resolve a TOML event into its selected ABI event and `ResolvedEvent`.
 ///
 /// # Errors
 ///
-/// Returns an error if the table name is invalid/duplicate, the event cannot
-/// be selected from the ABI, or column resolution fails.
+/// Returns an error on an invalid/duplicate table, an unselectable event, or bad columns.
 fn resolve_event<'a>(
     toml_event: &TomlEvent,
     contract_name: &str,

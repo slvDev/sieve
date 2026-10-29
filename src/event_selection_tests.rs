@@ -422,8 +422,7 @@ fn amount(value: u64) -> alloy_primitives::Bytes {
     alloy_primitives::Bytes::copy_from_slice(&topic(value).0)
 }
 
-/// One log per overload, in fixture order: CL logs index all three params
-/// (user, tokenId 7, liquidity 1000); classic logs carry `amount` in data.
+/// One log per overload in fixture order; CL logs index all params, classic logs carry `amount` in data.
 pub fn gauge_logs(gauge: Address) -> Vec<alloy_primitives::Log> {
     let cl = |signature| {
         crate::test_utils::make_log(

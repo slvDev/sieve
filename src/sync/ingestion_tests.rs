@@ -60,8 +60,7 @@ pub fn fixture() -> eyre::Result<Vec<BlockPayload<BaseChain>>> {
     Ok(chain(blocks))
 }
 
-/// Linked, commitment-valid Base blocks from 100 on; each non-empty block
-/// has one transaction whose receipt carries that block's logs.
+/// Linked, commitment-valid Base blocks from 100; non-empty blocks hold one tx carrying the logs.
 fn chain(blocks: Vec<Vec<alloy_primitives::Log>>) -> Vec<BlockPayload<BaseChain>> {
     let mut parent = B256::repeat_byte(3);
     let mut result = Vec::with_capacity(blocks.len());
@@ -752,8 +751,7 @@ pub async fn configured_context(
     Ok(ctx)
 }
 
-/// Every delivered `(table, event label, Some(count))` block summary entry
-/// and `(table, event label, None)` event payload.
+/// `(table, event, Some(count))` per block summary entry, `(table, event, None)` per payload.
 type Delivery = (String, String, Option<u64>);
 
 struct Capture(mpsc::UnboundedSender<Delivery>);
@@ -986,8 +984,7 @@ async fn factory_children_route_overloads_and_fan_out() -> eyre::Result<()> {
     );
     drop(ctx);
 
-    // Block 101 fans one classic Deposit out to two tables, each counted
-    // and streamed once.
+    // Block 101 fans one classic Deposit out to two tables, each counted and streamed once.
     let mut deliveries = messages(rx).await?;
     deliveries.sort();
     let mut expected = [

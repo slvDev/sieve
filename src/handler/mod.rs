@@ -154,21 +154,16 @@ pub struct EventContext {
     pub tx_status: bool,
 }
 
-/// Trait for user-defined event handlers.
-///
-/// Each handler declares which contract/event selector it handles via
-/// [`matches`](EventHandler::matches), then processes matching events in
-/// [`handle`](EventHandler::handle).
+/// Event handler, selected by [`matches`](EventHandler::matches) on contract and topic0.
 #[async_trait]
 pub trait EventHandler: Send + Sync {
     /// Human-readable name for logging.
     fn name(&self) -> &str;
 
-    /// Table this handler writes to (stream notifications and counts).
+    /// Table this handler writes to.
     fn table_name(&self) -> &str;
 
-    /// Return `true` if this handler should process events with the given
-    /// selector (topic0) from the given contract.
+    /// Whether this handler takes events with `topic0` from `contract_name`.
     fn matches(&self, contract_name: &str, topic0: B256) -> bool;
 
     /// Process a decoded event, writing to the database within the provided

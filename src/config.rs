@@ -59,19 +59,11 @@ impl ContractConfig {
     }
 }
 
-/// Select the ABI event a config entry refers to.
-///
-/// With `signature`, it must equal a candidate's canonical `Event::signature()`
-/// exactly. Without it, the name must have exactly one layout. Identical
-/// duplicate ABI entries count as one; distinct layouts sharing a canonical
-/// signature (e.g. different `indexed` flags) are rejected because topic0
-/// cannot tell them apart.
+/// Select a config entry's ABI event: exact canonical `signature` match, else the name's only layout.
 ///
 /// # Errors
 ///
-/// Returns an error if the name is missing, the signature matches no
-/// candidate, the name is overloaded and no signature was given, or the
-/// selected signature has conflicting layouts.
+/// Returns an error listing candidates if the event is missing, ambiguous, or has conflicting layouts.
 pub fn select_event<'a>(
     abi: &'a JsonAbi,
     contract_name: &str,
