@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.5] - 2026-10-28
+
+### Changed
+
+- Arrays and tuples are stored and streamed as JSON instead of Rust debug
+  text. Tuples become objects keyed by their component names.
+- New array and tuple columns default to `jsonb`.
+- GraphQL returns these columns as JSON strings.
+
+### Fixed
+
+- Unnamed ABI parameters get positional names `param_<i>` in columns, stream
+  keys, filters, and `factory.param`. `param = ""` keeps working when only one
+  input is unnamed.
+
+Existing text columns are not altered: old rows keep the debug text and new
+rows get JSON text. For uniform JSONB, reindex into a fresh database.
+
 ## [0.3.4] - 2026-10-28
 
 ### Added
