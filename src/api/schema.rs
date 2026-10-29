@@ -611,6 +611,7 @@ mod tests {
                     pg_type: "text".to_string(),
                     source: crate::config::ParamSource::Indexed(0),
                     components: vec![],
+                    structured: false,
                 },
                 ResolvedColumn {
                     column_name: "value".to_string(),
@@ -618,6 +619,7 @@ mod tests {
                     pg_type: "numeric".to_string(),
                     source: crate::config::ParamSource::Body(0),
                     components: vec![],
+                    structured: false,
                 },
             ],
             insert_sql: String::new(),

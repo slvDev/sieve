@@ -1040,7 +1040,8 @@ impl crate::stream::StreamSink for Payloads {
 
 /// Every user column of each event and call table, as JSON, sorted like `structured_rows`.
 ///
-/// JSON columns come back as stored; other columns as JSON strings (booleans as booleans).
+/// JSON columns come back as stored, array/tuple text columns parsed from their JSON text, and
+/// other columns as JSON strings (booleans as booleans).
 async fn stored_rows(
     db: &crate::db::Database,
     resolved: &crate::toml_config::ResolvedConfig,
@@ -1075,17 +1076,19 @@ async fn stored_rows(
             let serde_json::Value::Array(values) = values else {
                 return Err(eyre::eyre!("{table}: expected a JSON array row"));
             };
-            let mut row: Vec<(String, serde_json::Value)> = columns
-                .iter()
-                .map(|c| c.column_name.clone())
-                .zip(values)
-                .collect();
-            // The explicit `type = "text"` column holds serialized JSON text.
-            if table == "gauges_allocated_text" {
-                let serde_json::Value::String(text) = &row[1].1 else {
-                    return Err(eyre::eyre!("allocations text column is not text"));
+            let mut row = Vec::with_capacity(columns.len());
+            for (column, value) in columns.iter().zip(values) {
+                // A non-JSON column of an array or tuple type holds serialized JSON text.
+                let value = match value {
+                    serde_json::Value::String(text)
+                        if column.structured
+                            && !crate::toml_config::is_json_pg_type(&column.pg_type) =>
+                    {
+                        serde_json::from_str(&text)?
+                    }
+                    value => value,
                 };
-                row[1].1 = serde_json::from_str(text)?;
+                row.push((column.column_name.clone(), value));
             }
             rows.push((table.clone(), log, row));
         }
@@ -1149,7 +1152,7 @@ async fn structured_values_store_and_stream_as_json() -> eyre::Result<()> {
                 .await?;
         }
         let outcome = ingest(&ctx, payloads.clone(), &headers).await?;
-        assert_eq!((outcome.events_stored, outcome.calls_stored), (9, 1));
+        assert_eq!((outcome.events_stored, outcome.calls_stored), (11, 1));
         assert_eq!(stored_rows(&ctx.db, &resolved).await?, expected);
     }
     let scalar = |sql: &'static str| sqlx::query_scalar::<_, String>(sql).fetch_one(ctx.db.pool());
@@ -1167,6 +1170,19 @@ async fn structured_values_store_and_stream_as_json() -> eyre::Result<()> {
     assert_eq!(
         scalar("SELECT pg_typeof(allocations)::text FROM gauges_allocated_text LIMIT 1").await?,
         "text"
+    );
+    // Indexed array/tuple values are topic hashes: a JSON string in jsonb and in text overrides.
+    let values_hash = format!("0x{}", "c1".repeat(32));
+    assert_eq!(
+        scalar(
+            "SELECT jsonb_typeof(\"values\") || ' ' || (\"values\" #>> '{}') FROM indexed_complex"
+        )
+        .await?,
+        format!("string {values_hash}")
+    );
+    assert_eq!(
+        scalar("SELECT \"values\" || ' ' || pair FROM indexed_complex_text").await?,
+        format!("\"{values_hash}\" \"0x{}\"", "c2".repeat(32))
     );
 
     let schema = crate::api::build_schema(

@@ -1,0 +1,21 @@
+[
+  {
+    "name": "IndexedComplex",
+    "type": "event",
+    "inputs": [
+      {"name": "values", "type": "uint256[]", "indexed": true, "internalType": "uint256[]"},
+      {
+        "name": "pair",
+        "type": "tuple",
+        "indexed": true,
+        "components": [
+          {"name": "gauge", "type": "address", "internalType": "address"},
+          {"name": "allocated", "type": "uint128", "internalType": "uint128"}
+        ],
+        "internalType": "struct Pair"
+      },
+      {"name": "amount", "type": "uint256", "indexed": false, "internalType": "uint256"}
+    ],
+    "anonymous": false
+  }
+]

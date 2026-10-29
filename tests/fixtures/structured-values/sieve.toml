@@ -7,6 +7,8 @@
 # abis/root-voter.json: root GaugesAllocated layout, written from IVoter.sol and IVoterCommon.sol at
 #   https://github.com/dromos-labs/metadex-public/blob/8b506b450aaa9d4a9f1a77e264f2d9dd508e9ddf/V3/src/interfaces/voter/IVoter.sol
 #   Its contract address below is a placeholder.
+# abis/indexed-complex.json: synthetic event with an indexed array and an indexed tuple, which
+#   logs carry only as topic hashes. Its contract address below is a placeholder.
 chain = "base"
 
 [[contracts]]
@@ -72,3 +74,21 @@ start_block = 100
 [[contracts.events]]
 name = "GaugesAllocated"
 table = "root_gauges_allocated"
+
+[[contracts]]
+name = "IndexedComplex"
+address = "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+abi = "abis/indexed-complex.json"
+start_block = 100
+
+[[contracts.events]]
+name = "IndexedComplex"
+table = "indexed_complex"
+
+[[contracts.events]]
+name = "IndexedComplex"
+table = "indexed_complex_text"
+columns = [
+  { param = "values", type = "text" },
+  { param = "pair", type = "text" },
+]

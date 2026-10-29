@@ -364,6 +364,10 @@ pub mod tests {
     const POOL_FACTORY: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
     const LEAF_VOTER: Address = address!("382409fad8503FbCdbB27A4211551fa03e884078");
     const ROOT_VOTER: Address = address!("5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e");
+    const INDEXED_COMPLEX: Address = address!("7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e");
+    /// Topic hashes standing in for the indexed array and tuple values.
+    const VALUES_HASH: B256 = B256::repeat_byte(0xc1);
+    const PAIR_HASH: B256 = B256::repeat_byte(0xc2);
 
     /// `tests/fixtures/structured-values`.
     #[must_use]
@@ -457,6 +461,12 @@ pub mod tests {
                 "GaugesAllocated(uint256,uint256,(address,uint128,bytes)[])",
                 &[word(7), word(8453)],
                 vec![V::Array(vec![])],
+            ),
+            event_log(
+                INDEXED_COMPLEX,
+                "IndexedComplex(uint256[],(address,uint128),uint256)",
+                &[VALUES_HASH, PAIR_HASH],
+                vec![V::Uint(U256::from(3), 256)],
             ),
         ]
     }
@@ -559,6 +569,23 @@ pub mod tests {
                     ("token_id", json!("7")),
                     ("chain_id", json!("8453")),
                     ("gauges", json!([])),
+                ],
+            ),
+            (
+                "indexed_complex",
+                5,
+                vec![
+                    ("values", json!(VALUES_HASH.to_string())),
+                    ("pair", json!(PAIR_HASH.to_string())),
+                    ("amount", json!("3")),
+                ],
+            ),
+            (
+                "indexed_complex_text",
+                5,
+                vec![
+                    ("values", json!(VALUES_HASH.to_string())),
+                    ("pair", json!(PAIR_HASH.to_string())),
                 ],
             ),
             (

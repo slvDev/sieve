@@ -545,8 +545,9 @@ fn bind_columns<'q>(
 
 /// Bind a [`DynSolValue`] to a sqlx query based on the column's Postgres type.
 ///
-/// JSON columns get the value's JSON form; other columns get scalars as before
-/// and arrays/tuples as serialized JSON text.
+/// JSON columns get the value's JSON form. Other columns get serialized JSON
+/// text when the ABI type is an array or tuple (even an indexed one, which
+/// decodes to a topic hash), and scalars otherwise.
 fn bind_dyn_value<'q>(
     query: Query<'q, Postgres, PgArguments>,
     value: &DynSolValue,
@@ -554,6 +555,9 @@ fn bind_dyn_value<'q>(
 ) -> eyre::Result<Query<'q, Postgres, PgArguments>> {
     if is_json_pg_type(&col.pg_type) {
         return Ok(query.bind(sqlx::types::Json(value_to_json(value, &col.components)?)));
+    }
+    if col.structured {
+        return Ok(query.bind(value_to_json(value, &col.components)?.to_string()));
     }
     let pg_type = col.pg_type.as_str();
     match value {
@@ -587,7 +591,10 @@ fn bind_dyn_value<'q>(
         }
         DynSolValue::Function(function) => Ok(query.bind(hex::encode_prefixed(function))),
         DynSolValue::Array(_) | DynSolValue::FixedArray(_) | DynSolValue::Tuple(_) => {
-            Ok(query.bind(value_to_json(value, &col.components)?.to_string()))
+            Err(eyre::eyre!(
+                "column '{}' has a scalar ABI type but decoded to an array or tuple",
+                col.column_name
+            ))
         }
     }
 }
@@ -1242,13 +1249,18 @@ mod tests {
         assert!(extract_uint(&event.body, "nonexistent").is_err());
     }
 
-    fn column(pg_type: &str, source: crate::config::ParamSource) -> ResolvedColumn {
+    fn column(
+        pg_type: &str,
+        source: crate::config::ParamSource,
+        structured: bool,
+    ) -> ResolvedColumn {
         ResolvedColumn {
             column_name: "c".to_string(),
             param_name: "c".to_string(),
             pg_type: pg_type.to_string(),
             source,
             components: vec![],
+            structured,
         }
     }
 
@@ -1264,7 +1276,7 @@ mod tests {
         ] {
             let bound = bind_columns(
                 sqlx::query("SELECT $1"),
-                &[column("text", source)],
+                &[column("text", source, false)],
                 &event.indexed,
                 &event.body,
             );
@@ -1276,21 +1288,47 @@ mod tests {
     fn bind_dyn_value_accepts_every_value_kind() -> eyre::Result<()> {
         let addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let array = DynSolValue::Array(vec![DynSolValue::Uint(U256::from(1u64), 128)]);
-        for (value, pg_type) in [
-            (DynSolValue::Address(addr), "text"),
-            (DynSolValue::Bool(true), "boolean"),
-            (DynSolValue::Uint(U256::from(42u64), 64), "bigint"),
-            (DynSolValue::Uint(U256::from(1_000_000u64), 256), "numeric"),
-            (DynSolValue::Int(I256::try_from(-42i64)?, 64), "bigint"),
-            (DynSolValue::String("hello".to_string()), "text"),
-            (DynSolValue::Bytes(vec![1, 2, 3]), "bytea"),
-            (array.clone(), "jsonb"),
-            (array.clone(), "json"),
-            (array, "text"),
-            (DynSolValue::FixedBytes(B256::repeat_byte(1), 32), "jsonb"),
+        // An indexed array or tuple decodes to its topic hash.
+        let topic_hash = DynSolValue::FixedBytes(B256::repeat_byte(1), 32);
+        for (value, pg_type, structured, ok) in [
+            (DynSolValue::Address(addr), "text", false, true),
+            (DynSolValue::Bool(true), "boolean", false, true),
+            (
+                DynSolValue::Uint(U256::from(42u64), 64),
+                "bigint",
+                false,
+                true,
+            ),
+            (
+                DynSolValue::Uint(U256::from(1_000_000u64), 256),
+                "numeric",
+                false,
+                true,
+            ),
+            (
+                DynSolValue::Int(I256::try_from(-42i64)?, 64),
+                "bigint",
+                false,
+                true,
+            ),
+            (
+                DynSolValue::String("hello".to_string()),
+                "text",
+                false,
+                true,
+            ),
+            (DynSolValue::Bytes(vec![1, 2, 3]), "bytea", false, true),
+            (topic_hash.clone(), "bytea", false, true),
+            (array.clone(), "jsonb", true, true),
+            (array.clone(), "json", true, true),
+            (array.clone(), "text", true, true),
+            (topic_hash.clone(), "jsonb", true, true),
+            (topic_hash, "text", true, true),
+            (array, "text", false, false),
         ] {
-            let col = column(pg_type, crate::config::ParamSource::Body(0));
-            let _bound = bind_dyn_value(sqlx::query("SELECT $1"), &value, &col)?;
+            let col = column(pg_type, crate::config::ParamSource::Body(0), structured);
+            let bound = bind_dyn_value(sqlx::query("SELECT $1"), &value, &col);
+            assert_eq!(bound.is_ok(), ok, "{value:?} {pg_type} {structured}");
         }
         Ok(())
     }

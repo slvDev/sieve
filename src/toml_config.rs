@@ -314,6 +314,8 @@ pub struct ResolvedColumn {
     pub source: ParamSource,
     /// Tuple components of the input's type; they name JSON object keys.
     pub components: Vec<Param>,
+    /// Whether the ABI type is an array or tuple; such values bind as JSON in any column type.
+    pub structured: bool,
 }
 
 /// Resolved output from TOML config resolution.
@@ -489,12 +491,18 @@ pub struct ResolvedEvent {
 
 // ── Type mapping ──────────────────────────────────────────────────────
 
+/// Whether a Solidity type is an array or tuple.
+#[must_use]
+fn is_structured_abi_type(solidity_type: &str) -> bool {
+    solidity_type.ends_with(']') || solidity_type.starts_with("tuple")
+}
+
 /// Map a Solidity type to a Postgres type.
 #[must_use]
 fn default_pg_type(solidity_type: &str) -> &'static str {
     match solidity_type {
         // Arrays and tuples are JSON; checked first so `bytes32[2]` is not bytea.
-        s if s.ends_with(']') || s.starts_with("tuple") => "jsonb",
+        s if is_structured_abi_type(s) => "jsonb",
 
         "bool" => "boolean",
 
@@ -1949,6 +1957,7 @@ fn resolved_column(
         param_name,
         source: input.source,
         components: input.components.to_vec(),
+        structured: is_structured_abi_type(input.ty),
     }
 }
 
@@ -2225,6 +2234,10 @@ table = "usdc_approvals"
             "string[]",
         ] {
             assert_eq!(default_pg_type(ty), "jsonb", "{ty}");
+            assert!(is_structured_abi_type(ty), "{ty}");
+        }
+        for ty in ["bytes", "bytes32", "uint256", "address", "string", "bool"] {
+            assert!(!is_structured_abi_type(ty), "{ty}");
         }
     }
 
@@ -2245,6 +2258,7 @@ table = "usdc_approvals"
                 pg_type: "text".to_string(),
                 source: ParamSource::Indexed(0),
                 components: vec![],
+                structured: false,
             },
             ResolvedColumn {
                 column_name: "value".to_string(),
@@ -2252,6 +2266,7 @@ table = "usdc_approvals"
                 pg_type: "numeric".to_string(),
                 source: ParamSource::Body(0),
                 components: vec![],
+                structured: false,
             },
         ];
 
@@ -2274,6 +2289,7 @@ table = "usdc_approvals"
             pg_type: "numeric".to_string(),
             source: ParamSource::Body(0),
             components: vec![],
+            structured: false,
         }];
 
         let sql = generate_create_table_sql("t", &ctx, &columns, false);
@@ -2301,6 +2317,7 @@ table = "usdc_approvals"
                 pg_type: "text".to_string(),
                 source: ParamSource::Indexed(0),
                 components: vec![],
+                structured: false,
             },
             ResolvedColumn {
                 column_name: "to_address".to_string(),
@@ -2308,6 +2325,7 @@ table = "usdc_approvals"
                 pg_type: "text".to_string(),
                 source: ParamSource::Indexed(1),
                 components: vec![],
+                structured: false,
             },
         ];
 
@@ -2329,6 +2347,7 @@ table = "usdc_approvals"
             pg_type: "numeric".to_string(),
             source: ParamSource::Body(0),
             components: vec![],
+            structured: false,
         }];
 
         let sql = generate_insert_sql("t", &ctx, &columns, false);
@@ -3224,6 +3243,7 @@ table = "uniswap_swaps"
             pg_type: "numeric".to_string(),
             source: ParamSource::Body(0),
             components: vec![],
+            structured: false,
         }];
 
         let sql = generate_create_table_sql("pool_swaps", &[], &columns, true);
@@ -3240,6 +3260,7 @@ table = "uniswap_swaps"
             pg_type: "numeric".to_string(),
             source: ParamSource::Body(0),
             components: vec![],
+            structured: false,
         }];
 
         let sql = generate_insert_sql("pool_swaps", &[], &columns, true);
@@ -3590,6 +3611,7 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
                 pg_type: "text".to_string(),
                 source: ParamSource::Body(0),
                 components: vec![],
+                structured: false,
             }],
             false,
         );
@@ -3621,6 +3643,7 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
                 pg_type: "text".to_string(),
                 source: ParamSource::Body(0),
                 components: vec![],
+                structured: false,
             }],
             false,
         );
