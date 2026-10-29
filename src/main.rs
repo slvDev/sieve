@@ -1069,16 +1069,7 @@ async fn cmd_add_contract(
     let abi: alloy_json_abi::JsonAbi = serde_json::from_str(&info.abi_json)
         .map_err(|e| eyre::eyre!("failed to parse ABI JSON: {e}"))?;
 
-    let mut seen = HashSet::new();
-    let events: Vec<(String, String)> = abi
-        .events()
-        .filter(|ev| seen.insert(ev.name.clone()))
-        .map(|ev| {
-            let event_snake = toml_config::camel_to_snake_case(&ev.name);
-            let table = format!("{snake_name}_{event_snake}");
-            (ev.name.clone(), table)
-        })
-        .collect();
+    let events = config_events(&abi, &snake_name);
 
     let toml_block = generate_contract_toml(
         &contract_name,
@@ -1127,6 +1118,34 @@ fn save_abi_file(abi_json: &str, path: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Config entries `(name, signature, table)` for every ABI event. Names with
+/// several canonical signatures get one entry per signature, in ABI order,
+/// with a 1-based table suffix; unique names get no `signature`.
+fn config_events(
+    abi: &alloy_json_abi::JsonAbi,
+    snake_name: &str,
+) -> Vec<(String, Option<String>, String)> {
+    let mut entries = Vec::with_capacity(abi.events.len());
+    for (name, variants) in &abi.events {
+        let table = format!("{snake_name}_{}", toml_config::camel_to_snake_case(name));
+        let mut signatures: Vec<String> = Vec::with_capacity(variants.len());
+        for variant in variants {
+            let signature = variant.signature();
+            if !signatures.contains(&signature) {
+                signatures.push(signature);
+            }
+        }
+        if signatures.len() == 1 {
+            entries.push((name.clone(), None, table));
+        } else {
+            for (n, signature) in signatures.into_iter().enumerate() {
+                entries.push((name.clone(), Some(signature), format!("{table}_{}", n + 1)));
+            }
+        }
+    }
+    entries
+}
+
 /// Generate a TOML `[[contracts]]` block with event definitions.
 #[must_use]
 fn generate_contract_toml(
@@ -1134,7 +1153,7 @@ fn generate_contract_toml(
     address: &str,
     abi_path: &str,
     start_block: Option<u64>,
-    events: &[(String, String)],
+    events: &[(String, Option<String>, String)],
 ) -> String {
     use std::fmt::Write;
 
@@ -1152,10 +1171,13 @@ fn generate_contract_toml(
         }
     }
 
-    for (event_name, table_name) in events {
+    for (event_name, signature, table_name) in events {
         out.push('\n');
         out.push_str("[[contracts.events]]\n");
         let _ = writeln!(out, "name = \"{event_name}\"");
+        if let Some(signature) = signature {
+            let _ = writeln!(out, "signature = \"{signature}\"");
+        }
         let _ = writeln!(out, "table = \"{table_name}\"");
     }
 
@@ -1919,26 +1941,50 @@ mod tests {
         }
     }
 
+    const GENERATED_HEADER: &str = "\n[[contracts]]\nname = \"USDC\"\naddress = \"0xA0b8\"\nabi = \"abis/usdc.json\"\n# start_block = 0\n";
+
     #[test]
-    fn generate_contract_toml_basic() {
-        let events = vec![
-            ("Transfer".to_owned(), "usdc_transfer".to_owned()),
-            ("Approval".to_owned(), "usdc_approval".to_owned()),
-        ];
-        let toml = generate_contract_toml("USDC", "0xA0b8", "abis/usdc.json", None, &events);
-        assert!(toml.contains("name = \"USDC\""));
-        assert!(toml.contains("address = \"0xA0b8\""));
-        assert!(toml.contains("abi = \"abis/usdc.json\""));
-        assert!(toml.contains("# start_block = 0"));
-        assert!(toml.contains("name = \"Transfer\""));
-        assert!(toml.contains("table = \"usdc_transfer\""));
-        assert!(toml.contains("name = \"Approval\""));
-        assert!(toml.contains("table = \"usdc_approval\""));
+    fn generate_contract_toml_emits_every_overload() -> eyre::Result<()> {
+        let erc20 = r#"[
+            {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]},
+            {"type":"event","name":"Approval","anonymous":false,"inputs":[{"name":"owner","type":"address","indexed":true},{"name":"spender","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]},
+            {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}
+        ]"#;
+        let gauge = include_str!("../tests/fixtures/event-overloads/abis/gauge.json");
+        for (abi, events) in [
+            (
+                erc20,
+                "\n[[contracts.events]]\nname = \"Approval\"\ntable = \"usdc_approval\"\n\
+                 \n[[contracts.events]]\nname = \"Transfer\"\ntable = \"usdc_transfer\"\n",
+            ),
+            (
+                gauge,
+                "\n[[contracts.events]]\nname = \"Deposit\"\n\
+                 signature = \"Deposit(address,uint256,uint128)\"\ntable = \"usdc_deposit_1\"\n\
+                 \n[[contracts.events]]\nname = \"Deposit\"\n\
+                 signature = \"Deposit(address,address,uint256)\"\ntable = \"usdc_deposit_2\"\n\
+                 \n[[contracts.events]]\nname = \"Withdraw\"\n\
+                 signature = \"Withdraw(address,uint256,uint128)\"\ntable = \"usdc_withdraw_1\"\n\
+                 \n[[contracts.events]]\nname = \"Withdraw\"\n\
+                 signature = \"Withdraw(address,uint256)\"\ntable = \"usdc_withdraw_2\"\n",
+            ),
+        ] {
+            let abi: alloy_json_abi::JsonAbi = serde_json::from_str(abi)?;
+            let toml = generate_contract_toml(
+                "USDC",
+                "0xA0b8",
+                "abis/usdc.json",
+                None,
+                &config_events(&abi, "usdc"),
+            );
+            assert_eq!(toml, format!("{GENERATED_HEADER}{events}"));
+        }
+        Ok(())
     }
 
     #[test]
     fn generate_contract_toml_with_start_block() {
-        let events = vec![("Transfer".to_owned(), "usdc_transfer".to_owned())];
+        let events = vec![("Transfer".to_owned(), None, "usdc_transfer".to_owned())];
         let toml = generate_contract_toml(
             "USDC",
             "0xA0b8",
