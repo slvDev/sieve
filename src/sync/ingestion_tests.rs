@@ -12,10 +12,7 @@ use alloy_consensus::{proofs, BlockBody, Receipt, Signed, TxLegacy};
 use alloy_primitives::{Address, Bytes, Signature, B256, U256};
 use reth_chainspec::EthChainSpec;
 use reth_primitives_traits::{Header, SealedHeader};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::{mpsc, watch};
 
 const ABI: &str = r#"[{"type":"event","name":"Ping","anonymous":false,"inputs":[{"name":"value","type":"uint256","indexed":false}]},{"type":"event","name":"Created","anonymous":false,"inputs":[{"name":"child","type":"address","indexed":true}]}]"#;
@@ -38,8 +35,7 @@ fn factory() -> eyre::Result<crate::toml_config::ResolvedFactory> {
 pub fn fixture() -> eyre::Result<Vec<BlockPayload<BaseChain>>> {
     let abi: alloy_json_abi::JsonAbi = serde_json::from_str(ABI)?;
     let f = factory()?;
-    let mut parent = B256::repeat_byte(3);
-    let mut result = Vec::new();
+    let mut blocks = Vec::new();
     for number in 100..=104 {
         let mut logs = Vec::new();
         if number == 100 {
@@ -59,6 +55,17 @@ pub fn fixture() -> eyre::Result<Vec<BlockPayload<BaseChain>>> {
                 Bytes::copy_from_slice(&U256::from(number).to_be_bytes::<32>()),
             ));
         }
+        blocks.push(logs);
+    }
+    Ok(chain(blocks))
+}
+
+/// Linked, commitment-valid Base blocks from 100 on; each non-empty block
+/// has one transaction whose receipt carries that block's logs.
+fn chain(blocks: Vec<Vec<alloy_primitives::Log>>) -> Vec<BlockPayload<BaseChain>> {
+    let mut parent = B256::repeat_byte(3);
+    let mut result = Vec::with_capacity(blocks.len());
+    for (number, logs) in (100..).zip(blocks) {
         let (transactions, receipts) = if logs.is_empty() {
             (vec![], vec![])
         } else {
@@ -95,7 +102,7 @@ pub fn fixture() -> eyre::Result<Vec<BlockPayload<BaseChain>>> {
         parent = SealedHeader::seal_slow(header.clone()).hash();
         result.push(BlockPayload::new(header, body, receipts));
     }
-    Ok(result)
+    result
 }
 
 fn evidence(headers: &[Header]) -> eyre::Result<ArchiveEvidence> {
@@ -127,8 +134,11 @@ impl EventHandler for Recorder {
     fn name(&self) -> &'static str {
         "phase2"
     }
-    fn matches(&self, contract: &str, event: &str) -> bool {
-        contract == "Child" && event == "Ping"
+    fn table_name(&self) -> &'static str {
+        "phase2_events"
+    }
+    fn matches(&self, contract: &str, topic0: B256) -> bool {
+        contract == "Child" && topic0 == alloy_primitives::keccak256("Ping(uint256)")
     }
     async fn handle(
         &self,
@@ -181,6 +191,8 @@ impl crate::stream::StreamSink for Sink {
     }
 }
 
+const RESET_SYNC_STATE: &str = "TRUNCATE _sieve_archive_groups, _sieve_archive_job, _sieve_archive_frontier, _sieve_canonical, _sieve_block_hashes, _sieve_factory_children, _sieve_factories; UPDATE _sieve_checkpoints SET block_number = 0;";
+
 pub async fn context(
     fail: bool,
 ) -> eyre::Result<(
@@ -195,7 +207,7 @@ pub async fn context(
     );
     let db = Arc::new(crate::db::Database::connect(&url).await?);
     crate::db::create_internal_tables(&db).await?;
-    sqlx::raw_sql("TRUNCATE _sieve_archive_groups, _sieve_archive_job, _sieve_archive_frontier, _sieve_canonical, _sieve_block_hashes, _sieve_factory_children, _sieve_factories; UPDATE _sieve_checkpoints SET block_number = 0; CREATE TABLE IF NOT EXISTS phase2_events (block_number BIGINT, block_hash BYTEA, value TEXT); TRUNCATE phase2_events;").execute(db.pool()).await?;
+    sqlx::raw_sql(&format!("{RESET_SYNC_STATE} CREATE TABLE IF NOT EXISTS phase2_events (block_number BIGINT, block_hash BYTEA, value TEXT); TRUNCATE phase2_events;")).execute(db.pool()).await?;
     crate::db::ensure_chain_identity(&db, "base", BaseChain::chain_spec().genesis_hash()).await?;
     let config = Arc::new(crate::config::IndexConfig::new(vec![
         crate::config::ContractConfig::new("Child", Address::ZERO, ABI, &["Ping"])?,
@@ -237,10 +249,6 @@ pub async fn context(
             metrics: Arc::new(crate::metrics::SieveMetrics::new()),
             stop_rx,
             stream_dispatcher: Some(Arc::new(streams)),
-            event_table_map: Arc::new(HashMap::from([(
-                "Child:Ping".into(),
-                ("phase2_events".into(), "Ping".into()),
-            )])),
             is_backfill: false,
             receipt_tables: Arc::new(HashSet::new()),
             bloom_filter: None,
@@ -253,7 +261,7 @@ pub async fn context(
     ))
 }
 
-async fn messages(mut rx: mpsc::UnboundedReceiver<(u64, u64)>) -> eyre::Result<Vec<(u64, u64)>> {
+async fn messages<T>(mut rx: mpsc::UnboundedReceiver<T>) -> eyre::Result<Vec<T>> {
     Ok(
         tokio::time::timeout(std::time::Duration::from_secs(3), async move {
             let mut result = Vec::new();
@@ -622,7 +630,6 @@ fn sync_context(ctx: &IngestionContext) -> super::SyncContext<BaseChain> {
         transfer_handlers: Arc::clone(&ctx.transfer_handlers),
         call_handlers: Arc::clone(&ctx.call_handlers),
         stream_dispatcher: ctx.stream_dispatcher.clone(),
-        event_table_map: Arc::clone(&ctx.event_table_map),
         is_backfill: ctx.is_backfill,
         receipt_tables: Arc::clone(&ctx.receipt_tables),
         bloom_filter: ctx.bloom_filter.clone(),
@@ -675,5 +682,332 @@ async fn authenticated_bloom_skips_commit_all_hashes() -> eyre::Result<()> {
     drop(ctx);
     assert!(messages(rx).await?.is_empty());
     assert!(messages(live_rx).await?.is_empty());
+    Ok(())
+}
+
+/// Context indexing `config` (resolved against `dir`) into freshly created tables.
+pub async fn configured_context(
+    dir: &std::path::Path,
+    first_block: u64,
+    config: &crate::toml_config::SieveConfig,
+) -> eyre::Result<IngestionContext> {
+    use crate::handler::{
+        CallHandler, CallRegistry, ConfigDrivenHandler, HandlerRegistry, TransferHandler,
+        TransferRegistry,
+    };
+    let (mut ctx, _, _) = context(false).await?;
+    let resolved = crate::toml_config::resolve_config(config, dir)?;
+    for (table, ddl) in resolved
+        .resolved_events
+        .iter()
+        .map(|e| (&e.table_name, &e.create_table_sql))
+        .chain(
+            resolved
+                .calls
+                .iter()
+                .map(|e| (&e.table_name, &e.create_table_sql)),
+        )
+        .chain(
+            resolved
+                .transfers
+                .iter()
+                .map(|e| (&e.table_name, &e.create_table_sql)),
+        )
+    {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(ctx.db.pool())
+            .await?;
+        sqlx::query(ddl).execute(ctx.db.pool()).await?;
+    }
+    sqlx::query("TRUNCATE _sieve_factories")
+        .execute(ctx.db.pool())
+        .await?;
+    crate::db::ensure_factory_coverage(&ctx.db, &resolved.factories, first_block, false).await?;
+    ctx.receipt_tables = Arc::new(crate::build_receipt_tables(
+        &resolved.resolved_events,
+        &resolved.transfers,
+        &resolved.calls,
+    ));
+    ctx.handlers = Arc::new(HandlerRegistry::new(
+        resolved
+            .resolved_events
+            .into_iter()
+            .map(|e| Box::new(ConfigDrivenHandler::new(e)) as Box<dyn EventHandler>)
+            .collect(),
+    ));
+    ctx.call_handlers = Arc::new(CallRegistry::new(
+        resolved.calls.into_iter().map(CallHandler::new).collect(),
+    ));
+    ctx.transfer_handlers = Arc::new(TransferRegistry::new(
+        resolved
+            .transfers
+            .into_iter()
+            .map(TransferHandler::new)
+            .collect(),
+    ));
+    ctx.config = Arc::new(resolved.index_config);
+    ctx.factories = Arc::new(resolved.factories);
+    ctx.stream_dispatcher = None;
+    ctx.is_backfill = true;
+    Ok(ctx)
+}
+
+/// Every delivered `(table, event label, Some(count))` block summary entry
+/// and `(table, event label, None)` event payload.
+type Delivery = (String, String, Option<u64>);
+
+struct Capture(mpsc::UnboundedSender<Delivery>);
+#[async_trait::async_trait]
+impl crate::stream::StreamSink for Capture {
+    fn name(&self) -> &'static str {
+        "capture"
+    }
+    async fn notify(&self, n: &crate::stream::BlockNotification) {
+        for t in &n.tables {
+            let _ = self
+                .0
+                .send((t.name.clone(), t.event.clone(), Some(t.count)));
+        }
+    }
+    async fn notify_events(&self, events: &[crate::stream::EventPayload]) {
+        for e in events {
+            let _ = self.0.send((e.table.clone(), e.event.clone(), None));
+        }
+    }
+}
+
+/// Overload-fixture context whose stream deliveries are captured.
+async fn overload_context(
+    file: &str,
+) -> eyre::Result<(IngestionContext, mpsc::UnboundedReceiver<Delivery>)> {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/event-overloads");
+    let config = crate::toml_config::load_config(&dir.join(file))?;
+    let mut ctx = configured_context(&dir, 100, &config).await?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    ctx.stream_dispatcher = Some(Arc::new(crate::stream::StreamDispatcher::new(
+        vec![(Box::new(Capture(tx)), true)],
+        32,
+    )));
+    Ok((ctx, rx))
+}
+
+/// Ingest `payloads` (any order) through a peer-authenticated segment.
+async fn ingest(
+    ctx: &IngestionContext,
+    payloads: Vec<BlockPayload<BaseChain>>,
+    headers: &[Header],
+) -> eyre::Result<super::engine::SyncOutcome> {
+    let segment = AuthenticatedSegment::<BaseChain>::peer(Arc::new(
+        super::canonical::fixture_chain(headers.to_vec())?,
+    ));
+    let pipeline = IngestionPipeline::start(ctx.clone(), segment).await?;
+    let tx = pipeline.sender();
+    for payload in payloads {
+        tx.send(FetchItem::Payload(Box::new(
+            ValidatedPayload::new(payload).map_err(|e| eyre::eyre!(e))?,
+        )))
+        .await
+        .map_err(|_| eyre::eyre!("pipeline closed"))?;
+    }
+    drop(tx);
+    pipeline.finish().await
+}
+
+/// `(table, block_number, log_index, columns joined as text)` rows per table.
+async fn table_rows(
+    db: &crate::db::Database,
+    tables: &[(&str, &str)],
+) -> eyre::Result<Vec<(String, i64, i32, String)>> {
+    let mut rows = Vec::new();
+    for (table, columns) in tables {
+        let sql = format!(
+            "SELECT '{table}', block_number, log_index, concat_ws(',', {columns}) \
+             FROM {table} ORDER BY block_number, log_index"
+        );
+        rows.extend(sqlx::query_as(&sql).fetch_all(db.pool()).await?);
+    }
+    Ok(rows)
+}
+
+/// Sorted deliveries: one summary entry (count 1) and one payload per `(table, event)`.
+fn deliveries_once_per_table(targets: &[(&str, &str)]) -> Vec<Delivery> {
+    let mut deliveries: Vec<Delivery> = targets
+        .iter()
+        .flat_map(|&(table, event)| {
+            [None, Some(1)].map(|count| (table.to_owned(), event.to_owned(), count))
+        })
+        .collect();
+    deliveries.sort();
+    deliveries
+}
+
+const CL_COLUMNS: &str = r#""user", token_id::text, liquidity_to_stake::text"#;
+const CLASSIC_DEPOSIT_COLUMNS: &str = r#""from", "to", amount::text"#;
+const CLASSIC_WITHDRAW_COLUMNS: &str = r#""from", amount::text"#;
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+async fn overloaded_events_store_one_row_per_selector() -> eyre::Result<()> {
+    use crate::toml_config::event_selection_tests::{gauge_logs, FROM, TO, USER};
+    let (ctx, rx) = overload_context("sieve.toml").await?;
+    let payloads = chain(vec![gauge_logs(ctx.config.contracts[0].address)]);
+    let headers: Vec<_> = payloads.iter().map(|p| p.header().clone()).collect();
+    let tables = [
+        ("gauge_cl_deposit", CL_COLUMNS),
+        ("gauge_classic_deposit", CLASSIC_DEPOSIT_COLUMNS),
+        ("gauge_cl_withdraw", CL_COLUMNS),
+        ("gauge_classic_withdraw", CLASSIC_WITHDRAW_COLUMNS),
+    ];
+    let (user, from, to) = (
+        USER.to_checksum(None),
+        FROM.to_checksum(None),
+        TO.to_checksum(None),
+    );
+    let expected = [
+        ("gauge_cl_deposit", 0, format!("{user},7,1000")),
+        ("gauge_classic_deposit", 1, format!("{from},{to},500")),
+        ("gauge_cl_withdraw", 2, format!("{user},7,1000")),
+        ("gauge_classic_withdraw", 3, format!("{from},250")),
+    ]
+    .map(|(table, log, columns)| (table.to_owned(), 100, log, columns));
+    // Replaying the block over reset sync state stores nothing twice.
+    for run in 0..2 {
+        if run == 1 {
+            sqlx::raw_sql(RESET_SYNC_STATE)
+                .execute(ctx.db.pool())
+                .await?;
+        }
+        assert_eq!(
+            ingest(&ctx, payloads.clone(), &headers)
+                .await?
+                .events_stored,
+            4
+        );
+        assert_eq!(table_rows(&ctx.db, &tables).await?, expected);
+    }
+    super::follow::rollback_to_ancestor(
+        &ctx.db,
+        &ctx.handlers,
+        &ctx.transfer_handlers,
+        &ctx.call_handlers,
+        &ctx.config,
+        99,
+    )
+    .await?;
+    assert!(table_rows(&ctx.db, &tables).await?.is_empty());
+    drop(ctx);
+    let mut deliveries = messages(rx).await?;
+    deliveries.sort();
+    let once = deliveries_once_per_table(&[
+        ("gauge_cl_deposit", "Deposit"),
+        ("gauge_classic_deposit", "Deposit"),
+        ("gauge_cl_withdraw", "Withdraw"),
+        ("gauge_classic_withdraw", "Withdraw"),
+    ]);
+    let twice: Vec<_> = once.iter().flat_map(|d| [d.clone(), d.clone()]).collect();
+    assert_eq!(deliveries, twice);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+async fn factory_children_route_overloads_and_fan_out() -> eyre::Result<()> {
+    use crate::toml_config::event_selection_tests::{gauge_logs, FROM, TO, USER};
+    let (ctx, rx) = overload_context("factory.toml").await?;
+    let voter = ctx.factories[0].factory_address;
+    let created = |gauge: Address| {
+        crate::test_utils::make_log(
+            voter,
+            vec![
+                ctx.factories[0].creation_selector,
+                B256::left_padding_from(gauge.as_slice()),
+            ],
+            Bytes::new(),
+        )
+    };
+    let (cl, classic) = (Address::repeat_byte(0x41), Address::repeat_byte(0x42));
+    let [cl_deposit, _, cl_withdraw, _] =
+        <[_; 4]>::try_from(gauge_logs(cl)).map_err(|_| eyre::eyre!("four gauge logs"))?;
+    let [_, classic_deposit, _, classic_withdraw] =
+        <[_; 4]>::try_from(gauge_logs(classic)).map_err(|_| eyre::eyre!("four gauge logs"))?;
+    let mut payloads = chain(vec![
+        vec![created(cl), cl_deposit.clone(), cl_withdraw],
+        vec![created(classic), classic_deposit.clone(), classic_withdraw],
+        vec![cl_deposit, classic_deposit],
+    ]);
+    let headers: Vec<_> = payloads.iter().map(|p| p.header().clone()).collect();
+    // Later child events arrive before both creation blocks.
+    payloads.rotate_right(1);
+    assert_eq!(ingest(&ctx, payloads, &headers).await?.events_stored, 8);
+
+    let (cl, classic) = (cl.to_checksum(None), classic.to_checksum(None));
+    let (user, from, to) = (
+        USER.to_checksum(None),
+        FROM.to_checksum(None),
+        TO.to_checksum(None),
+    );
+    let cl_row = format!("{cl},{user},7,1000");
+    let deposit_row = format!("{classic},{from},{to},500");
+    let classic_deposit = format!("contract_address, {CLASSIC_DEPOSIT_COLUMNS}");
+    let expected = [
+        ("gauge_cl_deposit", 100, 1, &cl_row),
+        ("gauge_cl_deposit", 102, 0, &cl_row),
+        ("gauge_classic_deposit", 101, 1, &deposit_row),
+        ("gauge_classic_deposit", 102, 1, &deposit_row),
+        ("gauge_classic_deposit_copy", 101, 1, &deposit_row),
+        ("gauge_classic_deposit_copy", 102, 1, &deposit_row),
+        ("gauge_cl_withdraw", 100, 2, &cl_row),
+        (
+            "gauge_classic_withdraw",
+            101,
+            2,
+            &format!("{classic},{from},250"),
+        ),
+    ]
+    .map(|(table, block, log, columns)| (table.to_owned(), block, log, columns.clone()));
+    let cl_columns = format!("contract_address, {CL_COLUMNS}");
+    let tables = [
+        ("gauge_cl_deposit", cl_columns.as_str()),
+        ("gauge_classic_deposit", classic_deposit.as_str()),
+        ("gauge_classic_deposit_copy", classic_deposit.as_str()),
+        ("gauge_cl_withdraw", cl_columns.as_str()),
+        (
+            "gauge_classic_withdraw",
+            &format!("contract_address, {CLASSIC_WITHDRAW_COLUMNS}"),
+        ),
+    ];
+    assert_eq!(table_rows(&ctx.db, &tables).await?, expected);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sieve_factory_children")
+            .fetch_one(ctx.db.pool())
+            .await?,
+        2
+    );
+    drop(ctx);
+
+    // Block 101 fans one classic Deposit out to two tables, each counted
+    // and streamed once.
+    let mut deliveries = messages(rx).await?;
+    deliveries.sort();
+    let mut expected = [
+        deliveries_once_per_table(&[
+            ("gauge_cl_deposit", "Deposit"),
+            ("gauge_cl_withdraw", "Withdraw"),
+        ]),
+        deliveries_once_per_table(&[
+            ("gauge_classic_deposit", "Deposit"),
+            ("gauge_classic_deposit_copy", "Deposit"),
+            ("gauge_classic_withdraw", "Withdraw"),
+        ]),
+        deliveries_once_per_table(&[
+            ("gauge_cl_deposit", "Deposit"),
+            ("gauge_classic_deposit", "Deposit"),
+            ("gauge_classic_deposit_copy", "Deposit"),
+        ]),
+    ]
+    .concat();
+    expected.sort();
+    assert_eq!(deliveries, expected);
     Ok(())
 }

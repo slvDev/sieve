@@ -14,7 +14,7 @@ use crate::stream::StreamDispatcher;
 use crate::toml_config::ResolvedFactory;
 use alloy_consensus::BlockBody;
 use reth_primitives_traits::Header;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -88,8 +88,6 @@ pub struct SyncContext<C: ChainTypes> {
     pub call_handlers: Arc<CallRegistry>,
     /// Optional stream notification dispatcher.
     pub stream_dispatcher: Option<Arc<StreamDispatcher>>,
-    /// Maps (contract_name, event_name) → table_name for notification payloads.
-    pub event_table_map: Arc<HashMap<String, (String, String)>>,
     /// Whether this sync run is a historical backfill.
     pub is_backfill: bool,
     /// Table names that have `include_receipts = true` (for streaming enrichment).
@@ -119,7 +117,6 @@ impl<C: ChainTypes> Clone for SyncContext<C> {
             transfer_handlers: Arc::clone(&self.transfer_handlers),
             call_handlers: Arc::clone(&self.call_handlers),
             stream_dispatcher: self.stream_dispatcher.clone(),
-            event_table_map: Arc::clone(&self.event_table_map),
             is_backfill: self.is_backfill,
             receipt_tables: Arc::clone(&self.receipt_tables),
             bloom_filter: self.bloom_filter.clone(),

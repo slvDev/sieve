@@ -430,7 +430,6 @@ async fn build_sync_context<C: chain::ChainTypes>(
     metrics: &Arc<metrics::SieveMetrics>,
     stop_rx: watch::Receiver<bool>,
 ) -> eyre::Result<Option<sync::SyncContext<C>>> {
-    let event_table_map = build_event_table_map(&startup.resolved_events);
     let receipt_tables = Arc::new(build_receipt_tables(
         &startup.resolved_events,
         &startup.resolved_transfers,
@@ -504,7 +503,6 @@ async fn build_sync_context<C: chain::ChainTypes>(
         transfer_handlers,
         call_handlers,
         stream_dispatcher,
-        event_table_map: Arc::new(event_table_map),
         is_backfill: cli.end_block.is_some(),
         receipt_tables,
         bloom_filter,
@@ -521,7 +519,6 @@ async fn build_archive_context(
     metrics: &Arc<metrics::SieveMetrics>,
     stop_rx: watch::Receiver<bool>,
 ) -> eyre::Result<sync::ingestion::IngestionContext> {
-    let event_table_map = Arc::new(build_event_table_map(&startup.resolved_events));
     let receipt_tables = Arc::new(build_receipt_tables(
         &startup.resolved_events,
         &startup.resolved_transfers,
@@ -543,7 +540,6 @@ async fn build_archive_context(
         transfer_handlers,
         call_handlers,
         stream_dispatcher: build_stream_dispatcher(&startup.resolved_streams),
-        event_table_map,
         is_backfill: true,
         receipt_tables,
         bloom_filter,
@@ -1714,19 +1710,6 @@ fn build_bloom_filter(
         "bloom filter enabled — skipping blocks with no matching contracts"
     );
     Some(Arc::new(filter::BloomFilter::new(addresses)))
-}
-
-/// Used by the sync engine to map decoded events to table names for
-/// stream notification payloads.
-fn build_event_table_map(
-    events: &[toml_config::ResolvedEvent],
-) -> HashMap<String, (String, String)> {
-    let mut map = HashMap::with_capacity(events.len());
-    for re in events {
-        let key = format!("{}:{}", re.contract_name, re.event_name);
-        map.insert(key, (re.table_name.clone(), re.event_name.clone()));
-    }
-    map
 }
 
 /// Build the set of table names that have `include_receipts = true`.

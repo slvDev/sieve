@@ -55,7 +55,6 @@ pub struct IngestionContext {
     pub transfer_handlers: Arc<TransferRegistry>,
     pub call_handlers: Arc<CallRegistry>,
     pub stream_dispatcher: Option<Arc<crate::stream::StreamDispatcher>>,
-    pub event_table_map: Arc<HashMap<String, (String, String)>>,
     pub is_backfill: bool,
     pub receipt_tables: Arc<HashSet<String>>,
     pub bloom_filter: Option<Arc<crate::filter::BloomFilter>>,
@@ -83,7 +82,6 @@ impl IngestionContext {
             transfer_handlers: self.transfer_handlers,
             call_handlers: self.call_handlers,
             stream_dispatcher: self.stream_dispatcher,
-            event_table_map: self.event_table_map,
             is_backfill: self.is_backfill,
             receipt_tables: self.receipt_tables,
             bloom_filter: self.bloom_filter,
@@ -105,7 +103,6 @@ impl IngestionContext {
             transfer_handlers: Arc::clone(&ctx.transfer_handlers),
             call_handlers: Arc::clone(&ctx.call_handlers),
             stream_dispatcher: ctx.stream_dispatcher.clone(),
-            event_table_map: Arc::clone(&ctx.event_table_map),
             is_backfill: ctx.is_backfill,
             receipt_tables: Arc::clone(&ctx.receipt_tables),
             bloom_filter: ctx.bloom_filter.clone(),
@@ -604,7 +601,6 @@ async fn consume_payloads<C: ChainTypes>(
         handlers: &ingestion.handlers,
         transfer_handlers: &ingestion.transfer_handlers,
         call_handlers: &ingestion.call_handlers,
-        event_table_map: &ingestion.event_table_map,
         has_streams: ingestion.stream_dispatcher.is_some(),
         receipt_tables: &ingestion.receipt_tables,
         coverage_keys: &coverage_keys,
@@ -708,8 +704,6 @@ struct ProcessContext<'a> {
     handlers: &'a HandlerRegistry,
     transfer_handlers: &'a TransferRegistry,
     call_handlers: &'a CallRegistry,
-    /// Maps `"contract:event"` key → `(table_name, event_name)`.
-    event_table_map: &'a HashMap<String, (String, String)>,
     /// Whether streams are configured (gates event payload collection).
     has_streams: bool,
     /// Table names with `include_receipts = true` (for streaming enrichment).
@@ -1247,27 +1241,29 @@ async fn prepare_block_outcome<'a, C: ChainTypes>(
     let mut event_payloads: Vec<crate::stream::EventPayload> = Vec::new();
     let mut sender_cache: HashMap<TxIndex, Address> = HashMap::new();
 
-    // Events: count matches and accumulate for batch insert
+    // Events: count one row per target table and accumulate for batch insert
     for event in &block.decoded_events {
+        let matched_tables = ctx
+            .handlers
+            .matched_table_names(&event.contract_name, event.topic0);
+        if matched_tables.is_empty() {
+            continue;
+        }
         let event_context =
             build_event_context(&block.payload, block.block_hash, event, &mut sender_cache)?;
-        let dispatched = ctx
-            .handlers
-            .matching_count(&event.contract_name, &event.event_name);
-        if dispatched > 0 {
-            track_event_table(ctx.event_table_map, event, dispatched, &mut table_counts);
+        for table in &matched_tables {
+            track_table(&mut table_counts, table, &event.event_name);
             if ctx.has_streams {
-                collect_event_payload(
-                    ctx.event_table_map,
+                event_payloads.push(build_event_payload(
                     event,
                     &event_context,
-                    ctx.receipt_tables,
-                    &mut event_payloads,
-                );
+                    table,
+                    ctx.receipt_tables.contains(*table),
+                ));
             }
-            all_events.push((event, event_context));
         }
-        stored_count = stored_count.saturating_add(dispatched);
+        stored_count = stored_count.saturating_add(matched_tables.len() as u64);
+        all_events.push((event, event_context));
     }
 
     // Transfers: scan and accumulate for batch insert
@@ -1374,35 +1370,21 @@ fn dispatch_batch_notifications(
     }
 }
 
-/// Track an event's table in the table_counts map.
-fn track_event_table(
-    event_table_map: &HashMap<String, (String, String)>,
-    event: &decode::DecodedEvent,
-    dispatched: u64,
-    table_counts: &mut HashMap<String, (String, u64)>,
-) {
-    let key = format!("{}:{}", event.contract_name, event.event_name);
-    if let Some((table, event_name)) = event_table_map.get(&key) {
-        let entry = table_counts
-            .entry(table.clone())
-            .or_insert_with(|| (event_name.clone(), 0));
-        entry.1 = entry.1.saturating_add(dispatched);
-    }
+/// Count one row for `table` in the block's table summary.
+fn track_table(table_counts: &mut HashMap<String, (String, u64)>, table: &str, label: &str) {
+    let entry = table_counts
+        .entry(table.to_owned())
+        .or_insert_with(|| (label.to_owned(), 0));
+    entry.1 = entry.1.saturating_add(1);
 }
 
-/// Build an [`EventPayload`] from a decoded event and push it to the payloads vec.
-fn collect_event_payload(
-    event_table_map: &HashMap<String, (String, String)>,
+/// Build the [`EventPayload`] for a decoded event stored in `table`.
+fn build_event_payload(
     event: &decode::DecodedEvent,
     context: &EventContext,
-    receipt_tables: &HashSet<String>,
-    payloads: &mut Vec<crate::stream::EventPayload>,
-) {
-    let key = format!("{}:{}", event.contract_name, event.event_name);
-    let Some((table, event_name)) = event_table_map.get(&key) else {
-        return;
-    };
-
+    table: &str,
+    include: bool,
+) -> crate::stream::EventPayload {
     let mut data = serde_json::Map::new();
     for param in event.indexed.iter().chain(event.body.iter()) {
         data.insert(
@@ -1411,10 +1393,9 @@ fn collect_event_payload(
         );
     }
 
-    let include = receipt_tables.contains(table);
-    payloads.push(crate::stream::EventPayload {
-        table: table.clone(),
-        event: event_name.clone(),
+    crate::stream::EventPayload {
+        table: table.to_owned(),
+        event: event.event_name.clone(),
         contract_name: event.contract_name.clone(),
         contract: Address::to_checksum(&event.contract_address, None),
         block_number: event.block_number.as_u64(),
@@ -1430,7 +1411,7 @@ fn collect_event_payload(
         cumulative_gas_used: include.then_some(context.cumulative_gas_used),
         status: include.then_some(context.tx_status),
         data,
-    });
+    }
 }
 
 /// Build an [`EventPayload`] from a native transfer.
@@ -1721,10 +1702,7 @@ fn scan_transfers<C: ChainTypes>(
 
         let dispatched = matched_tables.len() as u64;
         for table_name in &matched_tables {
-            let entry = table_counts
-                .entry((*table_name).to_string())
-                .or_insert_with(|| ("transfer".to_string(), 0));
-            entry.1 = entry.1.saturating_add(1);
+            track_table(table_counts, table_name, "transfer");
             if has_streams {
                 let include = receipt_tables.contains(*table_name);
                 event_payloads.push(build_transfer_payload(
@@ -1886,10 +1864,7 @@ fn track_call_tables(
     receipt_tables: &HashSet<String>,
 ) -> u64 {
     for table_name in matched_tables {
-        let entry = table_counts
-            .entry((*table_name).to_string())
-            .or_insert_with(|| (decoded_call.function_name.clone(), 0));
-        entry.1 = entry.1.saturating_add(1);
+        track_table(table_counts, table_name, &decoded_call.function_name);
         if has_streams {
             let include = receipt_tables.contains(*table_name);
             event_payloads.push(build_call_payload(

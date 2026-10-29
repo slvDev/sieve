@@ -156,17 +156,20 @@ pub struct EventContext {
 
 /// Trait for user-defined event handlers.
 ///
-/// Each handler declares which contract/event combinations it handles
-/// via [`matches`](EventHandler::matches), then processes matching events
-/// in [`handle`](EventHandler::handle).
+/// Each handler declares which contract/event selector it handles via
+/// [`matches`](EventHandler::matches), then processes matching events in
+/// [`handle`](EventHandler::handle).
 #[async_trait]
 pub trait EventHandler: Send + Sync {
     /// Human-readable name for logging.
     fn name(&self) -> &str;
 
-    /// Return `true` if this handler should process events from the given
-    /// contract and event name.
-    fn matches(&self, contract_name: &str, event_name: &str) -> bool;
+    /// Table this handler writes to (stream notifications and counts).
+    fn table_name(&self) -> &str;
+
+    /// Return `true` if this handler should process events with the given
+    /// selector (topic0) from the given contract.
+    fn matches(&self, contract_name: &str, topic0: B256) -> bool;
 
     /// Process a decoded event, writing to the database within the provided
     /// transaction.
@@ -252,13 +255,14 @@ impl HandlerRegistry {
         Ok(())
     }
 
-    /// Count how many handlers match a given event (without executing INSERTs).
+    /// Tables of the handlers matching an event, one entry per handler.
     #[must_use]
-    pub fn matching_count(&self, contract_name: &str, event_name: &str) -> u64 {
+    pub fn matched_table_names(&self, contract_name: &str, topic0: B256) -> Vec<&str> {
         self.handlers
             .iter()
-            .filter(|h| h.matches(contract_name, event_name))
-            .count() as u64
+            .filter(|h| h.matches(contract_name, topic0))
+            .map(|h| h.table_name())
+            .collect()
     }
 
     /// Batch-insert events grouped by handler.
@@ -279,7 +283,7 @@ impl HandlerRegistry {
         let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.handlers.len()];
         for (event_idx, (event, _)) in events.iter().enumerate() {
             for (handler_idx, handler) in self.handlers.iter().enumerate() {
-                if handler.matches(&event.contract_name, &event.event_name) {
+                if handler.matches(&event.contract_name, event.topic0) {
                     groups[handler_idx].push(event_idx);
                 }
             }
@@ -382,8 +386,12 @@ impl EventHandler for ConfigDrivenHandler {
         &self.handler_name
     }
 
-    fn matches(&self, contract_name: &str, event_name: &str) -> bool {
-        self.resolved.contract_name == contract_name && self.resolved.event_name == event_name
+    fn table_name(&self) -> &str {
+        &self.resolved.table_name
+    }
+
+    fn matches(&self, contract_name: &str, topic0: B256) -> bool {
+        self.resolved.contract_name == contract_name && self.resolved.topic0 == topic0
     }
 
     async fn handle(
@@ -980,8 +988,17 @@ impl EventHandler for UsdcTransferHandler {
         "UsdcTransferHandler"
     }
 
-    fn matches(&self, contract_name: &str, event_name: &str) -> bool {
-        contract_name == "USDC" && event_name == "Transfer"
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "trait requires &str, not &'static str"
+    )]
+    fn table_name(&self) -> &str {
+        "usdc_transfers"
+    }
+
+    fn matches(&self, contract_name: &str, topic0: B256) -> bool {
+        contract_name == "USDC"
+            && topic0 == alloy_primitives::keccak256("Transfer(address,address,uint256)")
     }
 
     async fn handle(
@@ -1087,6 +1104,7 @@ mod tests {
 
         DecodedEvent {
             event_name: "Transfer".to_string(),
+            topic0: alloy_primitives::keccak256(TRANSFER),
             contract_name: "USDC".to_string(),
             indexed: vec![
                 DecodedParam {
@@ -1129,13 +1147,84 @@ mod tests {
         }
     }
 
+    const TRANSFER: &str = "Transfer(address,address,uint256)";
+    const APPROVAL: &str = "Approval(address,address,uint256)";
+
+    fn resolved_event(contract: &str, signature: &str, table: &str) -> ResolvedEvent {
+        ResolvedEvent {
+            event_name: signature
+                .split_once('(')
+                .map_or(signature, |(name, _)| name)
+                .to_string(),
+            signature: signature.to_string(),
+            topic0: alloy_primitives::keccak256(signature),
+            contract_name: contract.to_string(),
+            table_name: table.to_string(),
+            context_fields: vec![],
+            columns: vec![],
+            insert_sql: String::new(),
+            create_table_sql: String::new(),
+            create_indexes_sql: vec![],
+            rollback_sql: String::new(),
+            is_factory_child: false,
+            topic_filters: vec![],
+            include_receipts: false,
+        }
+    }
+
     #[test]
-    fn registry_dispatches_to_matching_handler() -> eyre::Result<()> {
-        let handler = UsdcTransferHandler;
-        assert!(handler.matches("USDC", "Transfer"));
-        assert!(!handler.matches("USDC", "Approval"));
-        assert!(!handler.matches("DAI", "Transfer"));
-        Ok(())
+    fn handlers_match_contract_and_topic0() {
+        let config_driven =
+            ConfigDrivenHandler::new(resolved_event("USDC", TRANSFER, "usdc_transfers"));
+        assert_eq!(config_driven.name(), "USDC:Transfer");
+        let handlers: [&dyn EventHandler; 2] = [&UsdcTransferHandler, &config_driven];
+        for handler in handlers {
+            assert_eq!(handler.table_name(), "usdc_transfers");
+            for (contract, signature, expected) in [
+                ("USDC", TRANSFER, true),
+                ("USDC", APPROVAL, false),
+                ("DAI", TRANSFER, false),
+            ] {
+                assert_eq!(
+                    handler.matches(contract, alloy_primitives::keccak256(signature)),
+                    expected,
+                    "{} {contract} {signature}",
+                    handler.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registry_lists_one_table_per_matching_handler() {
+        let registry = HandlerRegistry::new(
+            [
+                ("USDC", TRANSFER, "usdc_transfers"),
+                ("USDC", TRANSFER, "usdc_transfers_copy"),
+                ("USDC", APPROVAL, "usdc_approvals"),
+                ("DAI", TRANSFER, "dai_transfers"),
+            ]
+            .into_iter()
+            .map(|(c, s, t)| -> Box<dyn EventHandler> {
+                Box::new(ConfigDrivenHandler::new(resolved_event(c, s, t)))
+            })
+            .collect(),
+        );
+        for (contract, signature, expected) in [
+            (
+                "USDC",
+                TRANSFER,
+                vec!["usdc_transfers", "usdc_transfers_copy"],
+            ),
+            ("USDC", APPROVAL, vec!["usdc_approvals"]),
+            ("DAI", APPROVAL, vec![]),
+        ] {
+            assert_eq!(
+                registry.matched_table_names(contract, alloy_primitives::keccak256(signature)),
+                expected,
+                "{contract} {signature}"
+            );
+        }
     }
 
     #[test]
@@ -1168,34 +1257,6 @@ mod tests {
         assert!(find_param(&event.indexed, &event.body, "from").is_some());
         assert!(find_param(&event.indexed, &event.body, "value").is_some());
         assert!(find_param(&event.indexed, &event.body, "nonexistent").is_none());
-    }
-
-    #[test]
-    fn config_driven_handler_matches() {
-        use crate::toml_config::ResolvedEvent;
-
-        let resolved = ResolvedEvent {
-            event_name: "Transfer".to_string(),
-            signature: "Transfer(address,address,uint256)".to_string(),
-            topic0: alloy_primitives::keccak256("Transfer(address,address,uint256)"),
-            contract_name: "USDC".to_string(),
-            table_name: "usdc_transfers".to_string(),
-            context_fields: vec![],
-            columns: vec![],
-            insert_sql: String::new(),
-            create_table_sql: String::new(),
-            create_indexes_sql: vec![],
-            rollback_sql: String::new(),
-            is_factory_child: false,
-            topic_filters: vec![],
-            include_receipts: false,
-        };
-
-        let handler = ConfigDrivenHandler::new(resolved);
-        assert!(handler.matches("USDC", "Transfer"));
-        assert!(!handler.matches("USDC", "Approval"));
-        assert!(!handler.matches("DAI", "Transfer"));
-        assert_eq!(handler.name(), "USDC:Transfer");
     }
 
     #[test]

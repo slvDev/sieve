@@ -30,8 +30,10 @@ pub struct DecodedParam {
 /// A fully decoded event with named parameters and block context.
 #[derive(Debug)]
 pub struct DecodedEvent {
-    /// Event name from the ABI (e.g. "Transfer").
+    /// Event name from the ABI (e.g. "Transfer"); a label, not an identity.
     pub event_name: String,
+    /// Selector (topic0) of the ABI event that decoded this log.
+    pub topic0: B256,
     /// Contract name (e.g. "USDC").
     pub contract_name: String,
     /// Decoded indexed parameters (in ABI order).
@@ -54,7 +56,7 @@ pub struct DecodedEvent {
 
 // Compile-time size assertion for hot type (reth pattern).
 #[cfg(target_pointer_width = "64")]
-const _: [(); 176] = [(); core::mem::size_of::<DecodedEvent>()];
+const _: [(); 208] = [(); core::mem::size_of::<DecodedEvent>()];
 
 impl fmt::Display for DecodedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -125,6 +127,7 @@ pub fn decode_log(log: &FilteredLog, contract: &ContractConfig) -> eyre::Result<
 
     Ok(DecodedEvent {
         event_name: event_abi.name.clone(),
+        topic0: *topic0,
         contract_name: contract.name.clone(),
         indexed,
         body,

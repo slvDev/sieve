@@ -405,3 +405,157 @@ fn explicit_signature_changes_archive_fingerprint() -> eyre::Result<()> {
     assert_eq!(ordered_sql(&resolve_config(&config, &dir)?), sql);
     Ok(())
 }
+
+pub const USER: Address = Address::repeat_byte(0xbb);
+pub const FROM: Address = Address::repeat_byte(0xaa);
+pub const TO: Address = Address::repeat_byte(0xcc);
+
+fn topic(value: u64) -> B256 {
+    B256::from(alloy_primitives::U256::from(value))
+}
+
+fn address_topic(address: Address) -> B256 {
+    B256::left_padding_from(address.as_slice())
+}
+
+fn amount(value: u64) -> alloy_primitives::Bytes {
+    alloy_primitives::Bytes::copy_from_slice(&topic(value).0)
+}
+
+/// One log per overload, in fixture order: CL logs index all three params
+/// (user, tokenId 7, liquidity 1000); classic logs carry `amount` in data.
+pub fn gauge_logs(gauge: Address) -> Vec<alloy_primitives::Log> {
+    let cl = |signature| {
+        crate::test_utils::make_log(
+            gauge,
+            vec![
+                alloy_primitives::keccak256(signature),
+                address_topic(USER),
+                topic(7),
+                topic(1000),
+            ],
+            alloy_primitives::Bytes::new(),
+        )
+    };
+    vec![
+        cl(CL_DEPOSIT),
+        crate::test_utils::make_log(
+            gauge,
+            vec![
+                alloy_primitives::keccak256(CLASSIC_DEPOSIT),
+                address_topic(FROM),
+                address_topic(TO),
+            ],
+            amount(500),
+        ),
+        cl(CL_WITHDRAW),
+        crate::test_utils::make_log(
+            gauge,
+            vec![
+                alloy_primitives::keccak256(CLASSIC_WITHDRAW),
+                address_topic(FROM),
+            ],
+            amount(250),
+        ),
+    ]
+}
+
+/// A decoded log's index, target tables, and `(name, value)` params.
+type Routed<'a> = (
+    u32,
+    Vec<&'a str>,
+    Vec<(&'a str, alloy_dyn_abi::DynSolValue)>,
+);
+
+#[test]
+fn gauge_logs_decode_and_route_to_their_tables() -> eyre::Result<()> {
+    use crate::handler::{ConfigDrivenHandler, EventHandler, HandlerRegistry};
+    use alloy_dyn_abi::DynSolValue;
+
+    let dir = fixture_dir("event-overloads");
+    let resolved = resolve_config(&load_merged_config(&dir.join("sieve.toml"))?, &dir)?;
+    let gauge = resolved.index_config.contracts[0].address;
+    let mut logs = gauge_logs(gauge);
+    // Dropped by the classic Withdraw `from` filter; the CL filter is per topic0.
+    logs.push(crate::test_utils::make_log(
+        gauge,
+        vec![
+            alloy_primitives::keccak256(CLASSIC_WITHDRAW),
+            address_topic(TO),
+        ],
+        amount(1),
+    ));
+    let payload = crate::sync::BlockPayload::<crate::chain::EthereumChain>::new(
+        reth_primitives_traits::Header {
+            number: 100,
+            ..Default::default()
+        },
+        reth_ethereum_primitives::BlockBody {
+            transactions: vec![crate::test_utils::build_test_transaction()],
+            ommers: vec![],
+            withdrawals: None,
+        },
+        vec![crate::test_utils::make_receipt(logs)],
+    );
+    let registry = HandlerRegistry::new(
+        resolved
+            .resolved_events
+            .iter()
+            .map(|e| Box::new(ConfigDrivenHandler::new(e.clone())) as Box<dyn EventHandler>)
+            .collect(),
+    );
+
+    let decoded = crate::filter::filter_block(&payload, &resolved.index_config)
+        .iter()
+        .map(|log| crate::decode::decode_log(log, &resolved.index_config.contracts[0]))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    let routed: Vec<Routed<'_>> = decoded
+        .iter()
+        .map(|event| {
+            (
+                event.log_index.as_u32(),
+                registry.matched_table_names(&event.contract_name, event.topic0),
+                event
+                    .indexed
+                    .iter()
+                    .chain(&event.body)
+                    .map(|p| (p.name.as_str(), p.value.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    let cl = vec![
+        ("user", DynSolValue::Address(USER)),
+        (
+            "tokenId",
+            DynSolValue::Uint(alloy_primitives::U256::from(7), 256),
+        ),
+        (
+            "liquidityToStake",
+            DynSolValue::Uint(alloy_primitives::U256::from(1000), 128),
+        ),
+    ];
+    let uint = |v: u64| DynSolValue::Uint(alloy_primitives::U256::from(v), 256);
+    assert_eq!(
+        routed,
+        [
+            (0, vec!["gauge_cl_deposit"], cl.clone()),
+            (
+                1,
+                vec!["gauge_classic_deposit"],
+                vec![
+                    ("from", DynSolValue::Address(FROM)),
+                    ("to", DynSolValue::Address(TO)),
+                    ("amount", uint(500)),
+                ]
+            ),
+            (2, vec!["gauge_cl_withdraw"], cl),
+            (
+                3,
+                vec!["gauge_classic_withdraw"],
+                vec![("from", DynSolValue::Address(FROM)), ("amount", uint(250))]
+            ),
+        ]
+    );
+    Ok(())
+}

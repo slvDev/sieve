@@ -28,11 +28,10 @@ use reth_static_file_types::{SegmentHeader, SegmentRangeInclusive, StaticFileSeg
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
-    sync::Arc,
 };
 use tokio::sync::watch;
 
@@ -91,77 +90,12 @@ async fn configured_context(
     jars: &Jars,
     config: Value,
 ) -> Result<crate::sync::ingestion::IngestionContext> {
-    use crate::handler::{
-        CallHandler, CallRegistry, ConfigDrivenHandler, HandlerRegistry, TransferHandler,
-        TransferRegistry,
-    };
-    let (mut ctx, _, _) = crate::sync::ingestion_tests::context(false).await?;
-    let config = serde_json::from_value(config)?;
-    let resolved = crate::toml_config::resolve_config(&config, &jars.root.0)?;
-    for ddl in resolved
-        .resolved_events
-        .iter()
-        .map(|e| &e.create_table_sql)
-        .chain(resolved.calls.iter().map(|e| &e.create_table_sql))
-        .chain(resolved.transfers.iter().map(|e| &e.create_table_sql))
-    {
-        sqlx::query(ddl).execute(ctx.db.pool()).await?;
-    }
-    let tables = resolved
-        .resolved_events
-        .iter()
-        .map(|e| e.table_name.clone())
-        .chain(resolved.calls.iter().map(|e| e.table_name.clone()))
-        .chain(resolved.transfers.iter().map(|e| e.table_name.clone()))
-        .collect::<Vec<_>>();
-    sqlx::query(&format!("TRUNCATE {}", tables.join(", ")))
-        .execute(ctx.db.pool())
-        .await?;
-    sqlx::query("TRUNCATE _sieve_factories")
-        .execute(ctx.db.pool())
-        .await?;
-    crate::db::ensure_factory_coverage(
-        &ctx.db,
-        &resolved.factories,
+    crate::sync::ingestion_tests::configured_context(
+        &jars.root.0,
         jars.evidence.first_block,
-        false,
+        &serde_json::from_value(config)?,
     )
-    .await?;
-    ctx.event_table_map = Arc::new(
-        resolved
-            .resolved_events
-            .iter()
-            .map(|e| {
-                (
-                    format!("{}:{}", e.contract_name, e.event_name),
-                    (e.table_name.clone(), e.event_name.clone()),
-                )
-            })
-            .collect(),
-    );
-    ctx.receipt_tables = Arc::new(HashSet::from_iter(tables));
-    ctx.handlers = Arc::new(HandlerRegistry::new(
-        resolved
-            .resolved_events
-            .into_iter()
-            .map(|e| Box::new(ConfigDrivenHandler::new(e)) as Box<dyn crate::handler::EventHandler>)
-            .collect(),
-    ));
-    ctx.call_handlers = Arc::new(CallRegistry::new(
-        resolved.calls.into_iter().map(CallHandler::new).collect(),
-    ));
-    ctx.transfer_handlers = Arc::new(TransferRegistry::new(
-        resolved
-            .transfers
-            .into_iter()
-            .map(TransferHandler::new)
-            .collect(),
-    ));
-    ctx.config = Arc::new(resolved.index_config);
-    ctx.factories = Arc::new(resolved.factories);
-    ctx.stream_dispatcher = None;
-    ctx.is_backfill = true;
-    Ok(ctx)
+    .await
 }
 
 fn hex_number(value: &Value) -> Result<u64> {
