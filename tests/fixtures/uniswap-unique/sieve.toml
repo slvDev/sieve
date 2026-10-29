@@ -1,0 +1,58 @@
+chain = "mainnet"
+
+[[contracts]]
+name = "UniswapV3Pool"
+abi = "abis/v3-pool.json"
+include_receipts = true
+
+[contracts.factory]
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+abi = "abis/v3-factory.json"
+event = "PoolCreated"
+param = "pool"
+start_block = 12369621
+
+[[contracts.events]]
+name = "Swap"
+table = "v3_swaps"
+context = ["block_timestamp", "tx_from"]
+
+[[contracts.events]]
+name = "Mint"
+table = "v3_mints"
+columns = [
+  { param = "owner", name = "lp_owner" },
+  { param = "amount", type = "text" },
+]
+
+[[contracts.events]]
+name = "Burn"
+table = "v3_burns"
+
+[[contracts.events]]
+name = "Initialize"
+table = "v3_initializations"
+
+[[contracts.events]]
+name = "Swap"
+table = "v3_swaps_by_router"
+
+[[contracts]]
+name = "PoolManager"
+address = "0x000000000004444c5dc75cB358380D2e3dE08A90"
+abi = "abis/v4-pool-manager.json"
+start_block = 21688329
+
+[[contracts.events]]
+name = "Initialize"
+table = "v4_initializations"
+context = ["block_hash", "tx_value"]
+
+[[contracts.events]]
+name = "Swap"
+table = "v4_swaps"
+filter = { id = ["0x21c67e77068de97969ba93d4aab21826d33ca12bb9f565d8496e8fda8a82ca27"] }
+
+[[contracts.events]]
+name = "ModifyLiquidity"
+table = "v4_modify_liquidity"

@@ -4149,3 +4149,7 @@ type = "webhook"
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "event_selection_tests.rs"]
+mod event_selection_tests;
