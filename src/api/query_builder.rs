@@ -161,64 +161,43 @@ fn column_sql(column: &str, pg_type: &str) -> String {
     }
 }
 
+/// Write bind `$idx`, cast for numeric columns: their filter and cursor values bind as TEXT
+/// (integer filters as INT4), and PostgreSQL has no implicit text-to-number comparison.
+fn write_placeholder(sql: &mut String, idx: usize, pg_type: &str) {
+    let cast = match pg_type {
+        // bigserial is a DDL pseudo-type; runtime cast type is bigint
+        "bigint" | "bigserial" => "::bigint",
+        "numeric" => "::numeric",
+        "integer" => "::integer",
+        _ => "",
+    };
+    let _ = write!(sql, "${idx}{cast}");
+}
+
 /// Build a single WHERE condition string for a filter.
 fn build_condition(column: &str, pg_type: &str, op: FilterOp, param_idx: &mut usize) -> String {
     let idx = *param_idx;
     *param_idx += 1;
 
-    let col = column_sql(column, pg_type);
-    // For bytea columns, decode hex input
-    let is_bytea = pg_type == "bytea";
-    // For numeric comparisons, cast both sides
-    let is_numeric = matches!(pg_type, "bigint" | "numeric" | "bigserial");
-
-    match op {
-        FilterOp::Eq => {
-            if is_bytea {
-                format!("{col} = decode(${idx}, 'hex')")
-            } else {
-                format!("{col} = ${idx}")
-            }
-        }
-        FilterOp::Ne => {
-            if is_bytea {
-                format!("{col} != decode(${idx}, 'hex')")
-            } else {
-                format!("{col} != ${idx}")
-            }
-        }
-        FilterOp::Gt => {
-            if is_numeric {
-                format!("{col} > ${idx}::{pg_type}")
-            } else {
-                format!("{col} > ${idx}")
-            }
-        }
-        FilterOp::Gte => {
-            if is_numeric {
-                format!("{col} >= ${idx}::{pg_type}")
-            } else {
-                format!("{col} >= ${idx}")
-            }
-        }
-        FilterOp::Lt => {
-            if is_numeric {
-                format!("{col} < ${idx}::{pg_type}")
-            } else {
-                format!("{col} < ${idx}")
-            }
-        }
-        FilterOp::Lte => {
-            if is_numeric {
-                format!("{col} <= ${idx}::{pg_type}")
-            } else {
-                format!("{col} <= ${idx}")
-            }
-        }
-        FilterOp::Contains | FilterOp::StartsWith => format!("{col} LIKE ${idx}"),
+    let cmp = match op {
         // In/NotIn are handled by build_single_filter_sql, not build_condition
-        FilterOp::In | FilterOp::NotIn => format!("{col} = ${idx}"),
+        FilterOp::Eq | FilterOp::In | FilterOp::NotIn => "=",
+        FilterOp::Ne => "!=",
+        FilterOp::Gt => ">",
+        FilterOp::Gte => ">=",
+        FilterOp::Lt => "<",
+        FilterOp::Lte => "<=",
+        FilterOp::Contains | FilterOp::StartsWith => "LIKE",
+    };
+    let mut sql = column_sql(column, pg_type);
+    let _ = write!(sql, " {cmp} ");
+    if pg_type == "bytea" && matches!(op, FilterOp::Eq | FilterOp::Ne) {
+        // bytea filters take hex input
+        let _ = write!(sql, "decode(${idx}, 'hex')");
+    } else {
+        write_placeholder(&mut sql, idx, pg_type);
     }
+    sql
 }
 
 /// Parse a GraphQL filter value into a `SqlParam`.
@@ -381,27 +360,20 @@ pub fn build_condition_in(
     start_idx: usize,
 ) -> String {
     let op = if negated { "NOT IN" } else { "IN" };
-    let is_bytea = pg_type == "bytea";
-    let is_numeric = matches!(pg_type, "bigint" | "numeric" | "bigserial");
-
-    let placeholders: Vec<String> = (0..count)
-        .map(|i| {
-            let idx = start_idx + i;
-            if is_bytea {
-                format!("decode(${idx}, 'hex')")
-            } else if is_numeric {
-                format!("${idx}::{pg_type}")
-            } else {
-                format!("${idx}")
-            }
-        })
-        .collect();
-
-    format!(
-        "{} {op} ({})",
-        column_sql(column, pg_type),
-        placeholders.join(", ")
-    )
+    let mut sql = column_sql(column, pg_type);
+    let _ = write!(sql, " {op} (");
+    for idx in start_idx..start_idx + count {
+        if idx > start_idx {
+            sql.push_str(", ");
+        }
+        if pg_type == "bytea" {
+            let _ = write!(sql, "decode(${idx}, 'hex')");
+        } else {
+            write_placeholder(&mut sql, idx, pg_type);
+        }
+    }
+    sql.push(')');
+    sql
 }
 
 /// Parse a GraphQL filter value list into a `SqlParam::List`.
@@ -580,23 +552,9 @@ pub fn build_cursor_condition(
     let id_idx = *param_idx;
     *param_idx += 1;
 
-    let is_numeric = matches!(order_pg_type, "bigint" | "numeric" | "bigserial");
-    let cast = if is_numeric {
-        // bigserial is a DDL pseudo-type; runtime cast type is bigint
-        let cast_type = if order_pg_type == "bigserial" {
-            "bigint"
-        } else {
-            order_pg_type
-        };
-        format!("::{cast_type}")
-    } else {
-        String::new()
-    };
-
-    let sql = format!(
-        "({}, id) {cmp} (${val_idx}{cast}, ${id_idx})",
-        column_sql(order_col, order_pg_type)
-    );
+    let mut sql = format!("({}, id) {cmp} (", column_sql(order_col, order_pg_type));
+    write_placeholder(&mut sql, val_idx, order_pg_type);
+    let _ = write!(sql, ", ${id_idx})");
 
     let params = vec![
         SqlParam::Text(cursor.sort_value.clone()),
@@ -1204,5 +1162,107 @@ mod tests {
         let (sql, _) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
         // Empty IN list should produce FALSE
         assert!(sql.contains("WHERE FALSE"));
+    }
+
+    #[test]
+    fn binds_cast_to_column_type_for_every_exposed_operator() {
+        // (pg_type, column SQL, scalar bind, IN list, cursor value bind); numbering starts at $2.
+        let cases = [
+            (
+                "bigint",
+                "\"c\"",
+                "$2::bigint",
+                "($2::bigint, $3::bigint)",
+                "$2::bigint",
+            ),
+            (
+                "bigserial",
+                "\"c\"",
+                "$2::bigint",
+                "($2::bigint, $3::bigint)",
+                "$2::bigint",
+            ),
+            (
+                "numeric",
+                "\"c\"",
+                "$2::numeric",
+                "($2::numeric, $3::numeric)",
+                "$2::numeric",
+            ),
+            (
+                "integer",
+                "\"c\"",
+                "$2::integer",
+                "($2::integer, $3::integer)",
+                "$2::integer",
+            ),
+            ("text", "\"c\"", "$2", "($2, $3)", "$2"),
+            (
+                "bytea",
+                "\"c\"",
+                "decode($2, 'hex')",
+                "(decode($2, 'hex'), decode($3, 'hex'))",
+                "$2",
+            ),
+            ("jsonb", "\"c\"::text", "$2", "($2, $3)", "$2"),
+        ];
+        let text = |s: &str| SqlParam::Text(s.into());
+        for (pg_type, col, bind, list, cursor_bind) in cases {
+            for (suffix, _) in crate::api::types::operators_for_type(pg_type) {
+                let op = SUFFIXES
+                    .iter()
+                    .find(|(s, _)| *s == suffix)
+                    .map_or(FilterOp::Eq, |(_, op)| *op);
+                let (cmp, value, rhs) = match op {
+                    FilterOp::In => ("IN", SqlParam::List(vec![text("1"), text("2")]), list),
+                    FilterOp::NotIn => ("NOT IN", SqlParam::List(vec![text("1"), text("2")]), list),
+                    FilterOp::Eq => ("=", text("1"), bind),
+                    FilterOp::Ne => ("!=", text("1"), bind),
+                    FilterOp::Gt => (">", text("1"), bind),
+                    FilterOp::Gte => (">=", text("1"), bind),
+                    FilterOp::Lt => ("<", text("1"), bind),
+                    FilterOp::Lte => ("<=", text("1"), bind),
+                    FilterOp::Contains | FilterOp::StartsWith => ("LIKE", text("1"), bind),
+                };
+                let wc = WhereClause::Condition(FilterCondition {
+                    column: "c".into(),
+                    pg_type: pg_type.into(),
+                    op,
+                    value,
+                });
+                let mut params = vec![SqlParam::Int64(0)];
+                let mut idx = 2;
+                let sql = build_where_sql(&wc, &mut params, &mut idx);
+                assert_eq!(sql, format!("{col} {cmp} {rhs}"), "{pg_type}{suffix}");
+                let binds = if matches!(op, FilterOp::In | FilterOp::NotIn) {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    (idx, params.len()),
+                    (2 + binds, 1 + binds),
+                    "{pg_type}{suffix}"
+                );
+            }
+            let cursor = Cursor {
+                sort_value: "1".into(),
+                id: 7,
+            };
+            for (dir, cmp) in [("ASC", ">"), ("DESC", "<")] {
+                let mut idx = 2;
+                let (sql, params) = build_cursor_condition("c", pg_type, dir, &cursor, &mut idx);
+                assert_eq!(
+                    sql,
+                    format!("({col}, id) {cmp} ({cursor_bind}, $3)"),
+                    "{pg_type} {dir}"
+                );
+                assert!(matches!(
+                    params[..],
+                    [SqlParam::Text(_), SqlParam::Int64(7)]
+                ));
+                assert_eq!(idx, 4);
+            }
+        }
     }
 }

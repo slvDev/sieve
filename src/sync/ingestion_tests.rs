@@ -1449,3 +1449,119 @@ async fn legacy_text_columns_keep_debug_rows_and_take_json_text() -> eyre::Resul
     );
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "filter, paging and error assertions over one seeded table"
+)]
+async fn numeric_graphql_filters_and_cursors() -> eyre::Result<()> {
+    const ABOVE_I64: &str = "123456789012345678901234567890";
+    let (resolved, ctx, _) = structured_context().await?;
+    // Ids 1-4: block_number (bigint) and token_id (numeric) [2, 10, 10, 100], log_index [0, 0, 1, 0].
+    sqlx::query(
+        "INSERT INTO gauges_allocated (block_number, tx_hash, tx_index, log_index, token_id, \
+         allocations, emissions_per_vp) VALUES (2, '\\x00', 0, 0, 2, '[]', 0), \
+         (10, '\\x00', 0, 0, 10, '[]', 0), (10, '\\x00', 0, 1, 10, '[]', 0), \
+         (100, '\\x00', 0, 0, 100, '[]', $1::numeric)",
+    )
+    .bind(ABOVE_I64)
+    .execute(ctx.db.pool())
+    .await?;
+    let schema = crate::api::build_schema(
+        &resolved.resolved_events,
+        &resolved.transfers,
+        &resolved.calls,
+        ctx.db.pool().clone(),
+    )?;
+    let nodes = |ids: &[u8]| serde_json::json!({ "nodes": ids.iter().map(|id| serde_json::json!({ "id": id.to_string() })).collect::<Vec<_>>() });
+
+    for column in ["block_number", "token_id"] {
+        let field = |alias: &str, filter: &str| {
+            format!(
+                "{alias}: gauges_allocated(where: {{ {column}{filter} }}, orderBy: id, \
+                 orderDirection: ASC) {{ nodes {{ id }} }}"
+            )
+        };
+        let query = format!(
+            "query($v: String, $low: String, $vs: [String]) {{ {} {} {} {} {} }}",
+            field("eq", ": $v"),
+            field("ne", "_ne: $v"),
+            field("in", "_in: $vs"),
+            field("not_in", "_not_in: $vs"),
+            field("gt", "_gt: $low"),
+        );
+        let vars = serde_json::json!({ "v": "10", "low": "2", "vs": ["2", "10"] });
+        assert_eq!(
+            graphql(&schema, &query, vars).await?,
+            serde_json::json!({
+                "eq": nodes(&[2, 3]),
+                "ne": nodes(&[1, 4]),
+                "in": nodes(&[1, 2, 3]),
+                "not_in": nodes(&[4]),
+                "gt": nodes(&[2, 3, 4]),
+            }),
+            "{column}"
+        );
+    }
+    let big = graphql(
+        &schema,
+        "query($big: String) { \
+           eq: gauges_allocated(where: { emissions_per_vp: $big }) { nodes { id } } \
+           gt: gauges_allocated(where: { emissions_per_vp_gt: \"9223372036854775807\" }) \
+             { nodes { id } } }",
+        serde_json::json!({ "big": ABOVE_I64 }),
+    )
+    .await?;
+    assert_eq!(
+        big,
+        serde_json::json!({ "eq": nodes(&[4]), "gt": nodes(&[4]) })
+    );
+
+    // One row per page; `after` walks every row once in (column, id) order.
+    for (order, dir, filter, expected) in [
+        ("log_index", "ASC", "", &[1, 2, 4, 3]),
+        ("log_index", "DESC", "", &[3, 4, 2, 1]),
+    ] {
+        let mut after = String::new();
+        for (page, id) in expected.iter().enumerate() {
+            let result = graphql(
+                &schema,
+                &format!(
+                    "{{ gauges_allocated({filter}orderBy: {order}, orderDirection: {dir}, \
+                     first: 1{after}) {{ nodes {{ id }} pageInfo {{ hasNextPage endCursor }} }} }}"
+                ),
+                serde_json::json!({}),
+            )
+            .await?;
+            let connection = &result["gauges_allocated"];
+            assert_eq!(
+                (&connection["nodes"], &connection["pageInfo"]["hasNextPage"]),
+                (
+                    &nodes(&[*id])["nodes"],
+                    &serde_json::json!(page + 1 < expected.len())
+                ),
+                "{order} {dir} page {page}"
+            );
+            let cursor = connection["pageInfo"]["endCursor"]
+                .as_str()
+                .ok_or_else(|| eyre::eyre!("no endCursor"))?;
+            after = format!(", after: \"{cursor}\"");
+        }
+    }
+
+    for column in ["block_number", "token_id"] {
+        let response = schema
+            .execute(format!(
+                "{{ gauges_allocated(where: {{ {column}: \"abc\" }}) {{ nodes {{ id }} }} }}"
+            ))
+            .await;
+        assert!(
+            response.errors.len() == 1 && response.errors[0].message.starts_with("query failed: "),
+            "{column}: {:?}",
+            response.errors
+        );
+    }
+    Ok(())
+}
