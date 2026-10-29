@@ -103,3 +103,305 @@ fn unique_name_config_matches_v0_3_3_goldens() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+pub const CL_DEPOSIT: &str = "Deposit(address,uint256,uint128)";
+pub const CLASSIC_DEPOSIT: &str = "Deposit(address,address,uint256)";
+pub const CL_WITHDRAW: &str = "Withdraw(address,uint256,uint128)";
+pub const CLASSIC_WITHDRAW: &str = "Withdraw(address,uint256)";
+
+/// The overload fixture's four selectors with their expected topic0 vectors.
+const GAUGE_SELECTORS: [(&str, &str); 4] = [
+    (
+        CL_DEPOSIT,
+        "0x1c8ab8c7f45390d58f58f1d655213a82cca5d12179761a87c16f098813b8f211",
+    ),
+    (
+        CLASSIC_DEPOSIT,
+        "0x5548c837ab068cf56a2c2479df0882a4922fd203edb7517321831d95078c5f62",
+    ),
+    (
+        CL_WITHDRAW,
+        "0x8903a5b5d08a841e7f68438387f1da20c84dea756379ed37e633ff3854b99b84",
+    ),
+    (
+        CLASSIC_WITHDRAW,
+        "0x884edad9ce6fa2440d8a54cc123490eb96d2768479d49ff9c7366125a9424364",
+    ),
+];
+
+pub fn gauge_abi() -> eyre::Result<JsonAbi> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(
+        fixture_dir("event-overloads").join("abis/gauge.json"),
+    )?)?)
+}
+
+#[test]
+fn gauge_overload_selectors_match_vectors() -> eyre::Result<()> {
+    let abi = gauge_abi()?;
+    for (signature, topic0) in GAUGE_SELECTORS {
+        let topic0: B256 = topic0.parse()?;
+        assert_eq!(
+            alloy_primitives::keccak256(signature),
+            topic0,
+            "{signature}"
+        );
+        let selected: Vec<_> = abi
+            .events()
+            .filter(|e| e.signature() == signature)
+            .map(alloy_json_abi::Event::selector)
+            .collect();
+        assert_eq!(selected, [topic0], "{signature}");
+    }
+    Ok(())
+}
+
+/// Unique, identical-duplicate, conflicting-layout, and tuple/array events.
+const EXTRA_ABI: &str = r#"[
+    {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]},
+    {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]},
+    {"type":"event","name":"Sync","anonymous":false,"inputs":[{"name":"reserve","type":"uint112","indexed":false}]},
+    {"type":"event","name":"Sync","anonymous":false,"inputs":[{"name":"reserve","type":"uint112","indexed":true}]},
+    {"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"key","type":"tuple","indexed":false,"components":[{"name":"token","type":"address"},{"name":"fee","type":"uint24"}]},{"name":"amounts","type":"int256[2]","indexed":false}]},
+    {"type":"event","name":"Swap","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]}
+]"#;
+
+const NONCANONICAL: &[&str] = &["no ABI variant", CL_DEPOSIT, CLASSIC_DEPOSIT];
+
+/// (name, signature, Ok((selected signature, first input)) or Err(message substrings)).
+type SelectCase = (
+    &'static str,
+    Option<&'static str>,
+    Result<(&'static str, &'static str), &'static [&'static str]>,
+);
+
+const SELECT_CASES: [SelectCase; 15] = [
+    (
+        "Deposit",
+        None,
+        Err(&[
+            "contract 'Gauge'",
+            "'Deposit'",
+            "is overloaded",
+            "Deposit(address,address,uint256), Deposit(address,uint256,uint128)",
+            "signature = \"Deposit(address,address,uint256)\"",
+        ]),
+    ),
+    (
+        "Withdraw",
+        None,
+        Err(&["Withdraw(address,uint256), Withdraw(address,uint256,uint128)"]),
+    ),
+    ("Deposit", Some(CL_DEPOSIT), Ok((CL_DEPOSIT, "user"))),
+    (
+        "Deposit",
+        Some(CLASSIC_DEPOSIT),
+        Ok((CLASSIC_DEPOSIT, "from")),
+    ),
+    ("Withdraw", Some(CL_WITHDRAW), Ok((CL_WITHDRAW, "user"))),
+    (
+        "Withdraw",
+        Some(CLASSIC_WITHDRAW),
+        Ok((CLASSIC_WITHDRAW, "from")),
+    ),
+    (
+        "Deposit",
+        Some("Deposit(address, uint256, uint128)"),
+        Err(NONCANONICAL),
+    ),
+    (
+        "Deposit",
+        Some("Deposit(address user,uint256 tokenId,uint128 liquidityToStake)"),
+        Err(NONCANONICAL),
+    ),
+    (
+        "Deposit",
+        Some("deposit(address,address,uint256)"),
+        Err(NONCANONICAL),
+    ),
+    ("Deposit", Some(CLASSIC_WITHDRAW), Err(NONCANONICAL)),
+    (
+        "Deposit",
+        Some("Deposit(address,uint256)"),
+        Err(NONCANONICAL),
+    ),
+    (
+        "Missing",
+        None,
+        Err(&["event 'Missing' not found in ABI for contract 'Gauge'"]),
+    ),
+    (
+        "Transfer",
+        None,
+        Ok(("Transfer(address,address,uint256)", "from")),
+    ),
+    (
+        "Sync",
+        Some("Sync(uint112)"),
+        Err(&["'Sync(uint112)'", "conflicting ABI layouts"]),
+    ),
+    (
+        "Swap",
+        Some("Swap((address,uint24),int256[2])"),
+        Ok(("Swap((address,uint24),int256[2])", "key")),
+    ),
+];
+
+#[test]
+fn select_event_by_name_and_signature() -> eyre::Result<()> {
+    let gauge = gauge_abi()?;
+    let mut reversed = gauge_abi()?;
+    for variants in reversed.events.values_mut() {
+        variants.reverse();
+    }
+    let extra: JsonAbi = serde_json::from_str(EXTRA_ABI)?;
+    for abi in [&gauge, &reversed] {
+        for (name, signature, expected) in SELECT_CASES {
+            let source = if extra.events.contains_key(name) {
+                &extra
+            } else {
+                abi
+            };
+            let result = crate::config::select_event(source, "Gauge", name, signature);
+            match (result, expected) {
+                (Ok(event), Ok((selected, first_input))) => {
+                    assert_eq!(event.signature(), selected);
+                    assert_eq!(event.inputs[0].name, first_input, "{selected}");
+                }
+                (Err(err), Err(substrings)) => {
+                    let message = err.to_string();
+                    for substring in substrings {
+                        assert!(message.contains(substring), "{message} lacks {substring}");
+                    }
+                }
+                (result, expected) => {
+                    eyre::bail!("{name} {signature:?}: got {result:?}, expected {expected:?}")
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One resolved table: table, signature, columns, filtered topic indexes.
+type ResolvedRow<'a> = (&'a str, &'a str, Vec<&'a str>, Vec<usize>);
+
+#[test]
+fn overload_fixture_resolves_each_selector_once() -> eyre::Result<()> {
+    let dir = fixture_dir("event-overloads");
+    let mut config = load_merged_config(&dir.join("sieve.toml"))?;
+    let resolved = resolve_config(&config, &dir)?;
+    let rows: Vec<ResolvedRow<'_>> = resolved
+        .resolved_events
+        .iter()
+        .map(|e| {
+            (
+                e.table_name.as_str(),
+                e.signature.as_str(),
+                e.columns.iter().map(|c| c.column_name.as_str()).collect(),
+                e.topic_filters.iter().map(|f| f.topic_index).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "gauge_cl_deposit",
+                CL_DEPOSIT,
+                vec!["user", "token_id", "liquidity_to_stake"],
+                vec![]
+            ),
+            (
+                "gauge_classic_deposit",
+                CLASSIC_DEPOSIT,
+                vec!["from", "to", "amount"],
+                vec![]
+            ),
+            (
+                "gauge_cl_withdraw",
+                CL_WITHDRAW,
+                vec!["user", "token_id", "liquidity_to_stake"],
+                vec![2]
+            ),
+            (
+                "gauge_classic_withdraw",
+                CLASSIC_WITHDRAW,
+                vec!["from", "amount"],
+                vec![1]
+            ),
+        ]
+    );
+
+    let contract = &resolved.index_config.contracts[0];
+    assert_eq!(contract.events.len(), 4);
+    for (event, (signature, topic0)) in resolved.resolved_events.iter().zip(GAUGE_SELECTORS) {
+        let topic0: B256 = topic0.parse()?;
+        assert_eq!(event.topic0, topic0);
+        assert_eq!(contract.events[&topic0].signature(), signature);
+    }
+    let filtered: HashSet<B256> = contract.topic_filters.keys().copied().collect();
+    assert_eq!(
+        filtered,
+        HashSet::from([
+            resolved.resolved_events[2].topic0,
+            resolved.resolved_events[3].topic0
+        ])
+    );
+
+    config.contracts[0].events[1].signature = None;
+    let err = resolve_config(&config, &dir).err().map(|e| e.to_string());
+    assert!(
+        err.as_deref()
+            .is_some_and(|e| e
+                .contains("Deposit(address,address,uint256), Deposit(address,uint256,uint128)")),
+        "{err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn factory_fixture_resolves_overloaded_child_template() -> eyre::Result<()> {
+    let dir = fixture_dir("event-overloads");
+    let resolved = resolve_config(&load_config(&dir.join("factory.toml"))?, &dir)?;
+    let tables: Vec<(&str, &str)> = resolved
+        .resolved_events
+        .iter()
+        .map(|e| (e.table_name.as_str(), e.signature.as_str()))
+        .collect();
+    assert_eq!(
+        tables,
+        [
+            ("gauge_cl_deposit", CL_DEPOSIT),
+            ("gauge_classic_deposit", CLASSIC_DEPOSIT),
+            ("gauge_classic_deposit_copy", CLASSIC_DEPOSIT),
+            ("gauge_cl_withdraw", CL_WITHDRAW),
+            ("gauge_classic_withdraw", CLASSIC_WITHDRAW),
+        ]
+    );
+    assert_eq!(resolved.index_config.contracts[0].events.len(), 4);
+    let factory = &resolved.factories[0];
+    assert_eq!(
+        factory.creation_selector,
+        alloy_primitives::keccak256("GaugeCreated(address)")
+    );
+    assert_eq!(
+        factory.extraction_fingerprint(),
+        "event GaugeCreated(address indexed gauge) => gauge"
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_signature_changes_archive_fingerprint() -> eyre::Result<()> {
+    let dir = fixture_dir("uniswap-unique");
+    let mut config = load_merged_config(&dir.join("sieve.toml"))?;
+    let golden = crate::archive::config_fingerprint(&config, &dir)?;
+    assert!(!serde_json::to_string(&config.contracts[1].events[1])?.contains("signature"));
+
+    let sql = ordered_sql(&resolve_config(&config, &dir)?);
+    config.contracts[1].events[1].signature =
+        Some("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)".to_owned());
+    assert_ne!(crate::archive::config_fingerprint(&config, &dir)?, golden);
+    assert_eq!(ordered_sql(&resolve_config(&config, &dir)?), sql);
+    Ok(())
+}

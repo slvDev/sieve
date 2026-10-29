@@ -3,8 +3,8 @@
 //! Reads `sieve.toml`, parses contract/event definitions, resolves ABI files,
 //! and produces [`IndexConfig`] + [`ResolvedEvent`] structs for the pipeline.
 
-use crate::config::{ContractConfig, IndexConfig};
-use alloy_json_abi::JsonAbi;
+use crate::config::{select_event, ContractConfig, IndexConfig};
+use alloy_json_abi::{Event, JsonAbi};
 use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,10 @@ pub struct TomlFactory {
 pub struct TomlEvent {
     /// Event name as it appears in the ABI (e.g. "Transfer").
     pub name: String,
+    /// Canonical signature (e.g. "Deposit(address,uint256)") selecting one
+    /// overload of `name`. Required only when the ABI overloads the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     /// Postgres table name for this event's data.
     pub table: String,
     /// Optional context fields to enrich events with block/tx data.
@@ -448,8 +452,12 @@ pub struct TopicFilter {
 /// A fully resolved event with pre-built SQL statements.
 #[derive(Debug, Clone)]
 pub struct ResolvedEvent {
-    /// Event name from the ABI.
+    /// Event name from the ABI; a label, not an identity.
     pub event_name: String,
+    /// Canonical signature of the selected ABI event (topic0 preimage).
+    pub signature: String,
+    /// Selected event's topic0; with `contract_name`, the routing identity.
+    pub topic0: B256,
     /// Contract name.
     pub contract_name: String,
     /// Postgres table name.
@@ -1427,44 +1435,33 @@ fn resolve_contract(
         resolved_factories.push(resolve_factory(factory, &contract.name, &abi, config_dir)?);
     }
 
-    let event_names: Vec<&str> = contract.events.iter().map(|e| e.name.as_str()).collect();
-
-    // Resolve each event
+    // The pipeline decodes with exactly the events selected for SQL.
+    let mut contract_config = ContractConfig {
+        name: contract.name.clone(),
+        address,
+        events: HashMap::with_capacity(contract.events.len()),
+        topic_filters: HashMap::new(),
+        functions: HashMap::new(),
+    };
     for toml_event in &contract.events {
-        resolve_event(
+        let (abi_event, resolved) = resolve_event(
             toml_event,
             &contract.name,
             &abi,
             is_factory_child,
             contract.include_receipts,
             table_names,
-            resolved_events,
         )?;
-    }
-
-    // Build ContractConfig for the filter/decode pipeline
-    let mut contract_config =
-        ContractConfig::from_abi(&contract.name, address, &abi, &event_names)?;
-
-    // Populate topic filters from resolved events for this contract
-    for re in &resolved_events[resolved_events.len() - contract.events.len()..] {
-        if !re.topic_filters.is_empty() {
-            let selector = contract_config
-                .events
-                .keys()
-                .find(|sel| {
-                    contract_config
-                        .events
-                        .get(*sel)
-                        .is_some_and(|ev| ev.name == re.event_name)
-                })
-                .copied();
-            if let Some(sel) = selector {
-                contract_config
-                    .topic_filters
-                    .insert(sel, re.topic_filters.clone());
-            }
+        // Filters are contract-global per topic0: the last non-empty set wins.
+        if !resolved.topic_filters.is_empty() {
+            contract_config
+                .topic_filters
+                .insert(resolved.topic0, resolved.topic_filters.clone());
         }
+        contract_config
+            .events
+            .insert(resolved.topic0, abi_event.clone());
+        resolved_events.push(resolved);
     }
 
     // Resolve each function call
@@ -1495,21 +1492,21 @@ fn resolve_contract(
     Ok(contract_config)
 }
 
-/// Resolve a single TOML event definition into a `ResolvedEvent`.
+/// Resolve a single TOML event definition into its selected ABI event and
+/// `ResolvedEvent`.
 ///
 /// # Errors
 ///
-/// Returns an error if the table name is invalid/duplicate, the event is not
-/// found in the ABI, or column resolution fails.
-fn resolve_event(
+/// Returns an error if the table name is invalid/duplicate, the event cannot
+/// be selected from the ABI, or column resolution fails.
+fn resolve_event<'a>(
     toml_event: &TomlEvent,
     contract_name: &str,
-    abi: &JsonAbi,
+    abi: &'a JsonAbi,
     is_factory_child: bool,
     include_receipts: bool,
     table_names: &mut HashSet<String>,
-    resolved_events: &mut Vec<ResolvedEvent>,
-) -> eyre::Result<()> {
+) -> eyre::Result<(&'a Event, ResolvedEvent)> {
     validate_identifier(&toml_event.table, "table")?;
     if !table_names.insert(toml_event.table.clone()) {
         return Err(eyre::eyre!(
@@ -1518,18 +1515,12 @@ fn resolve_event(
         ));
     }
 
-    let abi_events = abi.events.get(&toml_event.name).ok_or_else(|| {
-        eyre::eyre!(
-            "event '{}' not found in ABI for contract '{contract_name}'",
-            toml_event.name,
-        )
-    })?;
-    let abi_event = abi_events.first().ok_or_else(|| {
-        eyre::eyre!(
-            "no variants for event '{}' in contract '{contract_name}'",
-            toml_event.name,
-        )
-    })?;
+    let abi_event = select_event(
+        abi,
+        contract_name,
+        &toml_event.name,
+        toml_event.signature.as_deref(),
+    )?;
 
     let context_fields = resolve_context_fields(
         toml_event.context.as_deref(),
@@ -1565,8 +1556,10 @@ fn resolve_event(
     );
     let rollback_sql = generate_rollback_sql(&toml_event.table);
 
-    resolved_events.push(ResolvedEvent {
+    let resolved = ResolvedEvent {
         event_name: toml_event.name.clone(),
+        signature: abi_event.signature(),
+        topic0: abi_event.selector(),
         contract_name: contract_name.to_owned(),
         table_name: toml_event.table.clone(),
         context_fields,
@@ -1578,9 +1571,9 @@ fn resolve_event(
         is_factory_child,
         topic_filters,
         include_receipts,
-    });
+    };
 
-    Ok(())
+    Ok((abi_event, resolved))
 }
 
 /// Resolve a factory definition: load ABI, validate event and param, build
@@ -1619,28 +1612,14 @@ fn resolve_factory(
         .parse()
         .wrap_err_with(|| format!("invalid factory address for contract '{contract_name}'"))?;
 
-    let creation_events = factory_abi.events.get(&factory.event).ok_or_else(|| {
-        eyre::eyre!(
-            "factory event '{}' not found in ABI for contract '{contract_name}'",
-            factory.event,
-        )
-    })?;
-    // An overloaded creation event is ambiguous: silently picking one
-    // variant could scan the wrong signature and find zero children.
-    if creation_events.len() > 1 {
-        return Err(eyre::eyre!(
-            "factory event '{}' is overloaded ({} variants) in the ABI for contract \
-             '{contract_name}'; overloaded creation events are ambiguous and not supported",
-            factory.event,
-            creation_events.len(),
-        ));
-    }
-    let creation_event = creation_events.first().ok_or_else(|| {
-        eyre::eyre!(
-            "no variants for factory event '{}' in contract '{contract_name}'",
-            factory.event,
-        )
-    })?;
+    let creation_event = select_event(&factory_abi, contract_name, &factory.event, None)
+        .wrap_err_with(|| {
+            format!(
+                "invalid factory creation event for contract '{contract_name}' (factory entries \
+                 take no `signature`; to pick an overload, point factory.abi at an ABI \
+                 containing only that variant)"
+            )
+        })?;
     // Discovery matches logs by their topic0 selector, which anonymous
     // events never emit — such a config would silently find zero children
     // while coverage advances.
@@ -4152,4 +4131,4 @@ type = "webhook"
 
 #[cfg(test)]
 #[path = "event_selection_tests.rs"]
-mod event_selection_tests;
+pub mod event_selection_tests;

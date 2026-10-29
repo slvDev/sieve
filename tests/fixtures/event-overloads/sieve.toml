@@ -1,0 +1,30 @@
+chain = "base"
+
+[[contracts]]
+name = "Gauge"
+address = "0x1111111111111111111111111111111111111111"
+abi = "abis/gauge.json"
+start_block = 100
+
+[[contracts.events]]
+name = "Deposit"
+signature = "Deposit(address,uint256,uint128)"
+table = "gauge_cl_deposit"
+context = ["block_timestamp"]
+
+[[contracts.events]]
+name = "Deposit"
+signature = "Deposit(address,address,uint256)"
+table = "gauge_classic_deposit"
+
+[[contracts.events]]
+name = "Withdraw"
+signature = "Withdraw(address,uint256,uint128)"
+table = "gauge_cl_withdraw"
+filter = { tokenId = ["7"] }
+
+[[contracts.events]]
+name = "Withdraw"
+signature = "Withdraw(address,uint256)"
+table = "gauge_classic_withdraw"
+filter = { from = ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] }

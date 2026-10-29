@@ -1,0 +1,37 @@
+chain = "base"
+
+[[contracts]]
+name = "Gauge"
+abi = "abis/gauge.json"
+
+[contracts.factory]
+address = "0x2222222222222222222222222222222222222222"
+abi = "abis/voter.json"
+event = "GaugeCreated"
+param = "gauge"
+start_block = 100
+
+[[contracts.events]]
+name = "Deposit"
+signature = "Deposit(address,uint256,uint128)"
+table = "gauge_cl_deposit"
+
+[[contracts.events]]
+name = "Deposit"
+signature = "Deposit(address,address,uint256)"
+table = "gauge_classic_deposit"
+
+[[contracts.events]]
+name = "Deposit"
+signature = "Deposit(address,address,uint256)"
+table = "gauge_classic_deposit_copy"
+
+[[contracts.events]]
+name = "Withdraw"
+signature = "Withdraw(address,uint256,uint128)"
+table = "gauge_cl_withdraw"
+
+[[contracts.events]]
+name = "Withdraw"
+signature = "Withdraw(address,uint256)"
+table = "gauge_classic_withdraw"

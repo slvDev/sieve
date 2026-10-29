@@ -599,6 +599,8 @@ mod tests {
     fn test_event() -> ResolvedEvent {
         ResolvedEvent {
             event_name: "Transfer".to_string(),
+            signature: "Transfer(address,address,uint256)".to_string(),
+            topic0: alloy_primitives::keccak256("Transfer(address,address,uint256)"),
             contract_name: "USDC".to_string(),
             table_name: "usdc_transfers".to_string(),
             context_fields: vec![ContextField::BlockTimestamp],

@@ -1246,10 +1246,12 @@ fn cmd_inspect(cli: &cli::Cli) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Print a single event's columns, context fields, and topic filters.
+/// Print a single event's selector, columns, context fields, and topic filters.
 #[expect(clippy::print_stdout, reason = "CLI output helper")]
 fn print_event_detail(event: &toml_config::ResolvedEvent) {
     println!("      {} -> {}", event.event_name, event.table_name);
+    println!("        signature: {}", event.signature);
+    println!("        topic0: {:#x}", event.topic0);
     if !event.columns.is_empty() {
         let cols: Vec<String> = event
             .columns

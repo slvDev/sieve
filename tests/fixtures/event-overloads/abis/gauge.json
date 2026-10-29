@@ -1,0 +1,6 @@
+[
+  {"type":"event","name":"Deposit","anonymous":false,"inputs":[{"name":"user","type":"address","indexed":true},{"name":"tokenId","type":"uint256","indexed":true},{"name":"liquidityToStake","type":"uint128","indexed":true}]},
+  {"type":"event","name":"Deposit","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"amount","type":"uint256","indexed":false}]},
+  {"type":"event","name":"Withdraw","anonymous":false,"inputs":[{"name":"user","type":"address","indexed":true},{"name":"tokenId","type":"uint256","indexed":true},{"name":"liquidityToStake","type":"uint128","indexed":true}]},
+  {"type":"event","name":"Withdraw","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"amount","type":"uint256","indexed":false}]}
+]

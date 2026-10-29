@@ -99,7 +99,7 @@ pub enum Command {
         #[arg(long, env = "ETHERSCAN_API_KEY")]
         etherscan_api_key: Option<String>,
     },
-    /// Dry-run: show tables, columns, and filters from the config.
+    /// Dry-run: show tables, event signatures and topic0, columns, and filters.
     Inspect,
     /// Connect to P2P network and report peer count (no DB needed).
     Peers {
