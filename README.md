@@ -314,6 +314,52 @@ columns = [                 # optional -- auto-generated from ABI if omitted
 spender = ["0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"]
 ```
 
+#### Overloaded events: `signature`
+
+Solidity lets one contract declare several events with the same name, for
+example Aerodrome gauges emitting both `Deposit(address,uint256,uint128)` and
+`Deposit(address,address,uint256)`. Each overload has its own topic0, so pick
+one per entry with `signature` and give each its own table:
+
+```toml
+[[contracts.events]]
+name = "Deposit"
+signature = "Deposit(address,uint256,uint128)"   # user, tokenId, liquidityToStake
+table = "gauge_cl_deposits"
+
+[[contracts.events]]
+name = "Deposit"
+signature = "Deposit(address,address,uint256)"   # from, to, amount
+table = "gauge_classic_deposits"
+```
+
+- The signature is canonical: the event name, then the ABI types in order,
+  comma-separated, with no spaces, parameter names, or `indexed`. Tuples are
+  written out as `(type,type)`. Sieve compares it exactly against the ABI;
+  anything else is a config error that lists the valid signatures.
+- An overloaded name without `signature` fails at startup (and in `sieve
+  inspect`, `schema`, and `reset`):
+
+  ```text
+  event 'Deposit' in contract 'Gauge' is overloaded; add `signature` with one of: Deposit(address,address,uint256), Deposit(address,uint256,uint128) (e.g. signature = "Deposit(address,address,uint256)")
+  ```
+
+- Rows are routed by contract and topic0, so each overload lands only in its
+  own table. One selector may still feed several tables; each table is
+  counted and streamed once per log. Stream payloads keep the bare event name
+  (`"event": "Deposit"`).
+- `sieve inspect` prints each entry's `signature` and full `topic0`.
+- Configs for events with a unique name need no change: omitting `signature`
+  keeps the same tables, SQL, and archive resume fingerprint, so upgrading
+  needs no reset. Adding `signature` to an existing entry changes the archive
+  fingerprint. Renaming an event or changing its parameter types in the ABI
+  changes its topic0.
+- `sieve add-contract` writes one entry per overload, with its `signature`
+  and a numbered table (`<contract>_deposit_1`, `<contract>_deposit_2`, in ABI
+  order).
+- Factory creation events take no `signature`; to use an overloaded one,
+  point `factory.abi` at an ABI containing only the intended variant.
+
 ### Function Call Indexing
 
 ```toml
@@ -516,7 +562,7 @@ sieve init                     Scaffold a new project (sieve.toml, .env, abis/)
 sieve init --docker            Same + docker-compose.yml with PostgreSQL
 sieve schema                   Print generated SQL DDL
 sieve reset                    Drop and recreate all tables
-sieve inspect                  Dry-run: show tables, columns, and filters
+sieve inspect                  Dry-run: show tables, event signatures/topic0, columns, and filters
 sieve add-contract <ADDRESS>   Fetch ABI from Etherscan and add to config
 sieve peers [--chain <NAME>]   Test P2P connectivity (no DB or config needed)
 
@@ -559,7 +605,7 @@ All sensitive URLs live in `.env` (auto-loaded at startup via `dotenvy`). Never 
 
 ### `sieve add-contract`
 
-Fetches a verified ABI from Etherscan, saves it to `abis/`, and appends a `[[contracts]]` block to your config. Auto-detects proxy contracts. Automatically sets `start_block` to the contract's deploy block.
+Fetches a verified ABI from Etherscan, saves it to `abis/`, and appends a `[[contracts]]` block to your config. Auto-detects proxy contracts. Automatically sets `start_block` to the contract's deploy block. Overloaded events get one entry per `signature`, with numbered tables.
 
 ```bash
 sieve add-contract 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
@@ -569,7 +615,7 @@ sieve add-contract 0xA0b8... --start-block 21000000   # override start block
 
 ### `sieve inspect`
 
-Validates your config without a database connection. Shows what tables, columns, context fields, and filters would be created.
+Validates your config without a database connection. Shows what tables, columns, context fields, and filters would be created, and each event's canonical `signature` and `topic0`.
 
 ```bash
 sieve inspect --config sieve.toml
