@@ -7,11 +7,13 @@
 //! [`ConfigDrivenHandler`] is the TOML-driven implementation that generates
 //! SQL dynamically from resolved event definitions.
 
-use crate::decode::{DecodedEvent, DecodedParam};
-use crate::toml_config::{ContextField, ResolvedCall, ResolvedEvent, ResolvedTransfer};
+use crate::decode::{value_to_json, DecodedEvent, DecodedParam};
+use crate::toml_config::{
+    is_json_pg_type, ContextField, ResolvedCall, ResolvedColumn, ResolvedEvent, ResolvedTransfer,
+};
 use crate::types::{BlockNumber, TxIndex};
 use alloy_dyn_abi::DynSolValue;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{hex, Address, B256, U256};
 use async_trait::async_trait;
 use eyre::WrapErr;
 use sqlx::postgres::PgArguments;
@@ -460,19 +462,12 @@ fn bind_event_row<'q>(
         q = bind_context_field(q, *cf, context);
     }
 
-    for col in &resolved.columns {
-        let param = find_param(&event.indexed, &event.body, &col.param_name).ok_or_else(|| {
-            eyre::eyre!(
-                "param '{}' not found in decoded event {}.{}",
-                col.param_name,
-                event.contract_name,
-                event.event_name
-            )
-        })?;
-        q = bind_dyn_value(q, &param.value, &col.pg_type)?;
-    }
-
-    Ok(q)
+    bind_columns(q, &resolved.columns, &event.indexed, &event.body).wrap_err_with(|| {
+        format!(
+            "failed to bind event {}.{}",
+            event.contract_name, event.event_name
+        )
+    })
 }
 
 /// Bind all parameters for one transfer row to a query.
@@ -518,47 +513,49 @@ fn bind_call_row<'q>(
         q = bind_context_field(q, *cf, context);
     }
 
-    for col in &resolved.columns {
-        let param = call
-            .params
-            .iter()
-            .find(|p| p.name == col.param_name)
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "param '{}' not found in decoded call {}.{}",
-                    col.param_name,
-                    call.contract_name,
-                    call.function_name
-                )
-            })?;
-        q = bind_dyn_value(q, &param.value, &col.pg_type)?;
-    }
-
-    Ok(q)
+    bind_columns(q, &resolved.columns, &[], &call.params).wrap_err_with(|| {
+        format!(
+            "failed to bind call {}.{}",
+            call.contract_name, call.function_name
+        )
+    })
 }
 
 // ── DynSolValue binding ───────────────────────────────────────────────
 
-/// Find a parameter by name in the indexed or body params.
-#[must_use]
-fn find_param<'a>(
-    indexed: &'a [DecodedParam],
-    body: &'a [DecodedParam],
-    name: &str,
-) -> Option<&'a DecodedParam> {
-    indexed.iter().chain(body.iter()).find(|p| p.name == name)
+/// Bind each column's decoded value, located by its resolved source position.
+fn bind_columns<'q>(
+    mut query: Query<'q, Postgres, PgArguments>,
+    columns: &[ResolvedColumn],
+    indexed: &[DecodedParam],
+    body: &[DecodedParam],
+) -> eyre::Result<Query<'q, Postgres, PgArguments>> {
+    for col in columns {
+        let param = col.source.pick(indexed, body).ok_or_else(|| {
+            eyre::eyre!(
+                "no decoded value at {:?} for column '{}'",
+                col.source,
+                col.column_name
+            )
+        })?;
+        query = bind_dyn_value(query, &param.value, col)?;
+    }
+    Ok(query)
 }
 
-/// Bind a [`DynSolValue`] to a sqlx query based on the target Postgres type.
+/// Bind a [`DynSolValue`] to a sqlx query based on the column's Postgres type.
 ///
-/// Returns the query with the value bound. All values are converted to owned
-/// types to avoid lifetime issues. Unknown variants fall back to Debug
-/// formatting as text.
+/// JSON columns get the value's JSON form; other columns get scalars as before
+/// and arrays/tuples as serialized JSON text.
 fn bind_dyn_value<'q>(
     query: Query<'q, Postgres, PgArguments>,
     value: &DynSolValue,
-    pg_type: &str,
+    col: &ResolvedColumn,
 ) -> eyre::Result<Query<'q, Postgres, PgArguments>> {
+    if is_json_pg_type(&col.pg_type) {
+        return Ok(query.bind(sqlx::types::Json(value_to_json(value, &col.components)?)));
+    }
+    let pg_type = col.pg_type.as_str();
     match value {
         DynSolValue::Address(addr) => {
             let checksum = Address::to_checksum(addr, None);
@@ -588,10 +585,9 @@ fn bind_dyn_value<'q>(
             let bytes = word.as_slice()[..(*size)].to_vec();
             Ok(query.bind(bytes))
         }
-        // Fallback: Debug format for complex types
-        _ => {
-            let text = format!("{value:?}");
-            Ok(query.bind(text))
+        DynSolValue::Function(function) => Ok(query.bind(hex::encode_prefixed(function))),
+        DynSolValue::Array(_) | DynSolValue::FixedArray(_) | DynSolValue::Tuple(_) => {
+            Ok(query.bind(value_to_json(value, &col.components)?.to_string()))
         }
     }
 }
@@ -1246,68 +1242,56 @@ mod tests {
         assert!(extract_uint(&event.body, "nonexistent").is_err());
     }
 
+    fn column(pg_type: &str, source: crate::config::ParamSource) -> ResolvedColumn {
+        ResolvedColumn {
+            column_name: "c".to_string(),
+            param_name: "c".to_string(),
+            pg_type: pg_type.to_string(),
+            source,
+            components: vec![],
+        }
+    }
+
     #[test]
-    fn find_param_searches_indexed_and_body() {
+    fn bind_columns_errors_on_missing_source() {
+        use crate::config::ParamSource;
         let event = make_test_event();
-        assert!(find_param(&event.indexed, &event.body, "from").is_some());
-        assert!(find_param(&event.indexed, &event.body, "value").is_some());
-        assert!(find_param(&event.indexed, &event.body, "nonexistent").is_none());
+        for (source, ok) in [
+            (ParamSource::Indexed(1), true),
+            (ParamSource::Body(0), true),
+            (ParamSource::Indexed(2), false),
+            (ParamSource::Body(1), false),
+        ] {
+            let bound = bind_columns(
+                sqlx::query("SELECT $1"),
+                &[column("text", source)],
+                &event.indexed,
+                &event.body,
+            );
+            assert_eq!(bound.is_ok(), ok, "{source:?}");
+        }
     }
 
     #[test]
-    fn bind_dyn_value_address() -> eyre::Result<()> {
+    fn bind_dyn_value_accepts_every_value_kind() -> eyre::Result<()> {
         let addr = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-        let val = DynSolValue::Address(addr);
-        let query = sqlx::query("SELECT $1");
-        let _bound = bind_dyn_value(query, &val, "text")?;
-        Ok(())
-    }
-
-    #[test]
-    fn bind_dyn_value_bool() -> eyre::Result<()> {
-        let val = DynSolValue::Bool(true);
-        let query = sqlx::query("SELECT $1");
-        let _bound = bind_dyn_value(query, &val, "boolean")?;
-        Ok(())
-    }
-
-    #[test]
-    fn bind_dyn_value_uint_small() -> eyre::Result<()> {
-        let val = DynSolValue::Uint(U256::from(42u64), 64);
-        let query = sqlx::query("SELECT $1");
-        let _bound = bind_dyn_value(query, &val, "bigint")?;
-        Ok(())
-    }
-
-    #[test]
-    fn bind_dyn_value_uint_large() -> eyre::Result<()> {
-        let val = DynSolValue::Uint(U256::from(1_000_000u64), 256);
-        let query = sqlx::query("SELECT $1");
-        let _bound = bind_dyn_value(query, &val, "numeric")?;
-        Ok(())
-    }
-
-    #[test]
-    fn bind_dyn_value_int() -> eyre::Result<()> {
-        let val = DynSolValue::Int(I256::try_from(-42i64).unwrap_or_default(), 64);
-        let query = sqlx::query("SELECT $1");
-        let _bound = bind_dyn_value(query, &val, "bigint")?;
-        Ok(())
-    }
-
-    #[test]
-    fn bind_dyn_value_string() -> eyre::Result<()> {
-        let val = DynSolValue::String("hello".to_string());
-        let query = sqlx::query("SELECT $1");
-        let _bound = bind_dyn_value(query, &val, "text")?;
-        Ok(())
-    }
-
-    #[test]
-    fn bind_dyn_value_bytes() -> eyre::Result<()> {
-        let val = DynSolValue::Bytes(vec![1, 2, 3]);
-        let query = sqlx::query("SELECT $1");
-        let _bound = bind_dyn_value(query, &val, "bytea")?;
+        let array = DynSolValue::Array(vec![DynSolValue::Uint(U256::from(1u64), 128)]);
+        for (value, pg_type) in [
+            (DynSolValue::Address(addr), "text"),
+            (DynSolValue::Bool(true), "boolean"),
+            (DynSolValue::Uint(U256::from(42u64), 64), "bigint"),
+            (DynSolValue::Uint(U256::from(1_000_000u64), 256), "numeric"),
+            (DynSolValue::Int(I256::try_from(-42i64)?, 64), "bigint"),
+            (DynSolValue::String("hello".to_string()), "text"),
+            (DynSolValue::Bytes(vec![1, 2, 3]), "bytea"),
+            (array.clone(), "jsonb"),
+            (array.clone(), "json"),
+            (array, "text"),
+            (DynSolValue::FixedBytes(B256::repeat_byte(1), 32), "jsonb"),
+        ] {
+            let col = column(pg_type, crate::config::ParamSource::Body(0));
+            let _bound = bind_dyn_value(sqlx::query("SELECT $1"), &value, &col)?;
+        }
         Ok(())
     }
 

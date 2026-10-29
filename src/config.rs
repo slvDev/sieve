@@ -7,6 +7,7 @@
 use crate::toml_config::TopicFilter;
 use alloy_json_abi::{Event, Function, JsonAbi};
 use alloy_primitives::{Address, FixedBytes, B256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -112,6 +113,51 @@ pub fn select_event<'a>(
              parameter names). Candidates: {}",
             candidates.join(", "),
         )),
+    }
+}
+
+/// ABI name of an input or tuple component: its raw name, or `param_<position>` when unnamed.
+#[must_use]
+pub fn param_name(raw: &str, position: usize) -> Cow<'_, str> {
+    if raw.is_empty() {
+        Cow::Owned(format!("param_{position}"))
+    } else {
+        Cow::Borrowed(raw)
+    }
+}
+
+/// Where an ABI input's decoded value lives: its offset among indexed or body values.
+///
+/// Function inputs are all `Body`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamSource {
+    Indexed(usize),
+    Body(usize),
+}
+
+impl ParamSource {
+    /// Source of event input `position`, counting predecessors with the same `indexed` flag.
+    #[must_use]
+    pub fn of_event_input(inputs: &[alloy_json_abi::EventParam], position: usize) -> Self {
+        let indexed = inputs[position].indexed;
+        let offset = inputs[..position]
+            .iter()
+            .filter(|p| p.indexed == indexed)
+            .count();
+        if indexed {
+            Self::Indexed(offset)
+        } else {
+            Self::Body(offset)
+        }
+    }
+
+    /// The value at this source, if the decoded partitions hold it.
+    #[must_use]
+    pub fn pick<'a, T>(self, indexed: &'a [T], body: &'a [T]) -> Option<&'a T> {
+        match self {
+            Self::Indexed(offset) => indexed.get(offset),
+            Self::Body(offset) => body.get(offset),
+        }
     }
 }
 

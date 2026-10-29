@@ -9,7 +9,7 @@ use super::{BlockPayload, FetchItem};
 use crate::chain::{BaseChain, ChainTypes};
 use crate::handler::{EventContext, EventHandler};
 use alloy_consensus::{proofs, BlockBody, Receipt, Signed, TxLegacy};
-use alloy_primitives::{Address, Bytes, Signature, B256, U256};
+use alloy_primitives::{Address, Bytes, Signature, TxKind, B256, U256};
 use reth_chainspec::EthChainSpec;
 use reth_primitives_traits::{Header, SealedHeader};
 use std::{collections::HashSet, sync::Arc};
@@ -27,6 +27,7 @@ fn factory() -> eyre::Result<crate::toml_config::ResolvedFactory> {
         creation_selector: event.selector(),
         creation_event: event,
         child_address_param: "child".into(),
+        child_address_source: crate::config::ParamSource::Indexed(0),
         child_contract_name: "Child".into(),
         start_block: 100,
     })
@@ -62,16 +63,29 @@ pub fn fixture() -> eyre::Result<Vec<BlockPayload<BaseChain>>> {
 
 /// Linked, commitment-valid Base blocks from 100; non-empty blocks hold one tx carrying the logs.
 fn chain(blocks: Vec<Vec<alloy_primitives::Log>>) -> Vec<BlockPayload<BaseChain>> {
+    chain_with_calls(blocks.into_iter().map(|logs| (logs, None)).collect())
+}
+
+/// One block's logs plus an optional `(to, input)` call.
+type Block = (Vec<alloy_primitives::Log>, Option<(Address, Bytes)>);
+
+/// Like [`chain`]; a block's optional call becomes its transaction.
+fn chain_with_calls(blocks: Vec<Block>) -> Vec<BlockPayload<BaseChain>> {
     let mut parent = B256::repeat_byte(3);
     let mut result = Vec::with_capacity(blocks.len());
-    for (number, logs) in (100..).zip(blocks) {
-        let (transactions, receipts) = if logs.is_empty() {
+    for (number, (logs, call)) in (100..).zip(blocks) {
+        let (transactions, receipts) = if logs.is_empty() && call.is_none() {
             (vec![], vec![])
         } else {
+            let (to, input) = call.map_or((TxKind::Create, Bytes::new()), |(to, input)| {
+                (TxKind::Call(to), input)
+            });
             let tx = TxLegacy {
                 chain_id: Some(8453),
                 nonce: number,
                 gas_limit: 21_000,
+                to,
+                input,
                 ..Default::default()
             };
             let signed =
@@ -1006,5 +1020,416 @@ async fn factory_children_route_overloads_and_fan_out() -> eyre::Result<()> {
     .concat();
     expected.sort();
     assert_eq!(deliveries, expected);
+    Ok(())
+}
+
+/// Captures every streamed payload.
+struct Payloads(mpsc::UnboundedSender<crate::stream::EventPayload>);
+#[async_trait::async_trait]
+impl crate::stream::StreamSink for Payloads {
+    fn name(&self) -> &'static str {
+        "payloads"
+    }
+    async fn notify(&self, _: &crate::stream::BlockNotification) {}
+    async fn notify_events(&self, events: &[crate::stream::EventPayload]) {
+        for e in events {
+            let _ = self.0.send(e.clone());
+        }
+    }
+}
+
+/// Every user column of each event and call table, as JSON, sorted like `structured_rows`.
+///
+/// JSON columns come back as stored; other columns as JSON strings (booleans as booleans).
+async fn stored_rows(
+    db: &crate::db::Database,
+    resolved: &crate::toml_config::ResolvedConfig,
+) -> eyre::Result<Vec<crate::decode::tests::Row>> {
+    let tables = resolved
+        .resolved_events
+        .iter()
+        .map(|e| (&e.table_name, &e.columns, "log_index", "log_index"))
+        .chain(
+            resolved
+                .calls
+                .iter()
+                .map(|c| (&c.table_name, &c.columns, "-1", "tx_index")),
+        );
+    let mut rows = Vec::new();
+    for (table, columns, log_index, order) in tables {
+        let exprs: Vec<String> = columns
+            .iter()
+            .map(|c| match c.pg_type.as_str() {
+                "jsonb" => format!("\"{}\"", c.column_name),
+                "boolean" => format!("to_jsonb(\"{}\")", c.column_name),
+                _ => format!("to_jsonb(\"{}\"::text)", c.column_name),
+            })
+            .collect();
+        let sql = format!(
+            "SELECT {log_index}, jsonb_build_array({}) FROM {table} ORDER BY block_number, {order}",
+            exprs.join(", ")
+        );
+        let fetched: Vec<(i32, sqlx::types::Json<serde_json::Value>)> =
+            sqlx::query_as(&sql).fetch_all(db.pool()).await?;
+        for (log, sqlx::types::Json(values)) in fetched {
+            let serde_json::Value::Array(values) = values else {
+                return Err(eyre::eyre!("{table}: expected a JSON array row"));
+            };
+            let mut row: Vec<(String, serde_json::Value)> = columns
+                .iter()
+                .map(|c| c.column_name.clone())
+                .zip(values)
+                .collect();
+            // The explicit `type = "text"` column holds serialized JSON text.
+            if table == "gauges_allocated_text" {
+                let serde_json::Value::String(text) = &row[1].1 else {
+                    return Err(eyre::eyre!("allocations text column is not text"));
+                };
+                row[1].1 = serde_json::from_str(text)?;
+            }
+            rows.push((table.clone(), log, row));
+        }
+    }
+    rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    Ok(rows)
+}
+
+/// Run a GraphQL query with variables; errors fail the call.
+async fn graphql(
+    schema: &async_graphql::dynamic::Schema,
+    query: &str,
+    variables: serde_json::Value,
+) -> eyre::Result<serde_json::Value> {
+    let response = schema
+        .execute(
+            async_graphql::Request::new(query)
+                .variables(async_graphql::Variables::from_json(variables)),
+        )
+        .await;
+    eyre::ensure!(response.errors.is_empty(), "{:?}", response.errors);
+    Ok(response.data.into_json()?)
+}
+
+/// Structured fixture: resolved config, configured context, and its block 100 payload.
+async fn structured_context() -> eyre::Result<(
+    crate::toml_config::ResolvedConfig,
+    IngestionContext,
+    Vec<BlockPayload<BaseChain>>,
+)> {
+    use crate::decode::tests::{allocate_gauges_call, structured_dir, structured_logs};
+    let dir = structured_dir();
+    let config = crate::toml_config::load_config(&dir.join("sieve.toml"))?;
+    let resolved = crate::toml_config::resolve_config(&config, &dir)?;
+    let ctx = configured_context(&dir, 100, &config).await?;
+    let payloads = chain_with_calls(vec![(structured_logs(), Some(allocate_gauges_call()))]);
+    Ok((resolved, ctx, payloads))
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "storage, replay, GraphQL, rollback and stream assertions"
+)]
+async fn structured_values_store_and_stream_as_json() -> eyre::Result<()> {
+    use crate::decode::tests::structured_rows;
+    let (resolved, mut ctx, payloads) = structured_context().await?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    ctx.stream_dispatcher = Some(Arc::new(crate::stream::StreamDispatcher::new(
+        vec![(Box::new(Payloads(tx)), true)],
+        32,
+    )));
+    let headers: Vec<_> = payloads.iter().map(|p| p.header().clone()).collect();
+    let expected = structured_rows();
+    // Replaying the block over reset sync state stores nothing twice.
+    for run in 0..2 {
+        if run == 1 {
+            sqlx::raw_sql(RESET_SYNC_STATE)
+                .execute(ctx.db.pool())
+                .await?;
+        }
+        let outcome = ingest(&ctx, payloads.clone(), &headers).await?;
+        assert_eq!((outcome.events_stored, outcome.calls_stored), (9, 1));
+        assert_eq!(stored_rows(&ctx.db, &resolved).await?, expected);
+    }
+    let scalar = |sql: &'static str| sqlx::query_scalar::<_, String>(sql).fetch_one(ctx.db.pool());
+    assert_eq!(
+        scalar(
+            "SELECT allocations->0->>'allocated' FROM gauges_allocated ORDER BY log_index LIMIT 1"
+        )
+        .await?,
+        "1000"
+    );
+    assert_eq!(
+        scalar("SELECT param_4::text FROM pool_created").await?,
+        "17"
+    );
+    assert_eq!(
+        scalar("SELECT pg_typeof(allocations)::text FROM gauges_allocated_text LIMIT 1").await?,
+        "text"
+    );
+
+    let schema = crate::api::build_schema(
+        &resolved.resolved_events,
+        &resolved.transfers,
+        &resolved.calls,
+        ctx.db.pool().clone(),
+    )?;
+    let page = |after: &str| {
+        format!(
+            "{{ gauges_allocated(orderBy: allocations, orderDirection: ASC, first: 1{after}) \
+             {{ nodes {{ token_id allocations }} pageInfo {{ hasNextPage endCursor }} }} \
+             pool_created(first: 2) {{ nodes {{ param_4 }} }} }}"
+        )
+    };
+    let allocations = |token: &str| {
+        expected
+            .iter()
+            .find(|(table, _, cols)| table == "gauges_allocated" && cols[0].1 == token)
+            .map(|(_, _, cols)| cols[1].1.clone())
+            .ok_or_else(|| eyre::eyre!("no expected row for token {token}"))
+    };
+    // Text order follows the database collation; two pages must cover both rows once.
+    let mut pages = Vec::new();
+    let mut after = String::new();
+    for has_next in [true, false] {
+        let result = graphql(&schema, &page(&after), serde_json::json!({})).await?;
+        assert_eq!(result["pool_created"]["nodes"][0]["param_4"], "17");
+        let connection = &result["gauges_allocated"];
+        assert_eq!(connection["pageInfo"]["hasNextPage"], has_next);
+        let node = &connection["nodes"][0];
+        let (Some(token), Some(text)) = (node["token_id"].as_str(), node["allocations"].as_str())
+        else {
+            return Err(eyre::eyre!("expected String fields, got {node}"));
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text)?,
+            allocations(token)?
+        );
+        pages.push((token.to_owned(), text.to_owned()));
+        let cursor = connection["pageInfo"]["endCursor"]
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("no endCursor"))?;
+        after = format!(", after: \"{cursor}\"");
+    }
+    pages.sort();
+    let tokens: Vec<&str> = pages.iter().map(|(token, _)| token.as_str()).collect();
+    assert_eq!(tokens, ["7", "8"]);
+    let filtered = graphql(
+        &schema,
+        "query($a: String, $b: String) { \
+           eq: gauges_allocated(where: { allocations: $a }) { nodes { token_id } } \
+           any: gauges_allocated(where: { allocations_in: [$a, $b] }, orderBy: token_id) \
+             { nodes { token_id } } }",
+        serde_json::json!({ "a": pages[0].1, "b": pages[1].1 }),
+    )
+    .await?;
+    assert_eq!(
+        filtered,
+        serde_json::json!({
+            "eq": { "nodes": [{ "token_id": "7" }] },
+            "any": { "nodes": [{ "token_id": "8" }, { "token_id": "7" }] },
+        })
+    );
+
+    super::follow::rollback_to_ancestor(
+        &ctx.db,
+        &ctx.handlers,
+        &ctx.transfer_handlers,
+        &ctx.call_handlers,
+        &ctx.config,
+        99,
+    )
+    .await?;
+    assert!(stored_rows(&ctx.db, &resolved).await?.is_empty());
+    drop(ctx);
+
+    // Stream data uses raw or generated ABI names and equals the stored JSON.
+    let delivered = messages(rx).await?;
+    assert_eq!(delivered.len(), 2 * expected.len());
+    for payload in &delivered {
+        let log = payload.log_index.map_or(-1, |i| i as i32);
+        let (_, _, row) = expected
+            .iter()
+            .find(|(table, l, _)| *table == payload.table && *l == log)
+            .ok_or_else(|| eyre::eyre!("unexpected payload {} {log}", payload.table))?;
+        let columns = resolved
+            .resolved_events
+            .iter()
+            .map(|e| (&e.table_name, &e.columns))
+            .chain(resolved.calls.iter().map(|c| (&c.table_name, &c.columns)))
+            .find(|(table, _)| **table == payload.table)
+            .map(|(_, columns)| columns)
+            .ok_or_else(|| eyre::eyre!("no table {}", payload.table))?;
+        for (col, (_, stored)) in columns.iter().zip(row) {
+            assert_eq!(
+                payload.data.get(&col.param_name),
+                Some(stored),
+                "{} {}",
+                payload.table,
+                col.param_name
+            );
+        }
+    }
+    let pool = delivered
+        .iter()
+        .find(|p| p.table == "pool_created")
+        .ok_or_else(|| eyre::eyre!("no pool_created payload"))?;
+    let mut keys: Vec<&str> = pool.data.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["param_4", "pool", "stable", "token0", "token1"]);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SIEVE_PHASE2_DATABASE_URL; run serially"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "legacy DDL setup, batch and single-row writes, GraphQL reads"
+)]
+async fn legacy_text_columns_keep_debug_rows_and_take_json_text() -> eyre::Result<()> {
+    use crate::decode::tests::{structured_logs, structured_rows};
+    use crate::handler::ConfigDrivenHandler;
+    const DEBUG_ROW: &str = "Array([Tuple([Address(0x1111111111111111111111111111111111111111), \
+                             Uint(1000, 128), Bytes(0x)])])";
+    let (resolved, ctx, payloads) = structured_context().await?;
+    let event = resolved
+        .resolved_events
+        .iter()
+        .find(|e| e.table_name == "gauges_allocated")
+        .ok_or_else(|| eyre::eyre!("no gauges_allocated"))?;
+    let call = &resolved.calls[0];
+    // v0.3.4 created these columns as text and stored Rust Debug text.
+    for (table, ddl, column) in [
+        (&event.table_name, &event.create_table_sql, "allocations"),
+        (&call.table_name, &call.create_table_sql, "gauges"),
+    ] {
+        let legacy = ddl.replace(
+            &format!("\"{column}\" jsonb"),
+            &format!("\"{column}\" text"),
+        );
+        eyre::ensure!(legacy != *ddl, "{table} DDL has no jsonb {column}");
+        sqlx::raw_sql(&format!("DROP TABLE {table}; {legacy}"))
+            .execute(ctx.db.pool())
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO gauges_allocated (block_number, tx_hash, tx_index, log_index, token_id, \
+         allocations, emissions_per_vp) VALUES (50, '\\x00', 0, 0, 1, $1, 0)",
+    )
+    .bind(DEBUG_ROW)
+    .execute(ctx.db.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO allocate_gauges_calls (block_number, tx_hash, tx_index, token_id, gauges) \
+         VALUES (50, '\\x00', 0, 1, $1)",
+    )
+    .bind(DEBUG_ROW)
+    .execute(ctx.db.pool())
+    .await?;
+    // Startup DDL leaves existing tables alone.
+    crate::db::create_user_tables(&ctx.db, &resolved.resolved_events).await?;
+    crate::db::create_call_tables(&ctx.db, &resolved.calls).await?;
+
+    // Batch path: block 100 through the pipeline.
+    let headers: Vec<_> = payloads.iter().map(|p| p.header().clone()).collect();
+    ingest(&ctx, payloads, &headers).await?;
+    assert_eq!(
+        ctx.db.last_checkpoint().await?,
+        Some(crate::types::BlockNumber::new(100))
+    );
+
+    // Single-row path: block 101 through the handler's own INSERT.
+    let log = structured_logs()[1].clone();
+    let contract = ctx
+        .config
+        .contract_for_address(&log.address)
+        .ok_or_else(|| eyre::eyre!("no LeafVoter"))?;
+    let decoded = crate::decode::decode_log(
+        &crate::filter::FilteredLog {
+            log,
+            block_number: crate::types::BlockNumber::new(101),
+            block_timestamp: 0,
+            tx_hash: B256::ZERO,
+            tx_index: crate::types::TxIndex::new(0),
+            log_index: crate::types::LogIndex::new(0),
+        },
+        contract,
+    )?;
+    let context = EventContext {
+        block_timestamp: 0,
+        block_hash: B256::ZERO,
+        tx_from: Address::ZERO,
+        tx_to: None,
+        tx_value: U256::ZERO,
+        tx_gas_price: 0,
+        tx_gas_used: 0,
+        tx_nonce: 0,
+        cumulative_gas_used: 0,
+        tx_status: true,
+    };
+    let mut tx = ctx.db.begin().await?;
+    ConfigDrivenHandler::new(event.clone())
+        .handle(&decoded, &context, &mut tx)
+        .await?;
+    tx.commit().await?;
+
+    let expected = structured_rows();
+    let allocations = |table: &str, log: i32| {
+        expected
+            .iter()
+            .find(|(t, l, _)| t == table && *l == log)
+            .map(|(_, _, cols)| cols[1].1.clone())
+            .ok_or_else(|| eyre::eyre!("no expected {table} {log}"))
+    };
+    let stored: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT block_number, allocations FROM gauges_allocated ORDER BY block_number, log_index",
+    )
+    .fetch_all(ctx.db.pool())
+    .await?;
+    assert_eq!(stored.len(), 4);
+    assert_eq!(stored[0], (50, DEBUG_ROW.to_owned()));
+    for ((block, text), log) in stored[1..].iter().zip([1, 2, 1]) {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text)?,
+            allocations("gauges_allocated", log)?,
+            "block {block}"
+        );
+    }
+    let calls: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT block_number, gauges FROM allocate_gauges_calls ORDER BY block_number",
+    )
+    .fetch_all(ctx.db.pool())
+    .await?;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], (50, DEBUG_ROW.to_owned()));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&calls[1].1)?,
+        allocations("allocate_gauges_calls", -1)?
+    );
+
+    // GraphQL reads legacy Debug and JSON text rows as Strings, filtering and sorting as text.
+    let schema = crate::api::build_schema(
+        &resolved.resolved_events,
+        &resolved.transfers,
+        &resolved.calls,
+        ctx.db.pool().clone(),
+    )?;
+    let result = graphql(
+        &schema,
+        "query($debug: String) { \
+           sorted: gauges_allocated(orderBy: allocations, orderDirection: ASC, first: 1) \
+             { nodes { block_number allocations } } \
+           debug: allocate_gauges_calls(where: { gauges: $debug }) { nodes { block_number } } }",
+        serde_json::json!({ "debug": DEBUG_ROW }),
+    )
+    .await?;
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "sorted": { "nodes": [{ "block_number": "50", "allocations": DEBUG_ROW }] },
+            "debug": { "nodes": [{ "block_number": "50" }] },
+        })
+    );
     Ok(())
 }

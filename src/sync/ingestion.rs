@@ -2,8 +2,8 @@
 
 use super::engine::SyncOutcome;
 use crate::chain::ChainTypes;
-use crate::config::IndexConfig;
 use crate::config::Selector;
+use crate::config::{param_name, IndexConfig};
 use crate::db::{self, Database};
 use crate::decode::DecodedParam;
 use crate::handler::{
@@ -1251,11 +1251,17 @@ async fn prepare_block_outcome<'a, C: ChainTypes>(
         }
         let event_context =
             build_event_context(&block.payload, block.block_hash, event, &mut sender_cache)?;
+        let data = if ctx.has_streams {
+            Some(event_data(ctx.config, event)?)
+        } else {
+            None
+        };
         for table in &matched_tables {
             track_table(&mut table_counts, table, &event.event_name);
-            if ctx.has_streams {
+            if let Some(data) = &data {
                 event_payloads.push(build_event_payload(
                     event,
+                    data.clone(),
                     &event_context,
                     table,
                     ctx.receipt_tables.contains(*table),
@@ -1378,21 +1384,41 @@ fn track_table(table_counts: &mut HashMap<String, (String, u64)>, table: &str, l
     entry.1 = entry.1.saturating_add(1);
 }
 
+/// Stream `data` for a decoded event, keyed and shaped by its selected ABI event.
+fn event_data(
+    config: &IndexConfig,
+    event: &decode::DecodedEvent,
+) -> eyre::Result<serde_json::Map<String, serde_json::Value>> {
+    let abi = config
+        .contract_for_address(&event.contract_address)
+        .and_then(|contract| contract.events.get(&event.topic0))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "no ABI for decoded event {}.{}",
+                event.contract_name,
+                event.event_name
+            )
+        })?;
+    let indexed_inputs = abi.inputs.iter().filter(|p| p.indexed);
+    let body_inputs = abi.inputs.iter().filter(|p| !p.indexed);
+    decode::params_to_json(
+        event
+            .indexed
+            .iter()
+            .zip(indexed_inputs)
+            .chain(event.body.iter().zip(body_inputs))
+            .map(|(param, input)| (param, input.components.as_slice())),
+    )
+}
+
 /// Build the [`EventPayload`] for a decoded event stored in `table`.
 fn build_event_payload(
     event: &decode::DecodedEvent,
+    data: serde_json::Map<String, serde_json::Value>,
     context: &EventContext,
     table: &str,
     include: bool,
 ) -> crate::stream::EventPayload {
-    let mut data = serde_json::Map::new();
-    for param in event.indexed.iter().chain(event.body.iter()) {
-        data.insert(
-            param.name.clone(),
-            crate::stream::dyn_sol_to_json(&param.value),
-        );
-    }
-
     crate::stream::EventPayload {
         table: table.to_owned(),
         event: event.event_name.clone(),
@@ -1459,18 +1485,11 @@ fn build_transfer_payload(
 /// Build an [`EventPayload`] from a decoded function call.
 fn build_call_payload(
     call: &DecodedCall,
+    data: serde_json::Map<String, serde_json::Value>,
     context: &EventContext,
     table_name: &str,
     include: bool,
 ) -> crate::stream::EventPayload {
-    let mut data = serde_json::Map::new();
-    for param in &call.params {
-        data.insert(
-            param.name.clone(),
-            crate::stream::dyn_sol_to_json(&param.value),
-        );
-    }
-
     crate::stream::EventPayload {
         table: table_name.to_string(),
         event: call.function_name.clone(),
@@ -1789,8 +1808,9 @@ fn scan_calls<C: ChainTypes>(
             .inputs
             .iter()
             .zip(decoded_values)
-            .map(|(input_param, value)| DecodedParam {
-                name: input_param.name.clone(),
+            .enumerate()
+            .map(|(position, (input_param, value))| DecodedParam {
+                name: param_name(&input_param.name, position).into_owned(),
                 solidity_type: input_param.ty.clone(),
                 value,
             })
@@ -1840,12 +1860,13 @@ fn scan_calls<C: ChainTypes>(
         count = count.saturating_add(track_call_tables(
             &matched_tables,
             &decoded_call,
+            function,
             &context,
             has_streams,
             event_payloads,
             table_counts,
             receipt_tables,
-        ));
+        )?);
 
         all_calls.push((decoded_call, context));
     }
@@ -1854,28 +1875,45 @@ fn scan_calls<C: ChainTypes>(
 }
 
 /// Track per-table call counts and optionally build stream payloads.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "payload data needs the call's ABI function"
+)]
 fn track_call_tables(
     matched_tables: &[&str],
     decoded_call: &DecodedCall,
+    function: &alloy_json_abi::Function,
     context: &EventContext,
     has_streams: bool,
     event_payloads: &mut Vec<crate::stream::EventPayload>,
     table_counts: &mut HashMap<String, (String, u64)>,
     receipt_tables: &HashSet<String>,
-) -> u64 {
+) -> eyre::Result<u64> {
+    let data = if has_streams {
+        Some(decode::params_to_json(
+            decoded_call
+                .params
+                .iter()
+                .zip(&function.inputs)
+                .map(|(param, input)| (param, input.components.as_slice())),
+        )?)
+    } else {
+        None
+    };
     for table_name in matched_tables {
         track_table(table_counts, table_name, &decoded_call.function_name);
-        if has_streams {
+        if let Some(data) = &data {
             let include = receipt_tables.contains(*table_name);
             event_payloads.push(build_call_payload(
                 decoded_call,
+                data.clone(),
                 context,
                 table_name,
                 include,
             ));
         }
     }
-    matched_tables.len() as u64
+    Ok(matched_tables.len() as u64)
 }
 
 /// Decode matched logs into events, logging any decode failures.
@@ -2032,6 +2070,7 @@ mod tests {
             creation_event: creation_event.clone(),
             creation_selector: creation_event.selector(),
             child_address_param: "pool".to_owned(),
+            child_address_source: crate::config::ParamSource::Indexed(0),
             child_contract_name: "Pool".to_owned(),
             start_block: 100,
         };

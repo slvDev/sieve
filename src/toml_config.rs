@@ -3,8 +3,8 @@
 //! Reads `sieve.toml`, parses contract/event definitions, resolves ABI files,
 //! and produces [`IndexConfig`] + [`ResolvedEvent`] structs for the pipeline.
 
-use crate::config::{select_event, ContractConfig, IndexConfig};
-use alloy_json_abi::{Event, JsonAbi};
+use crate::config::{param_name, select_event, ContractConfig, IndexConfig, ParamSource};
+use alloy_json_abi::{Event, Function, JsonAbi, Param};
 use alloy_primitives::{Address, B256};
 use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
@@ -306,10 +306,14 @@ impl ContextField {
 pub struct ResolvedColumn {
     /// Postgres column name.
     pub column_name: String,
-    /// ABI parameter name.
+    /// ABI input name: the raw name, or `param_<position>` when unnamed.
     pub param_name: String,
-    /// Postgres type (e.g. "text", "numeric", "bigint", "boolean", "bytea").
+    /// Postgres type (e.g. "text", "numeric", "bigint", "boolean", "bytea", "jsonb").
     pub pg_type: String,
+    /// Where the input's decoded value lives.
+    pub source: ParamSource,
+    /// Tuple components of the input's type; they name JSON object keys.
+    pub components: Vec<Param>,
 }
 
 /// Resolved output from TOML config resolution.
@@ -355,8 +359,10 @@ pub struct ResolvedFactory {
     pub creation_event: alloy_json_abi::Event,
     /// Topic0 selector for the creation event.
     pub creation_selector: alloy_primitives::B256,
-    /// Name of the ABI parameter holding the child address.
+    /// Configured `param` token naming the child-address input (part of the fingerprint).
     pub child_address_param: String,
+    /// Where the child address's decoded value lives.
+    pub child_address_source: ParamSource,
     /// Name of the child contract (for handler/table lookup).
     pub child_contract_name: String,
     /// Block number to start scanning for factory events.
@@ -367,8 +373,8 @@ impl ResolvedFactory {
     /// Stable description of the child-extraction rule.
     ///
     /// The creation-event selector alone does not pin down extraction: it
-    /// hashes parameter TYPES only, while `decode_child_address` selects a
-    /// value by parameter NAME and its indexed/body position. The full
+    /// hashes parameter TYPES only, while extraction reads the value at the
+    /// configured parameter's indexed/body position. The full
     /// signature (names, types, and `indexed` flags in order) plus the
     /// selected parameter therefore fully determines which address gets
     /// extracted — any ABI edit that changes it invalidates previously
@@ -487,6 +493,9 @@ pub struct ResolvedEvent {
 #[must_use]
 fn default_pg_type(solidity_type: &str) -> &'static str {
     match solidity_type {
+        // Arrays and tuples are JSON; checked first so `bytes32[2]` is not bytea.
+        s if s.ends_with(']') || s.starts_with("tuple") => "jsonb",
+
         "bool" => "boolean",
 
         "address" | "string" => "text",
@@ -1531,18 +1540,10 @@ fn resolve_event<'a>(
         &toml_event.name,
         include_receipts,
     )?;
-    let columns = resolve_columns(
-        toml_event.columns.as_deref(),
-        abi_event,
-        contract_name,
-        &toml_event.name,
-    )?;
-    let topic_filters = resolve_topic_filters(
-        toml_event.filter.as_ref(),
-        abi_event,
-        contract_name,
-        &toml_event.name,
-    )?;
+    let owner = format!("event '{contract_name}.{}'", toml_event.name);
+    let inputs = event_inputs(abi_event, &owner)?;
+    let columns = resolve_columns(toml_event.columns.as_deref(), &inputs, &owner)?;
+    let topic_filters = resolve_topic_filters(toml_event.filter.as_ref(), &inputs, &owner)?;
 
     let create_table_sql = generate_create_table_sql(
         &toml_event.table,
@@ -1634,32 +1635,24 @@ fn resolve_factory(
         ));
     }
 
-    let param = creation_event
-        .inputs
-        .iter()
-        .find(|p| p.name == factory.param)
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "factory param '{}' not found in event '{}' for contract '{contract_name}'",
-                factory.param,
-                factory.event,
-            )
-        })?;
+    let owner = format!("event '{}' for contract '{contract_name}'", factory.event);
+    let inputs = event_inputs(creation_event, &owner)?;
+    let input = &inputs[select_input(&inputs, &factory.param, "factory param", &owner)?];
     // Runtime decoding only accepts address values; any other Solidity
     // type would silently produce zero children forever.
-    if param.ty != "address" {
+    if input.ty != "address" {
         return Err(eyre::eyre!(
-            "factory param '{}' in event '{}' for contract '{contract_name}' has type '{}', \
+            "factory param '{}' in {owner} has type '{}', \
              but the child address param must be of type 'address'",
             factory.param,
-            factory.event,
-            param.ty,
+            input.ty,
         ));
     }
 
     Ok(ResolvedFactory {
         factory_address,
         creation_selector: creation_event.selector(),
+        child_address_source: input.source,
         creation_event: creation_event.clone(),
         child_address_param: factory.param.clone(),
         child_contract_name: contract_name.to_owned(),
@@ -1709,12 +1702,9 @@ fn resolve_call(
         &toml_call.name,
         include_receipts,
     )?;
-    let columns = resolve_call_columns(
-        toml_call.columns.as_deref(),
-        abi_function,
-        contract_name,
-        &toml_call.name,
-    )?;
+    let owner = format!("function '{contract_name}.{}'", toml_call.name);
+    let inputs = function_inputs(abi_function, &owner)?;
+    let columns = resolve_columns(toml_call.columns.as_deref(), &inputs, &owner)?;
 
     let create_table_sql = generate_call_create_table_sql(
         &toml_call.table,
@@ -1748,77 +1738,138 @@ fn resolve_call(
     Ok(())
 }
 
-/// Resolve columns for a function call: either from explicit TOML definitions
-/// or auto-generated from all ABI function input parameters.
+/// One ABI input as column, filter and factory resolution see it.
+struct AbiInput<'a> {
+    /// Raw ABI name; empty when unnamed.
+    raw_name: &'a str,
+    ty: &'a str,
+    components: &'a [Param],
+    source: ParamSource,
+}
+
+/// An event's inputs, after checking their names for collisions.
 ///
 /// # Errors
 ///
-/// Returns an error if a column param is not found in the function inputs,
-/// or if a column name fails identifier validation.
-fn resolve_call_columns(
-    toml_columns: Option<&[TomlColumn]>,
-    abi_function: &alloy_json_abi::Function,
-    contract_name: &str,
-    function_name: &str,
-) -> eyre::Result<Vec<ResolvedColumn>> {
-    let resolved = match toml_columns {
-        Some(cols) => {
-            let mut resolved = Vec::with_capacity(cols.len());
-            for col in cols {
-                let abi_param = abi_function
-                    .inputs
-                    .iter()
-                    .find(|p| p.name == col.param)
-                    .ok_or_else(|| {
-                        eyre::eyre!(
-                            "param '{}' not found in function '{}.{}'",
-                            col.param,
-                            contract_name,
-                            function_name
-                        )
-                    })?;
+/// Returns an error if two names (raw or generated) collide at any tuple level.
+fn event_inputs<'a>(event: &'a Event, owner: &str) -> eyre::Result<Vec<AbiInput<'a>>> {
+    let inputs: Vec<AbiInput<'a>> = event
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(position, p)| AbiInput {
+            raw_name: &p.name,
+            ty: &p.ty,
+            components: &p.components,
+            source: ParamSource::of_event_input(&event.inputs, position),
+        })
+        .collect();
+    check_input_names(&inputs, owner)?;
+    Ok(inputs)
+}
 
-                let column_name = col
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| abi_param_to_snake_case(&col.param));
-                if let Some(ref explicit_name) = col.name {
-                    validate_identifier(explicit_name, "column")?;
-                    if RESERVED_COLUMNS.contains(&explicit_name.as_str()) {
-                        return Err(eyre::eyre!(
-                            "column name '{explicit_name}' conflicts with a reserved schema column"
-                        ));
-                    }
-                }
-                let pg_type = col
-                    .pg_type
-                    .clone()
-                    .unwrap_or_else(|| default_pg_type(&abi_param.ty).to_string());
+/// A function's inputs, after checking their names for collisions.
+///
+/// # Errors
+///
+/// Returns an error if two names (raw or generated) collide at any tuple level.
+fn function_inputs<'a>(function: &'a Function, owner: &str) -> eyre::Result<Vec<AbiInput<'a>>> {
+    let inputs: Vec<AbiInput<'a>> = function
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(position, p)| AbiInput {
+            raw_name: &p.name,
+            ty: &p.ty,
+            components: &p.components,
+            source: ParamSource::Body(position),
+        })
+        .collect();
+    check_input_names(&inputs, owner)?;
+    Ok(inputs)
+}
 
-                resolved.push(ResolvedColumn {
-                    column_name,
-                    param_name: col.param.clone(),
-                    pg_type,
-                });
-            }
-            resolved
+fn check_input_names(inputs: &[AbiInput<'_>], owner: &str) -> eyre::Result<()> {
+    check_sibling_names(inputs.iter().map(|input| input.raw_name), owner)?;
+    inputs
+        .iter()
+        .try_for_each(|input| check_component_names(input.components, owner))
+}
+
+fn check_component_names(components: &[Param], owner: &str) -> eyre::Result<()> {
+    check_sibling_names(components.iter().map(|c| c.name.as_str()), owner)?;
+    components
+        .iter()
+        .try_for_each(|c| check_component_names(&c.components, owner))
+}
+
+/// Reject sibling inputs or tuple components whose names (raw or `param_<i>`) collide.
+fn check_sibling_names<'a>(
+    raw_names: impl Iterator<Item = &'a str>,
+    owner: &str,
+) -> eyre::Result<()> {
+    let mut seen = HashMap::new();
+    for (position, raw) in raw_names.enumerate() {
+        let name = param_name(raw, position);
+        if let Some(first) = seen.insert(name.clone(), position) {
+            return Err(eyre::eyre!(
+                "{owner} has two parameters named '{name}' at sibling positions {first} and \
+                 {position} (unnamed parameters are named param_<position>)"
+            ));
         }
-        None => {
-            let mut resolved = Vec::with_capacity(abi_function.inputs.len());
-            for param in &abi_function.inputs {
-                let column_name = abi_param_to_snake_case(&param.name);
-                resolved.push(ResolvedColumn {
-                    column_name,
-                    param_name: param.name.clone(),
-                    pg_type: default_pg_type(&param.ty).to_string(),
-                });
-            }
-            resolved
-        }
+    }
+    Ok(())
+}
+
+/// Position of the input a config entry selects: by raw or generated name, or `""` for
+/// the only unnamed input.
+///
+/// # Errors
+///
+/// Returns an error listing the input names if nothing or more than one input matches.
+fn select_input(
+    inputs: &[AbiInput<'_>],
+    wanted: &str,
+    kind: &str,
+    owner: &str,
+) -> eyre::Result<usize> {
+    let names = || {
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(position, input)| param_name(input.raw_name, position))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let ctx = format!("function '{contract_name}.{function_name}'");
-    check_duplicate_columns(&resolved, &ctx)?;
-    Ok(resolved)
+    if wanted.is_empty() {
+        let unnamed: Vec<usize> = (0..inputs.len())
+            .filter(|&position| inputs[position].raw_name.is_empty())
+            .collect();
+        return match unnamed[..] {
+            [only] => Ok(only),
+            [] => Err(eyre::eyre!(
+                "{kind} '' selects an unnamed input, but {owner} has none; inputs: {}",
+                names()
+            )),
+            _ => Err(eyre::eyre!(
+                "{kind} '' is ambiguous in {owner}: {} inputs are unnamed; select one of: {}",
+                unnamed.len(),
+                unnamed
+                    .iter()
+                    .map(|position| format!("param_{position}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        };
+    }
+    (0..inputs.len())
+        .find(|&position| param_name(inputs[position].raw_name, position) == wanted)
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{kind} '{wanted}' not found in {owner}; inputs: {}",
+                names()
+            )
+        })
 }
 
 /// Check for duplicate column names after snake_case conversion.
@@ -1841,43 +1892,24 @@ fn check_duplicate_columns(columns: &[ResolvedColumn], context: &str) -> eyre::R
     Ok(())
 }
 
-/// Resolve columns for an event: either from explicit TOML definitions or
-/// auto-generated from all ABI parameters.
+/// Resolve columns for an event or function: either from explicit TOML
+/// definitions or auto-generated from all ABI inputs.
 ///
 /// # Errors
 ///
-/// Returns an error if a column param is not found in the ABI event inputs,
-/// or if a column name fails identifier validation.
+/// Returns an error if a column param selects no input, or if a column name
+/// fails identifier validation or collides.
 fn resolve_columns(
     toml_columns: Option<&[TomlColumn]>,
-    abi_event: &alloy_json_abi::Event,
-    contract_name: &str,
-    event_name: &str,
+    inputs: &[AbiInput<'_>],
+    owner: &str,
 ) -> eyre::Result<Vec<ResolvedColumn>> {
     let resolved = match toml_columns {
         Some(cols) => {
-            // Explicit columns
             let mut resolved = Vec::with_capacity(cols.len());
             for col in cols {
-                // Find param in ABI inputs
-                let abi_param = abi_event
-                    .inputs
-                    .iter()
-                    .find(|p| p.name == col.param)
-                    .ok_or_else(|| {
-                        eyre::eyre!(
-                            "param '{}' not found in event '{}.{}'",
-                            col.param,
-                            contract_name,
-                            event_name
-                        )
-                    })?;
-
-                let column_name = col
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| abi_param_to_snake_case(&col.param));
-                if let Some(ref explicit_name) = col.name {
+                let position = select_input(inputs, &col.param, "param", owner)?;
+                if let Some(explicit_name) = &col.name {
                     validate_identifier(explicit_name, "column")?;
                     if RESERVED_COLUMNS.contains(&explicit_name.as_str()) {
                         return Err(eyre::eyre!(
@@ -1885,36 +1917,39 @@ fn resolve_columns(
                         ));
                     }
                 }
-                let pg_type = col
-                    .pg_type
-                    .clone()
-                    .unwrap_or_else(|| default_pg_type(&abi_param.ty).to_string());
-
-                resolved.push(ResolvedColumn {
-                    column_name,
-                    param_name: col.param.clone(),
-                    pg_type,
-                });
+                resolved.push(resolved_column(
+                    inputs,
+                    position,
+                    col.name.clone(),
+                    col.pg_type.clone(),
+                ));
             }
             resolved
         }
-        None => {
-            // Auto-generate from all ABI params
-            let mut resolved = Vec::with_capacity(abi_event.inputs.len());
-            for param in &abi_event.inputs {
-                let column_name = abi_param_to_snake_case(&param.name);
-                resolved.push(ResolvedColumn {
-                    column_name,
-                    param_name: param.name.clone(),
-                    pg_type: default_pg_type(&param.ty).to_string(),
-                });
-            }
-            resolved
-        }
+        None => (0..inputs.len())
+            .map(|position| resolved_column(inputs, position, None, None))
+            .collect(),
     };
-    let ctx = format!("event '{contract_name}.{event_name}'");
-    check_duplicate_columns(&resolved, &ctx)?;
+    check_duplicate_columns(&resolved, owner)?;
     Ok(resolved)
+}
+
+/// Column for input `position`, defaulting the SQL name and type from the ABI.
+fn resolved_column(
+    inputs: &[AbiInput<'_>],
+    position: usize,
+    column_name: Option<String>,
+    pg_type: Option<String>,
+) -> ResolvedColumn {
+    let input = &inputs[position];
+    let param_name = param_name(input.raw_name, position).into_owned();
+    ResolvedColumn {
+        column_name: column_name.unwrap_or_else(|| abi_param_to_snake_case(&param_name)),
+        pg_type: pg_type.unwrap_or_else(|| default_pg_type(input.ty).to_owned()),
+        param_name,
+        source: input.source,
+        components: input.components.to_vec(),
+    }
 }
 
 /// Resolve context fields from optional TOML string list.
@@ -1964,19 +1999,18 @@ fn resolve_context_fields(
 
 /// Resolve topic filters from TOML filter map.
 ///
-/// Validates that each key names an indexed parameter in the event ABI,
-/// computes the topic index (1-based among indexed params), and encodes
-/// each value as a left-padded `B256` according to the Solidity type.
+/// Validates that each key selects an indexed input, takes its topic index
+/// (1-based among indexed inputs), and encodes each value as a left-padded
+/// `B256` according to the Solidity type.
 ///
 /// # Errors
 ///
-/// Returns an error if a param name is not found, is not indexed, or a
+/// Returns an error if a key selects no input, the input is not indexed, or a
 /// value fails to parse.
 fn resolve_topic_filters(
     filter: Option<&HashMap<String, Vec<String>>>,
-    abi_event: &alloy_json_abi::Event,
-    contract_name: &str,
-    event_name: &str,
+    inputs: &[AbiInput<'_>],
+    owner: &str,
 ) -> eyre::Result<Vec<TopicFilter>> {
     let Some(filter) = filter else {
         return Ok(Vec::new());
@@ -1984,50 +2018,29 @@ fn resolve_topic_filters(
 
     let mut topic_filters = Vec::with_capacity(filter.len());
 
-    for (param_name, raw_values) in filter {
-        // Find the param in the ABI and verify it's indexed
-        let param = abi_event
-            .inputs
-            .iter()
-            .find(|p| p.name == *param_name)
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "filter param '{param_name}' not found in event \
-                     '{contract_name}.{event_name}'"
-                )
-            })?;
-
-        if !param.indexed {
+    for (key, raw_values) in filter {
+        let input = &inputs[select_input(inputs, key, "filter param", owner)?];
+        let ParamSource::Indexed(offset) = input.source else {
             return Err(eyre::eyre!(
-                "filter param '{param_name}' in event '{contract_name}.{event_name}' \
+                "filter param '{key}' in {owner} \
                  is not indexed (only indexed params can be filtered by topic)"
             ));
-        }
-
-        // Compute topic index: count indexed params that come before this one, + 1
-        let topic_index = abi_event
-            .inputs
-            .iter()
-            .take_while(|p| p.name != *param_name)
-            .filter(|p| p.indexed)
-            .count()
-            + 1;
+        };
 
         // Encode each value as B256 based on Solidity type
         let mut values = HashSet::with_capacity(raw_values.len());
         for raw in raw_values {
-            let b256 = encode_topic_value(raw, &param.ty).wrap_err_with(|| {
+            let b256 = encode_topic_value(raw, input.ty).wrap_err_with(|| {
                 format!(
-                    "invalid filter value '{raw}' for param '{param_name}' \
-                     (type {}) in event '{contract_name}.{event_name}'",
-                    param.ty
+                    "invalid filter value '{raw}' for param '{key}' (type {}) in {owner}",
+                    input.ty
                 )
             })?;
             values.insert(b256);
         }
 
         topic_filters.push(TopicFilter {
-            topic_index,
+            topic_index: offset + 1,
             values,
         });
     }
@@ -2194,7 +2207,25 @@ table = "usdc_approvals"
 
     #[test]
     fn type_mapping_unknown_fallback() {
-        assert_eq!(default_pg_type("tuple"), "text");
+        assert_eq!(default_pg_type("function"), "text");
+    }
+
+    #[test]
+    fn type_mapping_arrays_and_tuples_are_jsonb() {
+        for ty in [
+            "tuple",
+            "tuple[]",
+            "tuple[2]",
+            "uint256[]",
+            "int128[3]",
+            "address[]",
+            "bytes[]",
+            "bytes32[2]",
+            "bool[][]",
+            "string[]",
+        ] {
+            assert_eq!(default_pg_type(ty), "jsonb", "{ty}");
+        }
     }
 
     #[test]
@@ -2212,11 +2243,15 @@ table = "usdc_approvals"
                 column_name: "from_address".to_string(),
                 param_name: "from".to_string(),
                 pg_type: "text".to_string(),
+                source: ParamSource::Indexed(0),
+                components: vec![],
             },
             ResolvedColumn {
                 column_name: "value".to_string(),
                 param_name: "value".to_string(),
                 pg_type: "numeric".to_string(),
+                source: ParamSource::Body(0),
+                components: vec![],
             },
         ];
 
@@ -2237,6 +2272,8 @@ table = "usdc_approvals"
             column_name: "value".to_string(),
             param_name: "value".to_string(),
             pg_type: "numeric".to_string(),
+            source: ParamSource::Body(0),
+            components: vec![],
         }];
 
         let sql = generate_create_table_sql("t", &ctx, &columns, false);
@@ -2262,11 +2299,15 @@ table = "usdc_approvals"
                 column_name: "from_address".to_string(),
                 param_name: "from".to_string(),
                 pg_type: "text".to_string(),
+                source: ParamSource::Indexed(0),
+                components: vec![],
             },
             ResolvedColumn {
                 column_name: "to_address".to_string(),
                 param_name: "to".to_string(),
                 pg_type: "text".to_string(),
+                source: ParamSource::Indexed(1),
+                components: vec![],
             },
         ];
 
@@ -2286,6 +2327,8 @@ table = "usdc_approvals"
             column_name: "value".to_string(),
             param_name: "value".to_string(),
             pg_type: "numeric".to_string(),
+            source: ParamSource::Body(0),
+            components: vec![],
         }];
 
         let sql = generate_insert_sql("t", &ctx, &columns, false);
@@ -2788,6 +2831,7 @@ table = "pool_b_transfers"
             creation_event: event.clone(),
             creation_selector: event.selector(),
             child_address_param: "pool".to_owned(),
+            child_address_source: ParamSource::Indexed(0),
             child_contract_name: "Pool".to_owned(),
             start_block: 0,
         };
@@ -3178,6 +3222,8 @@ table = "uniswap_swaps"
             column_name: "amount".to_string(),
             param_name: "amount".to_string(),
             pg_type: "numeric".to_string(),
+            source: ParamSource::Body(0),
+            components: vec![],
         }];
 
         let sql = generate_create_table_sql("pool_swaps", &[], &columns, true);
@@ -3192,6 +3238,8 @@ table = "uniswap_swaps"
             column_name: "amount".to_string(),
             param_name: "amount".to_string(),
             pg_type: "numeric".to_string(),
+            source: ParamSource::Body(0),
+            components: vec![],
         }];
 
         let sql = generate_insert_sql("pool_swaps", &[], &columns, true);
@@ -3319,6 +3367,8 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         Ok(())
     }
 
+    const OWNER: &str = "event 'USDC.Transfer'";
+
     #[test]
     fn resolve_topic_filters_valid() -> eyre::Result<()> {
         let abi: alloy_json_abi::JsonAbi =
@@ -3335,7 +3385,7 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
             vec!["0x28C6c06298d514Db089934071355E5743bf21d60".to_string()],
         );
 
-        let filters = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer")?;
+        let filters = resolve_topic_filters(Some(&filter), &event_inputs(event, OWNER)?, OWNER)?;
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].topic_index, 2); // 'to' is the second indexed param
         assert_eq!(filters[0].values.len(), 1);
@@ -3362,7 +3412,8 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         let mut filter = HashMap::new();
         filter.insert("nonexistent".to_string(), vec!["0x00".to_string()]);
 
-        let Err(err) = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer") else {
+        let Err(err) = resolve_topic_filters(Some(&filter), &event_inputs(event, OWNER)?, OWNER)
+        else {
             return Err(eyre::eyre!("expected error for unknown param"));
         };
         assert!(format!("{err:?}").contains("not found"));
@@ -3383,7 +3434,8 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
         let mut filter = HashMap::new();
         filter.insert("value".to_string(), vec!["100".to_string()]);
 
-        let Err(err) = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer") else {
+        let Err(err) = resolve_topic_filters(Some(&filter), &event_inputs(event, OWNER)?, OWNER)
+        else {
             return Err(eyre::eyre!("expected error for non-indexed param"));
         };
         assert!(format!("{err:?}").contains("not indexed"));
@@ -3409,7 +3461,7 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
             ],
         );
 
-        let filters = resolve_topic_filters(Some(&filter), event, "USDC", "Transfer")?;
+        let filters = resolve_topic_filters(Some(&filter), &event_inputs(event, OWNER)?, OWNER)?;
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].topic_index, 1); // 'from' is the first indexed param
         assert_eq!(filters[0].values.len(), 2);
@@ -3536,6 +3588,8 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
                 column_name: "recipient".to_string(),
                 param_name: "recipient".to_string(),
                 pg_type: "text".to_string(),
+                source: ParamSource::Body(0),
+                components: vec![],
             }],
             false,
         );
@@ -3565,6 +3619,8 @@ to = ["0x28C6c06298d514Db089934071355E5743bf21d60"]
                 column_name: "recipient".to_string(),
                 param_name: "recipient".to_string(),
                 pg_type: "text".to_string(),
+                source: ParamSource::Body(0),
+                components: vec![],
             }],
             false,
         );
@@ -3909,6 +3965,15 @@ type = "webhook"
         assert_eq!(abi_param_to_snake_case("___foo"), "foo");
     }
 
+    const FOO: &str = "event 'Test.Foo'";
+
+    fn event_columns(
+        cols: Option<&[TomlColumn]>,
+        event: &Event,
+    ) -> eyre::Result<Vec<ResolvedColumn>> {
+        resolve_columns(cols, &event_inputs(event, FOO)?, FOO)
+    }
+
     // ── id column conflict tests ──────────────────────────────────────
 
     #[test]
@@ -3924,7 +3989,7 @@ type = "webhook"
             name: Some("id".to_string()),
             pg_type: None,
         }];
-        let result = resolve_columns(Some(&cols), &abi_json, "Test", "Foo");
+        let result = event_columns(Some(&cols), &abi_json);
         assert!(result.is_err());
         assert!(format!("{result:?}").contains("conflicts with a reserved schema column"));
         Ok(())
@@ -3938,7 +4003,7 @@ type = "webhook"
             ],"name":"Foo","type":"event"}"#,
         )?;
 
-        let result = resolve_columns(None, &abi_json, "Test", "Foo")?;
+        let result = event_columns(None, &abi_json)?;
         assert_eq!(result[0].column_name, "param_id");
         assert_eq!(result[0].param_name, "id");
         Ok(())
@@ -4071,7 +4136,7 @@ type = "webhook"
             ],"name":"Foo","type":"event"}"#,
         )?;
 
-        let result = resolve_columns(None, &abi_json, "Test", "Foo");
+        let result = event_columns(None, &abi_json);
         assert!(result.is_err());
         assert!(format!("{result:?}").contains("duplicate column name"));
         Ok(())
@@ -4086,7 +4151,9 @@ type = "webhook"
             ],"name":"foo","type":"function","outputs":[],"stateMutability":"nonpayable"}"#,
         )?;
 
-        let result = resolve_call_columns(None, &abi_json, "Test", "foo");
+        let owner = "function 'Test.foo'";
+        let result = function_inputs(&abi_json, owner)
+            .and_then(|inputs| resolve_columns(None, &inputs, owner));
         assert!(result.is_err());
         assert!(format!("{result:?}").contains("duplicate column name"));
         Ok(())
@@ -4109,7 +4176,7 @@ type = "webhook"
                 name: Some(reserved.to_string()),
                 pg_type: None,
             }];
-            let result = resolve_columns(Some(&cols), &abi_json, "Test", "Foo");
+            let result = event_columns(Some(&cols), &abi_json);
             assert!(result.is_err(), "should reject explicit name '{reserved}'");
         }
         Ok(())
@@ -4125,9 +4192,268 @@ type = "webhook"
             ],"name":"Foo","type":"event"}"#,
         )?;
 
-        let result = resolve_columns(None, &abi_json, "Test", "Foo")?;
+        let result = event_columns(None, &abi_json)?;
         assert_eq!(result[0].column_name, "param_block_number");
         assert_eq!(result[0].param_name, "blockNumber");
+        Ok(())
+    }
+
+    // ── Unnamed ABI inputs ─────────────────────────────────────────────
+
+    /// `Foo(address indexed a, uint256 indexed, bool, uint256 indexed b, bytes32[2])`.
+    const UNNAMED_EVENT: &str = r#"{"type":"event","name":"Foo","anonymous":false,"inputs":[
+        {"name":"a","type":"address","indexed":true},
+        {"name":"","type":"uint256","indexed":true},
+        {"name":"","type":"bool","indexed":false},
+        {"name":"b","type":"uint256","indexed":true},
+        {"name":"","type":"bytes32[2]","indexed":false}]}"#;
+
+    /// Aerodrome's `PoolCreated` layout: only the last input is unnamed.
+    const POOL_CREATED_EVENT: &str = r#"{"type":"event","name":"Foo","anonymous":false,"inputs":[
+        {"name":"token0","type":"address","indexed":true},
+        {"name":"token1","type":"address","indexed":true},
+        {"name":"stable","type":"bool","indexed":true},
+        {"name":"pool","type":"address","indexed":false},
+        {"name":"","type":"uint256","indexed":false}]}"#;
+
+    const NAMED_EVENT: &str = r#"{"type":"event","name":"Foo","anonymous":false,"inputs":[
+        {"name":"from","type":"address","indexed":true},
+        {"name":"value","type":"uint256","indexed":false}]}"#;
+
+    fn toml_column(param: &str, name: Option<&str>) -> TomlColumn {
+        TomlColumn {
+            param: param.to_owned(),
+            name: name.map(str::to_owned),
+            pg_type: None,
+        }
+    }
+
+    /// `(column, param, type, source)` per column.
+    fn summarize(columns: &[ResolvedColumn]) -> Vec<(&str, &str, &str, ParamSource)> {
+        columns
+            .iter()
+            .map(|c| {
+                (
+                    c.column_name.as_str(),
+                    c.param_name.as_str(),
+                    c.pg_type.as_str(),
+                    c.source,
+                )
+            })
+            .collect()
+    }
+
+    fn assert_err_contains<T: std::fmt::Debug>(
+        result: eyre::Result<T>,
+        fragment: &str,
+    ) -> eyre::Result<()> {
+        let Err(err) = result else {
+            return Err(eyre::eyre!(
+                "expected an error containing {fragment:?}, got {result:?}"
+            ));
+        };
+        assert!(err.to_string().contains(fragment), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn unnamed_event_inputs_resolve_by_position() -> eyre::Result<()> {
+        use ParamSource::{Body, Indexed};
+        type Expected<'a> = Result<Vec<(&'a str, &'a str, &'a str, ParamSource)>, &'a str>;
+        let cases: Vec<(&str, Option<Vec<TomlColumn>>, Expected<'_>)> = vec![
+            (
+                UNNAMED_EVENT,
+                None,
+                Ok(vec![
+                    ("a", "a", "text", Indexed(0)),
+                    ("param_1", "param_1", "numeric", Indexed(1)),
+                    ("param_2", "param_2", "boolean", Body(0)),
+                    ("b", "b", "numeric", Indexed(2)),
+                    ("param_4", "param_4", "jsonb", Body(1)),
+                ]),
+            ),
+            // Explicit order differs from ABI order; sources still follow the ABI.
+            (
+                UNNAMED_EVENT,
+                Some(vec![
+                    toml_column("param_4", None),
+                    toml_column("param_2", Some("flag")),
+                    toml_column("a", None),
+                ]),
+                Ok(vec![
+                    ("param_4", "param_4", "jsonb", Body(1)),
+                    ("flag", "param_2", "boolean", Body(0)),
+                    ("a", "a", "text", Indexed(0)),
+                ]),
+            ),
+            (
+                UNNAMED_EVENT,
+                Some(vec![toml_column("", None)]),
+                Err(
+                    "param '' is ambiguous in event 'Test.Foo': 3 inputs are unnamed; \
+                     select one of: param_1, param_2, param_4",
+                ),
+            ),
+            (
+                UNNAMED_EVENT,
+                Some(vec![toml_column("param_3", None)]),
+                Err("param 'param_3' not found in event 'Test.Foo'; \
+                     inputs: a, param_1, param_2, b, param_4"),
+            ),
+            (
+                POOL_CREATED_EVENT,
+                None,
+                Ok(vec![
+                    ("token0", "token0", "text", Indexed(0)),
+                    ("token1", "token1", "text", Indexed(1)),
+                    ("stable", "stable", "boolean", Indexed(2)),
+                    ("pool", "pool", "text", Body(0)),
+                    ("param_4", "param_4", "numeric", Body(1)),
+                ]),
+            ),
+            (
+                POOL_CREATED_EVENT,
+                Some(vec![toml_column("param_4", None)]),
+                Ok(vec![("param_4", "param_4", "numeric", Body(1))]),
+            ),
+            // The pre-0.3.5 workaround keeps working while one input is unnamed.
+            (
+                POOL_CREATED_EVENT,
+                Some(vec![toml_column("", Some("pool_count"))]),
+                Ok(vec![("pool_count", "param_4", "numeric", Body(1))]),
+            ),
+            (
+                NAMED_EVENT,
+                Some(vec![toml_column("", None)]),
+                Err(
+                    "param '' selects an unnamed input, but event 'Test.Foo' has none; \
+                     inputs: from, value",
+                ),
+            ),
+        ];
+        for (abi, columns, expected) in cases {
+            let event: Event = serde_json::from_str(abi)?;
+            let result = event_columns(columns.as_deref(), &event);
+            match expected {
+                Ok(expected) => assert_eq!(summarize(&result?), expected),
+                Err(fragment) => assert_err_contains(result, fragment)?,
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unnamed_indexed_inputs_filter_by_topic_position() -> eyre::Result<()> {
+        let event: Event = serde_json::from_str(UNNAMED_EVENT)?;
+        let inputs = event_inputs(&event, FOO)?;
+        for (key, expected) in [
+            ("param_1", Ok(2)),
+            ("b", Ok(3)),
+            ("param_2", Err("is not indexed")),
+            ("", Err("is ambiguous")),
+        ] {
+            let filter = HashMap::from([(key.to_owned(), vec!["5".to_owned()])]);
+            let result = resolve_topic_filters(Some(&filter), &inputs, FOO);
+            match expected {
+                Ok(topic_index) => {
+                    let filters = result?;
+                    assert_eq!(filters[0].topic_index, topic_index, "{key}");
+                    let five = B256::from(alloy_primitives::U256::from(5));
+                    assert!(filters[0].values.contains(&five));
+                }
+                Err(fragment) => assert_err_contains(result, fragment)?,
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unnamed_function_inputs_resolve_by_position() -> eyre::Result<()> {
+        let function: Function = serde_json::from_str(
+            r#"{"type":"function","name":"foo","outputs":[],"stateMutability":"nonpayable",
+                "inputs":[{"name":"","type":"uint256"},{"name":"","type":"address"},
+                {"name":"","type":"tuple[]","components":[
+                    {"name":"x","type":"uint8"},{"name":"","type":"uint8"}]}]}"#,
+        )?;
+        let owner = "function 'Test.foo'";
+        let inputs = function_inputs(&function, owner)?;
+        let columns = resolve_columns(None, &inputs, owner)?;
+        assert_eq!(
+            summarize(&columns),
+            [
+                ("param_0", "param_0", "numeric", ParamSource::Body(0)),
+                ("param_1", "param_1", "text", ParamSource::Body(1)),
+                ("param_2", "param_2", "jsonb", ParamSource::Body(2)),
+            ]
+        );
+        assert_eq!(columns[2].components.len(), 2);
+        assert_err_contains(
+            resolve_columns(Some(&[toml_column("", None)]), &inputs, owner),
+            "select one of: param_0, param_1, param_2",
+        )
+    }
+
+    #[test]
+    fn unnamed_factory_param_selects_by_global_position() -> eyre::Result<()> {
+        let abi: JsonAbi = serde_json::from_str(
+            r#"[{"type":"event","name":"Created","anonymous":false,"inputs":[
+                {"name":"","type":"uint256","indexed":true},
+                {"name":"","type":"address","indexed":false},
+                {"name":"","type":"address","indexed":true}]}]"#,
+        )?;
+        let factory = |param: &str| {
+            resolve_factory(
+                &TomlFactory {
+                    address: "0x2222222222222222222222222222222222222222".to_owned(),
+                    abi: None,
+                    event: "Created".to_owned(),
+                    param: param.to_owned(),
+                    start_block: 0,
+                },
+                "Child",
+                &abi,
+                Path::new("."),
+            )
+        };
+        for (param, expected) in [
+            ("param_2", Ok(ParamSource::Indexed(1))),
+            ("param_1", Ok(ParamSource::Body(0))),
+            ("param_0", Err("has type 'uint256'")),
+            ("", Err("is ambiguous")),
+        ] {
+            match expected {
+                Ok(source) => {
+                    let resolved = factory(param)?;
+                    assert_eq!(resolved.child_address_source, source, "{param}");
+                    assert!(resolved
+                        .extraction_fingerprint()
+                        .ends_with(&format!("=> {param}")));
+                }
+                Err(fragment) => assert_err_contains(factory(param), fragment)?,
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generated_name_collisions_are_rejected() -> eyre::Result<()> {
+        for (inputs, fragment) in [
+            (
+                r#"[{"name":"param_1","type":"uint256","indexed":false},
+                    {"name":"","type":"uint256","indexed":false}]"#,
+                "two parameters named 'param_1' at sibling positions 0 and 1",
+            ),
+            (
+                r#"[{"name":"t","type":"tuple","indexed":false,"components":[
+                    {"name":"","type":"uint8"},{"name":"param_0","type":"uint8"}]}]"#,
+                "two parameters named 'param_0' at sibling positions 0 and 1",
+            ),
+        ] {
+            let event: Event = serde_json::from_str(&format!(
+                r#"{{"type":"event","name":"Foo","anonymous":false,"inputs":{inputs}}}"#
+            ))?;
+            assert_err_contains(event_inputs(&event, FOO).map(|_| ()), fragment)?;
+        }
         Ok(())
     }
 }

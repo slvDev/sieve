@@ -1499,6 +1499,7 @@ mod tests {
             creation_selector: event.selector(),
             creation_event: event.clone(),
             child_address_param: "pool".to_owned(),
+            child_address_source: crate::config::ParamSource::Indexed(0),
             child_contract_name: name.to_owned(),
             start_block,
         })

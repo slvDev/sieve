@@ -8,8 +8,6 @@
 pub mod rabbitmq;
 pub mod webhook;
 
-use alloy_dyn_abi::DynSolValue;
-use alloy_primitives::Address;
 use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -82,29 +80,6 @@ pub struct EventPayload {
     pub status: Option<bool>,
     /// Decoded event parameters as key-value pairs.
     pub data: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Convert a [`DynSolValue`] to a [`serde_json::Value`].
-///
-/// Mirrors the conversion logic in `handler::bind_dyn_value` but targets
-/// JSON instead of PostgreSQL parameters.
-#[must_use]
-pub fn dyn_sol_to_json(value: &DynSolValue) -> serde_json::Value {
-    match value {
-        DynSolValue::Address(addr) => serde_json::Value::String(Address::to_checksum(addr, None)),
-        DynSolValue::Bool(b) => serde_json::Value::Bool(*b),
-        DynSolValue::Uint(val, _) => serde_json::Value::String(val.to_string()),
-        DynSolValue::Int(val, _) => serde_json::Value::String(val.to_string()),
-        DynSolValue::String(s) => serde_json::Value::String(s.clone()),
-        DynSolValue::Bytes(b) => {
-            serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(b)))
-        }
-        DynSolValue::FixedBytes(word, size) => {
-            let bytes = &word.as_slice()[..(*size)];
-            serde_json::Value::String(format!("0x{}", alloy_primitives::hex::encode(bytes)))
-        }
-        other => serde_json::Value::String(format!("{other:?}")),
-    }
 }
 
 /// Trait for notification sinks (webhook, RabbitMQ, etc.).
@@ -394,50 +369,6 @@ mod tests {
         assert!(!json.contains("log_index"));
         assert!(!json.contains("tx_from"));
         Ok(())
-    }
-
-    #[test]
-    fn dyn_sol_to_json_address() {
-        let addr = alloy_primitives::address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-        let val = dyn_sol_to_json(&DynSolValue::Address(addr));
-        assert_eq!(
-            val,
-            serde_json::Value::String("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string())
-        );
-    }
-
-    #[test]
-    fn dyn_sol_to_json_uint() {
-        let val = dyn_sol_to_json(&DynSolValue::Uint(
-            alloy_primitives::U256::from(1_000_000u64),
-            256,
-        ));
-        assert_eq!(val, serde_json::Value::String("1000000".to_string()));
-    }
-
-    #[test]
-    fn dyn_sol_to_json_bool() {
-        let val = dyn_sol_to_json(&DynSolValue::Bool(true));
-        assert_eq!(val, serde_json::Value::Bool(true));
-    }
-
-    #[test]
-    fn dyn_sol_to_json_bytes() {
-        let val = dyn_sol_to_json(&DynSolValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
-        assert_eq!(val, serde_json::Value::String("0xdeadbeef".to_string()));
-    }
-
-    #[test]
-    fn dyn_sol_to_json_string() {
-        let val = dyn_sol_to_json(&DynSolValue::String("hello".to_string()));
-        assert_eq!(val, serde_json::Value::String("hello".to_string()));
-    }
-
-    #[test]
-    fn dyn_sol_to_json_fixed_bytes() {
-        let word = alloy_primitives::B256::from_slice(&[0xab; 32]);
-        let val = dyn_sol_to_json(&DynSolValue::FixedBytes(word, 4));
-        assert_eq!(val, serde_json::Value::String("0xabababab".to_string()));
     }
 
     #[tokio::test]

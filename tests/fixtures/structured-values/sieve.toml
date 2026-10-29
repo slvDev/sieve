@@ -1,0 +1,74 @@
+# Structured ABI values and unnamed parameters.
+#
+# abis/pool-factory.json: PoolCreated, verbatim from the verified Aerodrome PoolFactory on Base
+#   https://sourcify.dev/server/v2/contract/8453/0x420DD381b31aEf6683db6B902084cB0FFECe40Da?fields=abi
+# abis/leaf-voter.json: GaugesAllocated, EmissionsMinted, allocateGauges, verbatim from the verified LeafVoter on Base
+#   https://sourcify.dev/server/v2/contract/8453/0x382409fad8503FbCdbB27A4211551fa03e884078?fields=abi
+# abis/root-voter.json: root GaugesAllocated layout, written from IVoter.sol and IVoterCommon.sol at
+#   https://github.com/dromos-labs/metadex-public/blob/8b506b450aaa9d4a9f1a77e264f2d9dd508e9ddf/V3/src/interfaces/voter/IVoter.sol
+#   Its contract address below is a placeholder.
+chain = "base"
+
+[[contracts]]
+name = "PoolFactory"
+address = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
+abi = "abis/pool-factory.json"
+start_block = 100
+
+# Auto columns: the unnamed fifth input becomes `param_4`.
+[[contracts.events]]
+name = "PoolCreated"
+table = "pool_created"
+
+[[contracts.events]]
+name = "PoolCreated"
+table = "pool_created_explicit"
+columns = [
+  { param = "param_4" },
+  { param = "pool" },
+]
+
+# Pre-0.3.5 workaround: an empty selector picks the only unnamed input.
+[[contracts.events]]
+name = "PoolCreated"
+table = "pool_created_legacy"
+columns = [
+  { param = "pool" },
+  { param = "", name = "pool_count" },
+]
+
+[[contracts]]
+name = "LeafVoter"
+address = "0x382409fad8503FbCdbB27A4211551fa03e884078"
+abi = "abis/leaf-voter.json"
+start_block = 100
+
+[[contracts.events]]
+name = "GaugesAllocated"
+table = "gauges_allocated"
+
+[[contracts.events]]
+name = "GaugesAllocated"
+table = "gauges_allocated_text"
+columns = [
+  { param = "_tokenId" },
+  { param = "_allocations", type = "text" },
+]
+
+[[contracts.events]]
+name = "EmissionsMinted"
+table = "emissions_minted"
+
+[[contracts.calls]]
+name = "allocateGauges"
+table = "allocate_gauges_calls"
+
+[[contracts]]
+name = "RootVoter"
+address = "0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+abi = "abis/root-voter.json"
+start_block = 100
+
+[[contracts.events]]
+name = "GaugesAllocated"
+table = "root_gauges_allocated"

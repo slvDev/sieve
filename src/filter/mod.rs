@@ -269,51 +269,20 @@ fn decode_child_address(log: &Log<LogData>, factory: &ResolvedFactory) -> eyre::
         .decode_log(&log.data)
         .map_err(|err| eyre::eyre!("log does not decode against the configured ABI: {err}"))?;
 
-    // Search indexed params first, then body params
-    for (i, input) in factory.creation_event.inputs.iter().enumerate() {
-        if input.name == factory.child_address_param {
-            let value = if input.indexed {
-                // Find position among indexed params
-                let indexed_pos = factory
-                    .creation_event
-                    .inputs
-                    .iter()
-                    .take(i + 1)
-                    .filter(|p| p.indexed)
-                    .count()
-                    - 1;
-                decoded.indexed.get(indexed_pos)
-            } else {
-                // Find position among body params
-                let body_pos = factory
-                    .creation_event
-                    .inputs
-                    .iter()
-                    .take(i + 1)
-                    .filter(|p| !p.indexed)
-                    .count()
-                    - 1;
-                decoded.body.get(body_pos)
-            };
-            let value = value.ok_or_else(|| {
-                eyre::eyre!(
-                    "decoded event is missing a value for param \"{}\"",
-                    factory.child_address_param
-                )
-            })?;
-
-            if let DynSolValue::Address(addr) = value {
-                return Ok(*addr);
-            }
-            return Err(eyre::eyre!(
-                "param \"{}\" decoded to a non-address value",
+    let value = factory
+        .child_address_source
+        .pick(&decoded.indexed, &decoded.body)
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "decoded event is missing a value for param \"{}\"",
                 factory.child_address_param
-            ));
-        }
+            )
+        })?;
+    if let DynSolValue::Address(addr) = value {
+        return Ok(*addr);
     }
-
     Err(eyre::eyre!(
-        "param \"{}\" is not among the creation event's inputs",
+        "param \"{}\" decoded to a non-address value",
         factory.child_address_param
     ))
 }
@@ -619,6 +588,7 @@ mod tests {
             creation_event: creation_event.clone(),
             creation_selector: creation_event.selector(),
             child_address_param: "pool".to_string(),
+            child_address_source: crate::config::ParamSource::Indexed(0),
             child_contract_name: "UniswapV3Pool".to_string(),
             start_block: 12_369_621,
         };
@@ -674,6 +644,7 @@ mod tests {
             creation_event: creation_event.clone(),
             creation_selector: creation_event.selector(),
             child_address_param: "pool".to_string(),
+            child_address_source: crate::config::ParamSource::Indexed(0),
             child_contract_name: "UniswapV3Pool".to_string(),
             start_block: 0,
         };
@@ -725,6 +696,7 @@ mod tests {
             creation_event: creation_event.clone(),
             creation_selector: creation_event.selector(),
             child_address_param: "pool".to_string(),
+            child_address_source: crate::config::ParamSource::Indexed(0),
             child_contract_name: "UniswapV3Pool".to_string(),
             start_block: 12_369_621,
         };
