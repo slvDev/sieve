@@ -75,7 +75,7 @@ Sensitive URLs go in `.env` (auto-loaded at startup):
 DATABASE_URL=postgres://postgres:sieve@localhost:5432/sieve
 ```
 
-Columns are auto-generated from the ABI. Solidity camelCase is converted to snake_case automatically (`_troveId` -> `trove_id`, `amount0Out` -> `amount0_out`). SQL reserved words are handled. You can [override columns](#contracts-and-events) if you want.
+Columns are auto-generated from the ABI. Solidity camelCase is converted to snake_case automatically (`_troveId` -> `trove_id`, `amount0Out` -> `amount0_out`). SQL reserved words are handled. Unnamed ABI parameters are named by position (`param_4`), and arrays and structs are stored as JSONB. You can [override columns](#contracts-and-events) if you want.
 
 ### 3. Run
 
@@ -360,6 +360,52 @@ table = "gauge_classic_deposits"
 - Factory creation events take no `signature`; to use an overloaded one,
   point `factory.abi` at an ABI containing only the intended variant.
 
+#### Column types, arrays and structs
+
+| Solidity type                                   | Default column                       |
+| ----------------------------------------------- | ------------------------------------ |
+| `bool`                                          | `boolean`                            |
+| `address`, `string`                             | `text` (addresses checksummed)       |
+| `uint8`..`uint64`, `int8`..`int64`              | `bigint`                             |
+| larger integers                                 | `numeric`                            |
+| `bytes`, `bytesN`                               | `bytea`                              |
+| any array (`uint128[]`, `bytes32[2]`), `tuple`  | `jsonb`                              |
+
+Arrays become JSON arrays and structs become JSON objects keyed by their ABI
+component names, at every nesting level. Integers are decimal strings, so
+`uint256` values keep full precision; bytes are lowercase `0x` hex (`"0x"`
+when empty); booleans stay booleans. An Aerodrome `GaugesAllocated` row
+stores:
+
+```json
+[{"gauge": "0x1111111111111111111111111111111111111111", "allocated": "1000", "data": "0x"}]
+```
+
+and can be queried with `allocations->0->>'allocated'`. An indexed array or
+struct is only a hash in the log, so it is stored as that `0x` hex string.
+`type = "text"` on such a column stores the same JSON as text.
+
+#### Unnamed parameters
+
+An ABI input with an empty name is named `param_<i>`, where `i` is its
+0-based position among all of the event's or function's inputs (struct
+components count among their siblings). Aerodrome's
+`PoolCreated(address indexed token0, address indexed token1, bool indexed stable, address pool, uint256)`
+gets a `param_4 numeric` column, and `param = "param_4"` selects it in
+`columns`, `filter` keys, and `factory.param`. The older `param = ""` still
+works while exactly one input is unnamed. An ABI whose real name equals a
+generated one at the same level (`param_1` plus an unnamed input 1) is
+rejected at startup.
+
+#### Upgrading from 0.3.4 or earlier
+
+Earlier versions stored arrays and structs in `text` columns as Rust debug
+strings (`Array([Tuple([...])])`). Sieve never alters existing tables: an
+existing `text` column keeps its old rows unchanged and receives JSON text
+for new rows, and the GraphQL API keeps serving it as a String. For uniformly
+JSON history, reindex into a fresh database. `ALTER TABLE ... TYPE jsonb USING
+col::jsonb` fails while any debug-string row remains.
+
 ### Function Call Indexing
 
 ```toml
@@ -538,7 +584,7 @@ Message payload (one per event):
 }
 ```
 
-**Note:** `data` keys use raw ABI parameter names, not your TOML column names. If the Solidity ABI defines `_troveId`, the stream sends `_troveId` -- even though PostgreSQL stores it as `trove_id`. ABI names are immutable; config names can change.
+**Note:** `data` keys use raw ABI parameter names, not your TOML column names. If the Solidity ABI defines `_troveId`, the stream sends `_troveId` -- even though PostgreSQL stores it as `trove_id`. ABI names are immutable; config names can change. Unnamed parameters use their generated `param_<i>` name. Values have the same JSON form as the [JSONB columns](#column-types-arrays-and-structs): arrays and struct objects are nested JSON, integers decimal strings.
 
 Receipt fields (`tx_value`, `tx_gas_price`, `gas_used`, `nonce`, `cumulative_gas_used`, `status`) are included when `include_receipts = true`.
 
@@ -552,6 +598,8 @@ Auto-generated from your TOML config. Every table gets:
 - **Composition** -- `AND` / `OR` for complex filter logic
 - **Pagination** -- cursor-based (`first`/`after`) and offset-based (`first`/`skip`)
 - **Sorting** -- `orderBy` + `orderDirection`
+
+JSON columns (`jsonb`, `json`) are returned as `String` fields holding the JSON text, and their filters (`field`, `_in`, `_not_in`), `orderBy`, and cursors compare that text (sorting follows the database collation). PostgreSQL normalizes `jsonb` text (key order, spacing), so match against values read from the API.
 
 ## CLI
 
