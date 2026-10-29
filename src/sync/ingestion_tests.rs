@@ -1521,8 +1521,18 @@ async fn numeric_graphql_filters_and_cursors() -> eyre::Result<()> {
 
     // One row per page; `after` walks every row once in (column, id) order.
     for (order, dir, filter, expected) in [
+        ("block_number", "ASC", "", [1, 2, 3, 4].as_slice()),
+        ("block_number", "DESC", "", &[4, 3, 2, 1]),
+        ("token_id", "ASC", "", &[1, 2, 3, 4]),
+        (
+            "token_id",
+            "DESC",
+            "where: { token_id_gt: \"2\" }, ",
+            &[4, 3, 2],
+        ),
         ("log_index", "ASC", "", &[1, 2, 4, 3]),
         ("log_index", "DESC", "", &[3, 4, 2, 1]),
+        ("id", "DESC", "", &[4, 3, 2, 1]),
     ] {
         let mut after = String::new();
         for (page, id) in expected.iter().enumerate() {

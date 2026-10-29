@@ -110,46 +110,28 @@ pub const MAX_LIMIT: i64 = 1000;
 /// Default number of rows returned.
 pub const DEFAULT_LIMIT: i64 = 100;
 
-/// Build a complete SELECT query from components.
-///
-/// `select_clause` is the pre-built column list with casts (from
-/// `build_select_clause`). Returns the SQL string and ordered parameter list.
+/// [`build_select_with_cursor`] ordered by `id`, without a cursor.
 #[cfg(test)]
 #[must_use]
 pub fn build_select(
     table: &str,
     select_clause: &str,
     where_clause: Option<&WhereClause>,
-    order_by: &str,
     order_dir: &str,
     limit: i64,
     offset: i64,
 ) -> (String, Vec<SqlParam>) {
-    let mut sql = format!("SELECT {select_clause} FROM {table}");
-    let mut params: Vec<SqlParam> = Vec::new();
-    let mut param_idx = 1usize;
-
-    if let Some(wc) = where_clause {
-        let where_sql = build_where_sql(wc, &mut params, &mut param_idx);
-        if !where_sql.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_sql);
-        }
-    }
-
-    let _ = write!(sql, " ORDER BY \"{order_by}\" {order_dir}");
-
-    let clamped_limit = limit.clamp(1, MAX_LIMIT);
-    let clamped_offset = offset.max(0);
-
-    let _ = write!(sql, " LIMIT ${param_idx}");
-    params.push(SqlParam::Int64(clamped_limit));
-    param_idx += 1;
-
-    let _ = write!(sql, " OFFSET ${param_idx}");
-    params.push(SqlParam::Int64(clamped_offset));
-
-    (sql, params)
+    build_select_with_cursor(&SelectParams {
+        table,
+        select_clause,
+        where_clause,
+        order_by: "id",
+        order_pg_type: "bigserial",
+        order_dir,
+        limit,
+        offset,
+        cursor: None,
+    })
 }
 
 /// SQL for a column as GraphQL sees it: JSON columns compare and sort by their text.
@@ -610,12 +592,13 @@ pub fn build_select_with_cursor(p: &SelectParams<'_>) -> (String, Vec<SqlParam>)
         sql.push_str(&conditions.join(" AND "));
     }
 
+    // Qualified: a bare name resolves to the SELECT clause's ::text alias of numeric columns.
     let _ = write!(
         sql,
-        " ORDER BY {} {}, id {}",
+        " ORDER BY {table}.{} {dir}, {table}.id {dir}",
         column_sql(p.order_by, p.order_pg_type),
-        p.order_dir,
-        p.order_dir
+        table = p.table,
+        dir = p.order_dir,
     );
 
     let clamped_limit = p.limit.clamp(1, MAX_LIMIT);
@@ -720,18 +703,11 @@ mod tests {
 
     #[test]
     fn build_select_no_filters() {
-        let (sql, params) = build_select(
-            "usdc_transfers",
-            "id, block_number",
-            None,
-            "id",
-            "DESC",
-            100,
-            0,
-        );
+        let (sql, params) =
+            build_select("usdc_transfers", "id, block_number", None, "DESC", 100, 0);
         assert_eq!(
             sql,
-            "SELECT id, block_number FROM usdc_transfers ORDER BY \"id\" DESC LIMIT $1 OFFSET $2"
+            "SELECT id, block_number FROM usdc_transfers ORDER BY usdc_transfers.\"id\" DESC, usdc_transfers.id DESC LIMIT $1 OFFSET $2"
         );
         assert_eq!(params.len(), 2);
     }
@@ -744,10 +720,10 @@ mod tests {
             op: FilterOp::Gte,
             value: SqlParam::Text("21000000".into()),
         });
-        let (sql, params) = build_select("usdc_transfers", "*", Some(&wc), "id", "DESC", 100, 0);
+        let (sql, params) = build_select("usdc_transfers", "*", Some(&wc), "DESC", 100, 0);
         assert_eq!(
             sql,
-            "SELECT * FROM usdc_transfers WHERE \"block_number\" >= $1::bigint ORDER BY \"id\" DESC LIMIT $2 OFFSET $3"
+            "SELECT * FROM usdc_transfers WHERE \"block_number\" >= $1::bigint ORDER BY usdc_transfers.\"id\" DESC, usdc_transfers.id DESC LIMIT $2 OFFSET $3"
         );
         assert_eq!(params.len(), 3);
     }
@@ -760,15 +736,15 @@ mod tests {
             op: FilterOp::Eq,
             value: SqlParam::Text("abcd1234".into()),
         });
-        let (sql, _) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
+        let (sql, _) = build_select("t", "*", Some(&wc), "DESC", 10, 0);
         assert!(sql.contains("\"tx_hash\" = decode($1, 'hex')"));
     }
 
     #[test]
     fn build_select_clamps_limit() {
-        let (sql, params) = build_select("t", "*", None, "id", "DESC", 9999, 0);
+        let (sql, params) = build_select("t", "*", None, "DESC", 9999, 0);
         // Should clamp to MAX_LIMIT (1000)
-        assert!(sql.contains("ORDER BY \"id\" DESC LIMIT $1"));
+        assert!(sql.contains("ORDER BY t.\"id\" DESC, t.id DESC LIMIT $1"));
         if let SqlParam::Int64(limit) = &params[0] {
             assert_eq!(*limit, 1000);
         }
@@ -790,10 +766,10 @@ mod tests {
                 value: SqlParam::Text("0xABC".into()),
             }),
         ]);
-        let (sql, params) = build_select("t", "*", Some(&wc), "id", "ASC", 50, 10);
+        let (sql, params) = build_select("t", "*", Some(&wc), "ASC", 50, 10);
         assert_eq!(
             sql,
-            "SELECT * FROM t WHERE (\"block_number\" >= $1::bigint AND \"from_address\" = $2) ORDER BY \"id\" ASC LIMIT $3 OFFSET $4"
+            "SELECT * FROM t WHERE (\"block_number\" >= $1::bigint AND \"from_address\" = $2) ORDER BY t.\"id\" ASC, t.id ASC LIMIT $3 OFFSET $4"
         );
         assert_eq!(params.len(), 4);
     }
@@ -885,7 +861,7 @@ mod tests {
         });
         assert_eq!(
             sql,
-            "SELECT * FROM t ORDER BY \"allocations\"::text ASC, id ASC LIMIT $1 OFFSET $2"
+            "SELECT * FROM t ORDER BY t.\"allocations\"::text ASC, t.id ASC LIMIT $1 OFFSET $2"
         );
     }
 
@@ -915,7 +891,7 @@ mod tests {
             cursor: Some(&cursor),
         });
         assert!(sql.contains("(\"block_number\", id) < ($1::bigint, $2)"));
-        assert!(sql.contains("ORDER BY \"block_number\" DESC, id DESC"));
+        assert!(sql.contains("ORDER BY t.\"block_number\" DESC, t.id DESC"));
         assert!(sql.contains("LIMIT $3"));
         // No OFFSET when cursor is present
         assert!(!sql.contains("OFFSET"));
@@ -1009,7 +985,7 @@ mod tests {
                 SqlParam::Text("300".into()),
             ]),
         });
-        let (sql, params) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
+        let (sql, params) = build_select("t", "*", Some(&wc), "DESC", 10, 0);
         assert!(sql.contains("\"block_number\" IN ($1::bigint, $2::bigint, $3::bigint)"));
         assert_eq!(params.len(), 5); // 3 IN params + limit + offset
     }
@@ -1142,11 +1118,11 @@ mod tests {
     #[test]
     fn build_select_with_empty_where_clause() {
         let wc = WhereClause::And(vec![]);
-        let (sql, params) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
+        let (sql, params) = build_select("t", "*", Some(&wc), "DESC", 10, 0);
         // Empty where clause should not produce WHERE
         assert_eq!(
             sql,
-            "SELECT * FROM t ORDER BY \"id\" DESC LIMIT $1 OFFSET $2"
+            "SELECT * FROM t ORDER BY t.\"id\" DESC, t.id DESC LIMIT $1 OFFSET $2"
         );
         assert_eq!(params.len(), 2);
     }
@@ -1159,7 +1135,7 @@ mod tests {
             op: FilterOp::In,
             value: SqlParam::List(vec![]),
         });
-        let (sql, _) = build_select("t", "*", Some(&wc), "id", "DESC", 10, 0);
+        let (sql, _) = build_select("t", "*", Some(&wc), "DESC", 10, 0);
         // Empty IN list should produce FALSE
         assert!(sql.contains("WHERE FALSE"));
     }
