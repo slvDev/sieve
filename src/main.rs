@@ -1118,29 +1118,47 @@ fn save_abi_file(abi_json: &str, path: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Config entries `(name, signature, table)` for every ABI event. Names with
-/// several canonical signatures get one entry per signature, in ABI order,
-/// with a 1-based table suffix; unique names get no `signature`.
+/// Config entries `(name, signature, table)`; overloads get the first free 1-based table suffix.
 fn config_events(
     abi: &alloy_json_abi::JsonAbi,
     snake_name: &str,
 ) -> Vec<(String, Option<String>, String)> {
-    let mut entries = Vec::with_capacity(abi.events.len());
-    for (name, variants) in &abi.events {
-        let table = format!("{snake_name}_{}", toml_config::camel_to_snake_case(name));
-        let mut signatures: Vec<String> = Vec::with_capacity(variants.len());
-        for variant in variants {
-            let signature = variant.signature();
-            if !signatures.contains(&signature) {
-                signatures.push(signature);
+    let grouped: Vec<(&String, String, Vec<String>)> = abi
+        .events
+        .iter()
+        .map(|(name, variants)| {
+            let mut signatures: Vec<String> = Vec::with_capacity(variants.len());
+            for signature in variants.iter().map(alloy_json_abi::Event::signature) {
+                if !signatures.contains(&signature) {
+                    signatures.push(signature);
+                }
             }
-        }
+            let table = format!("{snake_name}_{}", toml_config::camel_to_snake_case(name));
+            (name, table, signatures)
+        })
+        .collect();
+    // Unique names keep their table; overload suffixes skip every table already taken.
+    let mut taken: HashSet<String> = grouped
+        .iter()
+        .filter(|(_, _, signatures)| signatures.len() == 1)
+        .map(|(_, table, _)| table.clone())
+        .collect();
+    let mut entries = Vec::with_capacity(grouped.len());
+    for (name, table, signatures) in grouped {
         if signatures.len() == 1 {
             entries.push((name.clone(), None, table));
-        } else {
-            for (n, signature) in signatures.into_iter().enumerate() {
-                entries.push((name.clone(), Some(signature), format!("{table}_{}", n + 1)));
-            }
+            continue;
+        }
+        let mut suffix = 0;
+        for signature in signatures {
+            let numbered = loop {
+                suffix += 1;
+                let candidate = format!("{table}_{suffix}");
+                if taken.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            entries.push((name.clone(), Some(signature), numbered));
         }
     }
     entries
@@ -1951,7 +1969,14 @@ mod tests {
             {"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}
         ]"#;
         let gauge = include_str!("../tests/fixtures/event-overloads/abis/gauge.json");
-        for (abi, events) in [
+        let colliding = r#"[
+            {"type":"event","name":"Deposit","anonymous":false,"inputs":[{"name":"a","type":"address","indexed":false}]},
+            {"type":"event","name":"Deposit","anonymous":false,"inputs":[{"name":"b","type":"uint256","indexed":false}]},
+            {"type":"event","name":"Deposit_1","anonymous":false,"inputs":[{"name":"a","type":"address","indexed":false}]}
+        ]"#;
+        let dir = std::env::temp_dir().join(format!("sieve-add-contract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        for (abi_json, events) in [
             (
                 erc20,
                 "\n[[contracts.events]]\nname = \"Approval\"\ntable = \"usdc_approval\"\n\
@@ -1968,17 +1993,35 @@ mod tests {
                  \n[[contracts.events]]\nname = \"Withdraw\"\n\
                  signature = \"Withdraw(address,uint256)\"\ntable = \"usdc_withdraw_2\"\n",
             ),
+            (
+                colliding,
+                "\n[[contracts.events]]\nname = \"Deposit\"\n\
+                 signature = \"Deposit(address)\"\ntable = \"usdc_deposit_2\"\n\
+                 \n[[contracts.events]]\nname = \"Deposit\"\n\
+                 signature = \"Deposit(uint256)\"\ntable = \"usdc_deposit_3\"\n\
+                 \n[[contracts.events]]\nname = \"Deposit_1\"\ntable = \"usdc_deposit_1\"\n",
+            ),
         ] {
-            let abi: alloy_json_abi::JsonAbi = serde_json::from_str(abi)?;
-            let toml = generate_contract_toml(
-                "USDC",
-                "0xA0b8",
-                "abis/usdc.json",
-                None,
-                &config_events(&abi, "usdc"),
-            );
+            let abi: alloy_json_abi::JsonAbi = serde_json::from_str(abi_json)?;
+            let events_config = config_events(&abi, "usdc");
+            let toml =
+                generate_contract_toml("USDC", "0xA0b8", "abis/usdc.json", None, &events_config);
             assert_eq!(toml, format!("{GENERATED_HEADER}{events}"));
+
+            // The generated block must pass the config's own resolver.
+            std::fs::write(dir.join("usdc.json"), abi_json)?;
+            let block = generate_contract_toml(
+                "USDC",
+                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                "usdc.json",
+                None,
+                &events_config,
+            );
+            let config: toml_config::SieveConfig = toml::from_str(&block)?;
+            let resolved = toml_config::resolve_config(&config, &dir)?;
+            assert_eq!(resolved.resolved_events.len(), events_config.len());
         }
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
