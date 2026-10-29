@@ -143,8 +143,7 @@ fn column_sql(column: &str, pg_type: &str) -> String {
     }
 }
 
-/// Write bind `$idx`, cast for numeric columns: their filter and cursor values bind as TEXT
-/// (integer filters as INT4), and PostgreSQL has no implicit text-to-number comparison.
+/// Write bind `$idx`, cast to the numeric column type since numeric values bind as TEXT or INT4.
 fn write_placeholder(sql: &mut String, idx: usize, pg_type: &str) {
     let cast = match pg_type {
         // bigserial is a DDL pseudo-type; runtime cast type is bigint
