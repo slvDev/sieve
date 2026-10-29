@@ -599,6 +599,8 @@ Auto-generated from your TOML config. Every table gets:
 - **Pagination** -- cursor-based (`first`/`after`) and offset-based (`first`/`skip`)
 - **Sorting** -- `orderBy` + `orderDirection`
 
+Numeric columns (`bigint`, `numeric`, `integer`) take filter values as strings (`block_number: "21000000"`, `value_in: ["1", "2"]`) and compare them as numbers.
+
 JSON columns (`jsonb`, `json`) are returned as `String` fields holding the JSON text, and their filters (`field`, `_in`, `_not_in`), `orderBy`, and cursors compare that text (sorting follows the database collation). PostgreSQL normalizes `jsonb` text (key order, spacing), so match against values read from the API.
 
 ## CLI
